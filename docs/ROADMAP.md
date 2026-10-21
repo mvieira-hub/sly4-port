@@ -306,7 +306,7 @@ O host continua só com Docker e Git.
 
 | Peça | Escolha |
 |---|---|
-| Compilador | **llvm-mingw** (clang, C++20, alvo `x86_64-w64-mingw32`) em Docker. Gera um `.exe` que roda direto no Windows |
+| Compilador | **MinGW-w64 GCC 14** (C++20, alvo `x86_64-w64-mingw32`, threads POSIX) em Docker, imagem `sly4-mingw:1`. Gera um `.exe` que roda direto no Windows. O llvm-mingw (clang) continua sendo opção se for preciso |
 | Build | CMake + Ninja |
 | Janela, áudio, controle | SDL3 (zlib) |
 | Vulkan | Vulkan-Headers + volk (MIT); o *loader* vem do driver da GPU no Windows |
@@ -340,11 +340,12 @@ generated/           (ignorado pelo git) C++ gerado do dump local
 
 As durações são estimativas para uma pessoa em dedicação parcial, com o Claude escrevendo a maior parte do código. Servem para ordenar, não como prazo. Cada fase termina num **critério de saída verificável**.
 
-### Fase 0: fundação (1–2 semanas)
-- Imagem Docker com llvm-mingw, CMake e Ninja; `docker/build.ps1` gera `build/sly4.exe`.
-- `app/main.cpp` abre uma janela com SDL3 e limpa a tela em Vulkan 1.3. Primeiro teste visual no Windows.
-- CI no GitHub Actions compilando o runtime, sem código gerado.
-- **Saída:** `sly4.exe` abre uma janela azul no Windows 11.
+### Fase 0: fundação (1–2 semanas) — **concluída em 2026-10-21**
+- Imagem Docker `sly4-mingw:1` (`docker/toolchain/Dockerfile`). Usa MinGW-w64 GCC 14 do Debian trixie em vez do llvm-mingw: são pacotes oficiais, com C++20 completo. Traz também CMake, Ninja, os headers do Vulkan e o SDL 3.2.0 estático.
+- `docker/build.ps1` gera `build/mingw-release/sly4.exe`: um único arquivo de 4,9 MB, sem DLLs.
+- `app/main.cpp` + `runtime/gpu/vulkan_context` abrem a janela com SDL3. A instância e o dispositivo são Vulkan 1.3, com *dynamic rendering* e *synchronization2*. A *swapchain* é recriada no redimensionamento, e um *clear* azul é apresentado a cada quadro. As funções do Vulkan são carregadas pelo SDL a partir do `vulkan-1.dll` do driver, sem precisar do Vulkan SDK.
+- CI no GitHub Actions (`.github/workflows/build.yml`) com artefato `sly4-windows-x64`.
+- **Saída verificada:** `sly4.exe --frames 300` sai com código 0 na RTX 5060 Ti: Vulkan 1.4.351, swapchain 1280×720 `B8G8R8A8_SRGB`, 145 fps com vsync (FIFO) e 7.500 fps em MAILBOX.
 
 ### Fase 1: memória e loader (1–2 semanas)
 - `runtime/memory/guest_memory` (seção 6).

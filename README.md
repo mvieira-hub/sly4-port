@@ -34,12 +34,30 @@ Próximos passos imediatos:
 - lacunas do EDGE (`inputFmt` 0 e 8), LODs, contornos (`OUTL`), luzes e efeitos;
 - começar a classificar as funções do EBOOT por subsistema (motor Sanzaru, Havok, EDGE, bibliotecas da Sony).
 
+## Port nativo: compilar e rodar
+
+O runtime C++20 (`runtime/`, `app/`) é compilado para Windows x86-64 dentro de um contêiner com MinGW-w64 (GCC 14) e SDL3. O resultado é um único `.exe`, sem DLLs.
+
+```powershell
+.\docker\build.ps1                  # Release -> build\mingw-release\sly4.exe
+.\docker\build.ps1 -Config Debug    # Debug   -> build\mingw-debug\sly4.exe
+.\build\mingw-release\sly4.exe      # janela até fechar (Esc fecha)
+.\build\mingw-release\sly4.exe --frames 300   # teste: 300 quadros e sai (código 0 = ok)
+```
+
+Outras opções: `--no-vsync` e `--validation`. Esta última exige a camada de validação do Vulkan SDK; sem ela, o programa só avisa.
+
+Requisitos para rodar: Windows 10/11 e uma GPU com Vulkan 1.3 (o `vulkan-1.dll` vem com o driver).
+
+Estado atual: **Fase 0 concluída**. Abre a janela, escolhe a GPU dedicada e apresenta uma *swapchain* Vulkan 1.3 limpa a cada quadro. A CI (`.github/workflows/build.yml`) compila o mesmo `.exe` a cada push e o publica como artefato.
+
 ## Ambiente
 
 Tudo roda em **Docker**; no Windows só são necessários Docker e Git.
 
 | Imagem | Para quê |
 |---|---|
+| `sly4-mingw:1` | MinGW-w64 GCC 14, CMake, Ninja, headers do Vulkan e SDL3 estático: compila o `sly4.exe` (`docker\build.ps1`) |
 | `sly4-tools:1` | Python 3.11 + capstone + Pillow: todas as ferramentas (`tools\run.ps1`) |
 | `eclipse-temurin:21-jdk` | Ghidra sem interface (`tools\run_ghidra.ps1`) |
 | `sly4-spu:1` | binutils 2.35 para SPU (`tools/spu/Dockerfile`) |

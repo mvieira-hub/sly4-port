@@ -1,0 +1,4 @@
+# The repository root is the Docker build context of docker/toolchain/Dockerfile:
+# send only what the image needs (the game dump and work/ are tens of GB).
+*
+!cmake/

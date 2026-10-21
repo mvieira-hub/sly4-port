@@ -1,0 +1,30 @@
+# Builds sly4.exe (Windows x86-64) with the same Docker toolchain used locally.
+# Only the runtime is compiled here: no game data and no generated code exist in CI.
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows-x64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain (MinGW-w64 GCC 14 + SDL3)
+        run: docker build -t sly4-mingw:1 -f docker/toolchain/Dockerfile .
+
+      - name: Build sly4.exe
+        run: >
+          docker run --rm -v "$PWD:/src" -w /src sly4-mingw:1 sh -c
+          "cmake -S . -B build/ci -G Ninja -DCMAKE_TOOLCHAIN_FILE=/opt/cmake/mingw-w64-x86_64.cmake
+          -DCMAKE_BUILD_TYPE=Release && cmake --build build/ci"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sly4-windows-x64
+          path: build/ci/sly4.exe
+          if-no-files-found: error
