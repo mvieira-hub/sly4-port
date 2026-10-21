@@ -19,5 +19,6 @@ find_path(VULKAN_HEADERS_DIR vulkan/vulkan.h REQUIRED)
 add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
 
 add_subdirectory(runtime)
+add_subdirectory(recomp)
 add_subdirectory(app)
 add_subdirectory(tests)

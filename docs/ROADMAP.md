@@ -365,7 +365,10 @@ As durações são estimativas para uma pessoa em dedicação parcial, com o Cla
 - `sly4_tests.exe`: 9 testes, entre eles vetores FIPS do SHA-1, NIDs conhecidos e o EBOOT real (via `SLY4_EBOOT`). Rodam também na CI, num runner Windows.
 - **Saída verificada:** o EBOOT carrega em cerca de 25 ms, com 17,9 MiB confirmados. As 251 importações (20 módulos, 241 com nome) do `--dump-imports` são **idênticas, linha a linha e na mesma ordem**, às do `eboot_scan.py`.
 
-### Fase 2: recompilador PPU (6–10 semanas)
+### Fase 2: recompilador PPU (6–10 semanas) — **em andamento**
+
+Andamento em [RECOMP.md](RECOMP.md). A entrega 2a (decodificador) está concluída: nas 2,8 milhões de instruções, o texto é idêntico ao do binutils em tudo o que ele decodifica (0 divergências).
+
 - **Decodificador próprio** (as tabelas do binutils servem de referência): 315 mnemônicos, cerca de 200 operações-base.
 - **Análise:** limites de função (`functions.csv` e Ghidra), tabelas de salto e dados no meio do código. Há 10.044 palavras no `.text` que o objdump não decodifica (`.long`), e cada uma precisa ser classificada como tabela ou dado.
 - **Emissor C++,** operação a operação, por prioridade:

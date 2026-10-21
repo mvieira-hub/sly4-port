@@ -56,7 +56,13 @@ $env:SLY4_EBOOT = "$PWD\PS3_GAME\USRDIR\EBOOT.elf"; .\build\mingw-release\sly4_t
 
 Requisitos para rodar: Windows 10/11 e uma GPU com Vulkan 1.3 (o `vulkan-1.dll` vem com o driver).
 
-Estado atual: **Fases 0 e 1 concluídas.**
+Recompilador (Fase 2, em andamento; ver [docs/RECOMP.md](docs/RECOMP.md)):
+
+```powershell
+.\build\mingw-release\sly4_recomp.exe disasm --eboot PS3_GAME\USRDIR\EBOOT.elf --out work\ours_raw.txt
+```
+
+Estado atual: **Fases 0 e 1 concluídas; Fase 2 com o decodificador PPU pronto.**
 - O programa abre a janela Vulkan 1.3 na GPU dedicada.
 - Reserva os 4 GiB do espaço de endereços do PS3 e carrega o `EBOOT.elf`: segmentos, TLS, parâmetros do processo e as 251 importações, idênticas às do `eboot_scan.py`.
 - A CI (`.github/workflows/build.yml`) compila o `.exe`, roda os testes num runner Windows e publica os binários como artefato.
