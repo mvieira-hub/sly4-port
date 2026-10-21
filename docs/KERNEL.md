@@ -5,8 +5,8 @@ O código recompilado do jogo (Fase 2) chama o sistema do PS3 de duas formas: po
 | Entrega | Estado |
 |---|---|
 | 3a. Partida do processo: o EBOOT roda do ponto de entrada, com HLE, syscalls e registro das chamadas | **Concluída** (2026-10-21) |
-| 3b. Memória, threads PPU e sincronização (lwmutex, mutex, cond, rwlock, semáforo, event flag, filas de evento, timers) | Próxima |
-| 3c. Arquivos (VFS, `cellFs` e `sc` 801–818) e módulos de sistema (`cellGame`, `cellSysutil`, `cellSysmodule`, `cellRtc`, stubs de NP e rede) | Pendente |
+| 3b. Memória, threads PPU e sincronização (lwmutex, mutex, cond, rwlock, semáforo, event flag, filas de evento, timers) | **Concluída** (2026-10-21) |
+| 3c. Arquivos (VFS, `cellFs` e `sc` 801–818) e módulos de sistema (`cellGame`, `cellSysutil`, `cellSysmodule`, `cellRtc`, stubs de NP e rede) | Próxima |
 | 3d. Chegar ao `cellGcmInit`, com o log comparado ao do RPCS3 | Pendente |
 
 Código em `runtime/kernel/`, biblioteca `sly4_kernel`.
@@ -89,3 +89,58 @@ No total, foram chamadas 32 funções HLE (26 ainda sem implementação) e 10 sy
 Testes no `sly4_tests.exe` (`test_kernel.cpp`):
 - o alocador: *first fit*, junção de blocos livres e recusa de liberação dupla;
 - um stub de importação idêntico aos do EBOOT, que chega à função nativa pelo descritor e volta para o LR.
+
+## 3b. Threads, sincronização e memória
+
+### Threads PPU
+
+`sys_ppu_thread_create` (no `sysPrxForUser`) cria a thread com:
+- pilha própria com página de guarda;
+- bloco de TLS copiado da imagem que o `crt0` registrou;
+- `r2` do descritor de entrada, `r3` = argumento e LR = "retorno de thread".
+
+Cada thread roda numa thread do Windows com 64 MiB de pilha reservada e o nome do PS3, que aparece no depurador. O retorno da função de entrada ou `sys_ppu_thread_exit` encerra a thread. `join` (`sc` 44) espera e devolve o valor de saída, e `detach` (45) libera a thread.
+
+`sys_ppu_thread_once` chama a função de inicialização do convidado a partir do código nativo (`call_guest`). Ela ganha um quadro de pilha novo abaixo da zona protegida de quem chamou, e LR, `r1` e `r2` são restaurados na volta.
+
+Um `sys_process_exit` em qualquer thread encerra o processo.
+
+### Sincronização
+
+`runtime/kernel/sync.h` implementa os objetos do LV2 sobre `std::mutex` e `std::condition_variable`. Cada objeto fica num gerenciador de IDs, com as mesmas faixas que o RPCS3 usa (`0x85…` mutex, `0x8D…` fila de evento etc.).
+
+| Objeto | Syscalls / funções | Semântica |
+|---|---|---|
+| mutex e lwmutex | 100–104; `sys_lwmutex_*` | Recursivo ou não (`EDEADLK`), `EPERM` para quem não é dono, `EBUSY` no `trylock`, *timeout* em µs |
+| cond e lwcond | 105–109; `sys_lwcond_*` | A espera solta o mutex por completo (mesmo recursivo), espera um sinal e pega o mutex de volta com a mesma profundidade. Sinal sem ninguém esperando se perde, como no LV2 |
+| rwlock | 120–127 | Vários leitores ou um escritor |
+| semáforo | 90–94, 114 | `EBUSY` acima do máximo |
+| event flag | 82–87, 118 | Espera AND/OR com limpeza opcional; `clear` faz `bits &= padrão`, como o LV2 |
+| fila e porta de evento | 128–138 | Fila de até 127 eventos. `receive` devolve o evento em `r4`–`r7`. A origem é o nome da porta ou `(pid << 32) \| id` |
+| timer | 70–76 | Uma thread do Windows por timer iniciado, que envia `{nome, dado1, dado2, horário}` à fila ligada |
+
+O lwmutex mantém atualizados no convidado os campos `owner` e `recursive_count` da `sys_lwmutex_t`, para o código que os consulta direto. O estado que vale é o do objeto nativo. Prioridades e protocolos (FIFO/prioridade) não são modelados: quem acorda é decidido pelo escalonador do Windows.
+
+### Memória
+
+- `sys_memory_allocate`/`free` (348/349): páginas de 64 KiB ou 1 MiB.
+- `get_page_attribute` (351) e o total de 213 MiB (352), que agora conta também os blocos do mmapper.
+- `sys_mmapper_allocate_address`/`free_address` (330/331): reservam faixas de 256 MiB em `0x30000000–0xBFFFFFFF`.
+- Os *wrappers* `sys_mmapper_allocate/map/unmap/free_memory` do `sysPrxForUser` mapeiam blocos dentro dessas faixas.
+
+### Resultado
+
+Com threads e sincronização, o jogo vai bem mais longe:
+1. cria 5 threads: `_SPU_printf_server` (espera numa fila de evento), `ApeWorkerThread_1` (espera num event flag), `fios mediathread 2` e `3` e `fios scheduler 1`;
+2. o FIOS, a biblioteca de arquivos da Sony embutida no jogo, sobe e troca sinais entre as threads por lwcond e rwlock. Os avisos `attempt to lock invalid mutex` da 3a sumiram;
+3. a thread de mídia faz as primeiras chamadas de arquivo (`cellFsStat` e `cellFsMkdir`, ainda sem implementação);
+4. a thread principal lê o endereço 0 logo depois (LR do convidado `0x5E89C4`).
+
+A queda vem do que ainda responde "OK" sem preencher nada. `cellGameBootCheck` e `cellGameContentPermit` deixam lixo nas variáveis de saída (`get_type = [1869633377]`), e o `cellFs` não existe ainda. Isso é a entrega 3c.
+
+Testes novos no `sly4_tests.exe`, com threads de verdade:
+- mutex: recursão, `EDEADLK`/`EPERM`/`EBUSY` e *timeout*;
+- condição: a espera solta um mutex recursivo, outra thread o pega e sinaliza, e a profundidade volta igual;
+- fila de evento: cheia, vazia com *timeout* e recepção bloqueante;
+- event flag: AND/OR com limpeza;
+- semáforo: limite máximo.

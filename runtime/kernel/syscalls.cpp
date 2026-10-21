@@ -19,7 +19,6 @@ namespace sly4 {
 namespace {
 
 constexpr uint32_t kCount = 1024;
-using SyscallFn = void (*)(PPUContext&, GuestMemory&);
 
 // ---------------------------------------------------------------- process
 void sys_process_getpid(PPUContext& c, GuestMemory&) { c.gpr[3] = 0x01000500; }
@@ -31,10 +30,22 @@ void sys_ppu_thread_yield(PPUContext& c, GuestMemory&) {
     std::this_thread::yield();
     c.gpr[3] = CELL_OK;
 }
+void sys_ppu_thread_join(PPUContext& c, GuestMemory& m) {
+    uint64_t value = 0;
+    const uint32_t r = kernel().join_thread(c.gpr[3], value);
+    if (r == CELL_OK && uint32_t(c.gpr[4])) m.write<uint64_t>(uint32_t(c.gpr[4]), value);
+    c.gpr[3] = r;
+}
+void sys_ppu_thread_detach(PPUContext& c, GuestMemory&) { c.gpr[3] = kernel().detach_thread(c.gpr[3]); }
+void sys_ppu_thread_set_priority(PPUContext& c, GuestMemory&) {
+    auto t = kernel().find_thread(c.gpr[3]);
+    if (t) t->priority = int32_t(c.gpr[4]);
+    c.gpr[3] = t ? CELL_OK : CELL_ESRCH;
+}
 void sys_ppu_thread_get_priority(PPUContext& c, GuestMemory& m) {
-    PpuThread* t = current_thread();
-    m.write<int32_t>(uint32_t(c.gpr[4]), t ? t->priority : 1001);
-    c.gpr[3] = CELL_OK;
+    auto t = kernel().find_thread(c.gpr[3]);
+    if (t) m.write<int32_t>(uint32_t(c.gpr[4]), t->priority);
+    c.gpr[3] = t ? CELL_OK : CELL_ESRCH;
 }
 void sys_ppu_thread_get_stack_information(PPUContext& c, GuestMemory& m) {
     PpuThread* t = current_thread();
@@ -66,37 +77,6 @@ void sys_time_get_current_time(PPUContext& c, GuestMemory& m) {
     c.gpr[3] = CELL_OK;
 }
 void sys_time_get_timebase_frequency(PPUContext& c, GuestMemory&) { c.gpr[3] = 79'800'000; }
-
-// ---------------------------------------------------------------- memory
-constexpr uint32_t kUserMemoryTotal = 0x0D500000;  // 213 MiB, what a game sees on the PS3
-constexpr uint64_t kPage1M = 0x400, kPage64K = 0x200;
-
-void sys_memory_allocate(PPUContext& c, GuestMemory& m) {
-    const uint32_t size = uint32_t(c.gpr[3]);
-    const uint64_t flags = c.gpr[4];
-    const uint32_t align = flags == kPage64K ? 0x10000 : 0x100000;
-    if (!size || size % align) {
-        c.gpr[3] = CELL_EINVAL;
-        return;
-    }
-    const GuestAddr a = kernel().user_memory().alloc(size, align);
-    if (!a) {
-        c.gpr[3] = CELL_ENOMEM;
-        return;
-    }
-    m.write<uint32_t>(uint32_t(c.gpr[5]), a);
-    c.gpr[3] = CELL_OK;
-}
-void sys_memory_free(PPUContext& c, GuestMemory&) {
-    c.gpr[3] = kernel().user_memory().free(uint32_t(c.gpr[3])) ? CELL_OK : CELL_EINVAL;
-}
-void sys_memory_get_user_memory_size(PPUContext& c, GuestMemory& m) {
-    const uint32_t info = uint32_t(c.gpr[3]);
-    const uint32_t used = kernel().user_memory().used();
-    m.write<uint32_t>(info, kUserMemoryTotal);
-    m.write<uint32_t>(info + 4, used < kUserMemoryTotal ? kUserMemoryTotal - used : 0);
-    c.gpr[3] = CELL_OK;
-}
 
 // ---------------------------------------------------------------- TTY
 void sys_tty_write(PPUContext& c, GuestMemory& m) {
@@ -227,6 +207,9 @@ struct Table {
         impl(14, "sys_process_is_spu_lock_line_reservation_address", sys_process_is_spu_lock_line_reservation_address);
         impl(22, "_sys_process_exit", sys_process_exit_);
         impl(43, "sys_ppu_thread_yield", sys_ppu_thread_yield);
+        impl(44, "sys_ppu_thread_join", sys_ppu_thread_join);
+        impl(45, "sys_ppu_thread_detach", sys_ppu_thread_detach);
+        impl(47, "sys_ppu_thread_set_priority", sys_ppu_thread_set_priority);
         impl(48, "sys_ppu_thread_get_priority", sys_ppu_thread_get_priority);
         impl(49, "sys_ppu_thread_get_stack_information", sys_ppu_thread_get_stack_information);
         impl(141, "sys_timer_usleep", sys_timer_usleep);
@@ -234,9 +217,6 @@ struct Table {
         impl(144, "sys_time_get_timezone", sys_time_get_timezone);
         impl(145, "sys_time_get_current_time", sys_time_get_current_time);
         impl(147, "sys_time_get_timebase_frequency", sys_time_get_timebase_frequency);
-        impl(348, "sys_memory_allocate", sys_memory_allocate);
-        impl(349, "sys_memory_free", sys_memory_free);
-        impl(352, "sys_memory_get_user_memory_size", sys_memory_get_user_memory_size);
         impl(403, "sys_tty_write", sys_tty_write);
     }
 };
@@ -249,6 +229,10 @@ Table& table() {
 }  // namespace
 
 const char* syscall_name(uint32_t n) { return n < kCount ? table().e[n].name : nullptr; }
+
+void register_syscall(uint32_t n, const char* name, SyscallFn fn) {
+    if (n < kCount) table().impl(n, name, fn);
+}
 
 void syscall_dispatch(PPUContext& c, GuestMemory& m) {
     const uint64_t n = c.gpr[11];

@@ -74,7 +74,7 @@ Estado atual: **Fases 0, 1 e 2 concluídas; Fase 3 em andamento.**
 - O EBOOT inteiro vira C++: 24.164 funções que compilam sem avisos.
 - Comparado com o interpretador, o código gerado deu igual em todos os 98 mil casos.
 - O interpretador foi validado antes contra o QEMU: 195 mil casos, 0 divergências.
-- O jogo recompilado já roda do ponto de entrada: inicializa memória, SPURS e `cellGame` e escreve no console. Para quando precisa da primeira thread, a próxima entrega.
+- O jogo recompilado já roda do ponto de entrada: inicializa memória, SPURS e `cellGame`, cria 5 threads e sobe o sistema de arquivos da Sony (FIOS). Para nas primeiras chamadas de arquivo, a próxima entrega.
 - O programa abre a janela Vulkan 1.3 na GPU dedicada.
 - Reserva os 4 GiB do espaço de endereços do PS3 e carrega o `EBOOT.elf`: segmentos, TLS, parâmetros do processo e as 251 importações, idênticas às do `eboot_scan.py`.
 - A CI (`.github/workflows/build.yml`) compila o `.exe`, roda os testes num runner Windows e publica os binários como artefato.

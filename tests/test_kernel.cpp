@@ -1,8 +1,13 @@
 #include "check.h"
 
+#include <atomic>
+#include <thread>
+
 #include "cpu/ppu_rt.h"
 #include "kernel/guest_alloc.h"
 #include "kernel/hle.h"
+#include "kernel/kernel.h"
+#include "kernel/sync.h"
 #include "loader/elf_loader.h"
 #include "loader/nid.h"
 
@@ -89,4 +94,80 @@ TEST(hle_import_stub_reaches_native_function) {
 
     h.hle = nullptr;
     h.hle_base = h.hle_size = 0;
+}
+
+// LV2 synchronisation objects with real host threads.
+TEST(sync_mutex_cond_semantics) {
+    auto mx = std::make_shared<Mutex>();
+    CHECK_EQ(mx->lock(1, 0), CELL_OK);
+    CHECK_EQ(mx->lock(1, 0), CELL_EDEADLK);  // not recursive
+    CHECK_EQ(mx->trylock(2), CELL_EBUSY);
+    CHECK_EQ(mx->unlock(2), CELL_EPERM);
+    CHECK_EQ(mx->lock(2, 1000), CELL_ETIMEDOUT);
+    CHECK_EQ(mx->unlock(1), CELL_OK);
+    mx->recursive = true;
+    CHECK_EQ(mx->lock(1, 0), CELL_OK);
+    CHECK_EQ(mx->lock(1, 0), CELL_OK);
+    CHECK_EQ(mx->count, 2u);
+
+    // A waiter gives the (recursively held) mutex away and gets it back with its depth.
+    Cond cv;
+    cv.mutex = mx;
+    std::atomic<int> stage{0};
+    std::thread other([&] {
+        while (stage.load() == 0) std::this_thread::yield();
+        CHECK_EQ(mx->lock(2, 0), CELL_OK);  // possible only while thread 1 waits
+        stage = 2;
+        cv.signal(false);
+        CHECK_EQ(mx->unlock(2), CELL_OK);
+    });
+    stage = 1;
+    CHECK_EQ(cv.wait(1, 0), CELL_OK);
+    CHECK_EQ(stage.load(), 2);
+    CHECK_EQ(mx->owner, 1u);
+    CHECK_EQ(mx->count, 2u);
+    other.join();
+    CHECK_EQ(cv.wait(1, 1000), CELL_ETIMEDOUT);  // nobody signals
+    CHECK_EQ(mx->owner, 1u);
+}
+
+TEST(sync_event_queue_flag_semaphore) {
+    EventQueue q;
+    q.size = 2;
+    CHECK_EQ(q.send({1, 2, 3, 4}), CELL_OK);
+    CHECK_EQ(q.send({5, 6, 7, 8}), CELL_OK);
+    CHECK_EQ(q.send({9, 9, 9, 9}), CELL_EBUSY);  // full
+    Event e{};
+    CHECK_EQ(q.receive(e, 0), CELL_OK);
+    CHECK_EQ(e.source, 1u);
+    CHECK_EQ(e.data3, 4u);
+    CHECK_EQ(q.receive(e, 0), CELL_OK);
+    CHECK_EQ(e.data1, 6u);
+    CHECK_EQ(q.receive(e, 1000), CELL_ETIMEDOUT);
+    std::thread sender([&] { q.send({10, 0, 0, 0}); });
+    CHECK_EQ(q.receive(e, 0), CELL_OK);  // blocks until the other thread sends
+    CHECK_EQ(e.source, 10u);
+    sender.join();
+
+    EventFlag f;
+    uint64_t result = 0;
+    CHECK_EQ(f.wait(0x3, event_flag::kWaitAnd, result, 0, true), CELL_EBUSY);
+    f.set(0x1);
+    CHECK_EQ(f.wait(0x3, event_flag::kWaitOr | event_flag::kClear, result, 0, true), CELL_OK);
+    CHECK_EQ(result, 0x1u);
+    CHECK_EQ(f.bits, 0u);
+    std::thread setter([&] { f.set(0x6); });
+    CHECK_EQ(f.wait(0x6, event_flag::kWaitAnd, result, 0, false), CELL_OK);
+    setter.join();
+    f.clear(0x2);  // bits &= 0x2
+    CHECK_EQ(f.bits, 0x2u);
+
+    Semaphore s;
+    s.value = 1;
+    s.max = 2;
+    CHECK_EQ(s.wait(0, true), CELL_OK);
+    CHECK_EQ(s.wait(0, true), CELL_EBUSY);
+    CHECK_EQ(s.post(3), CELL_EBUSY);  // above max
+    CHECK_EQ(s.post(2), CELL_OK);
+    CHECK_EQ(s.value, 2);
 }

@@ -1,6 +1,7 @@
 #include "kernel/kernel.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <cstring>
 
@@ -9,6 +10,14 @@
 #include "kernel/hle.h"
 #include "loader/elf_loader.h"
 #include "loader/nid.h"
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 
 namespace sly4 {
 
@@ -25,6 +34,12 @@ void on_hle(PPUContext& c, GuestMemory& m, uint32_t target) { hle().call(c, m, t
 
 PpuThread* current_thread() { return t_current; }
 
+uint64_t guest_system_time() {
+    using namespace std::chrono;
+    static const auto t0 = steady_clock::now();
+    return uint64_t(duration_cast<microseconds>(steady_clock::now() - t0).count());
+}
+
 Kernel& kernel() { return *g_kernel; }
 
 Kernel::Kernel(GuestMemory& mem, const LoadedImage& img) : mem_(mem), img_(img) { g_kernel = this; }
@@ -38,11 +53,14 @@ bool Kernel::init(const NidNames& names, const KernelOptions& opt) {
     main_ = std::make_unique<GuestAllocator>(mem_, main_base, layout::kMainEnd - main_base, "principal");
     user_ = std::make_unique<GuestAllocator>(mem_, layout::kUserBase, layout::kUserSize, "usuário");
     stacks_ = std::make_unique<GuestAllocator>(mem_, layout::kStackBase, layout::kStackSize, "pilhas");
+    mmapper_ = std::make_unique<GuestAllocator>(mem_, layout::kMmapperBase, layout::kMmapperSize, "mmapper");
 
     call_log().trace = opt.trace;
     HleTable& table = hle();
     table.add(hle_sys_prx_for_user());
     if (!table.bind(mem_, *main_, img_, names)) return false;
+    register_sync_syscalls();
+    register_memory_syscalls();
 
     rt::Hooks& h = rt::hooks();
     h.syscall = syscall_dispatch;
@@ -82,15 +100,22 @@ uint64_t Kernel::alloc_tls(PpuThread& t) {
 }
 
 int Kernel::run_main() {
-    PpuThread t;
+    auto tp = std::make_shared<PpuThread>();
+    PpuThread& t = *tp;
     t.id = next_thread_id();
     t.name = "main_thread";
     t.priority = img_.param.present ? img_.param.primary_prio : 1001;
+    t.entry = img_.entry_function;
     uint32_t stack = img_.param.present ? img_.param.primary_stack_size : 0x100000;
     stack = align_up(std::clamp<uint32_t>(stack, 0x10000, 0x100000), 0x1000);
     if (!alloc_stack(t, stack)) {
         SLY4_ERROR("não foi possível criar a pilha da thread principal");
+        request_exit(-1);
         return -1;
+    }
+    {
+        std::lock_guard<std::mutex> g(threads_lock_);
+        threads_.emplace(t.id, tp);
     }
 
     // argv/envp at the top of the stack: 64-bit pointer arrays, then the strings.
@@ -136,20 +161,155 @@ int Kernel::run_main() {
 
     SLY4_INFO("thread principal 0x%" PRIX64 ": entrada 0x%08X, pilha 0x%08X (+0x%X), prioridade %d", t.id,
               img_.entry_function, t.stack_addr, t.stack_size, t.priority);
-    t_current = &t;
-    int status = 0;
     try {
-        rt::call_indirect(c, mem_, img_.entry_function);
-        SLY4_INFO("a função de entrada retornou");
+        if (run_entry(t)) {
+            SLY4_INFO("a função de entrada da thread principal retornou (0x%" PRIX64 ")", t.exit_value);
+            request_exit(int(t.exit_value));
+        } else {
+            SLY4_INFO("a thread principal saiu com sys_ppu_thread_exit(0x%" PRIX64 ")", t.exit_value);
+        }
     } catch (const ProcessExit& e) {
-        status = e.status;
-        SLY4_INFO("sys_process_exit(%d)", status);
+        SLY4_INFO("sys_process_exit(%d)", e.status);
+        request_exit(e.status);
+    }
+    return exit_status();
+}
+
+bool Kernel::run_entry(PpuThread& t) {
+    t_current = &t;
+    bool returned = false;
+    try {
+        rt::call_indirect(t.ctx, mem_, t.entry);
+        t.exit_value = t.ctx.gpr[3];
+        returned = true;
     } catch (const ThreadExit& e) {
-        SLY4_INFO("a thread principal saiu com sys_ppu_thread_exit(0x%" PRIX64 ")", e.value);
+        t.exit_value = e.value;
+    } catch (...) {
+        t_current = nullptr;
+        throw;
     }
     t_current = nullptr;
-    return status;
+    {
+        std::lock_guard<std::mutex> g(t.m);
+        t.done = true;
+    }
+    t.cv.notify_all();
+    return returned;
 }
+
+void Kernel::request_exit(int status) {
+    if (!exited_.exchange(true)) exit_status_ = status;
+}
+
+std::shared_ptr<PpuThread> Kernel::create_thread(GuestAddr entry_opd, uint64_t arg, int32_t prio, uint32_t stack_size,
+                                                 bool joinable, std::string name, uint32_t& error) {
+    auto t = std::make_shared<PpuThread>();
+    t->id = next_thread_id();
+    t->name = std::move(name);
+    t->priority = prio;
+    t->joinable = joinable;
+    t->entry = mem_.read<uint32_t>(entry_opd);
+    if (!alloc_stack(*t, std::max<uint32_t>(stack_size, 0x4000))) {
+        error = CELL_ENOMEM;
+        return nullptr;
+    }
+    PPUContext& c = t->ctx;
+    c.gpr[1] = t->stack_addr + t->stack_size - 0x70;
+    c.gpr[2] = mem_.read<uint32_t>(entry_opd + 4);
+    c.gpr[3] = arg;
+    c.gpr[13] = alloc_tls(*t);
+    c.lr = hle().thread_return();
+    std::lock_guard<std::mutex> g(threads_lock_);
+    threads_.emplace(t->id, t);
+    error = CELL_OK;
+    return t;
+}
+
+namespace {
+struct HostStart {
+    Kernel* k;
+    std::shared_ptr<PpuThread> t;
+};
+DWORD WINAPI host_thread(void* p) {
+    std::unique_ptr<HostStart> s(static_cast<HostStart*>(p));
+    s->k->thread_entry_point(s->t);
+    return 0;
+}
+}  // namespace
+
+bool Kernel::start_thread(const std::shared_ptr<PpuThread>& t) {
+    // Recompiled guest calls nest as host calls: give each thread a large host stack.
+    auto* s = new HostStart{this, t};
+    HANDLE h = CreateThread(nullptr, 64u << 20, host_thread, s, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+    if (!h) {
+        delete s;
+        return false;
+    }
+    CloseHandle(h);
+    return true;
+}
+
+void Kernel::thread_entry_point(const std::shared_ptr<PpuThread>& t) {
+    SetThreadDescription(GetCurrentThread(), std::wstring(t->name.begin(), t->name.end()).c_str());
+    try {
+        run_entry(*t);
+    } catch (const ProcessExit& e) {
+        SLY4_INFO("sys_process_exit(%d) na thread %s", e.status, t->name.c_str());
+        request_exit(e.status);
+        return;
+    }
+    std::lock_guard<std::mutex> g(threads_lock_);
+    if (!t->joinable) threads_.erase(t->id);
+}
+
+std::shared_ptr<PpuThread> Kernel::find_thread(uint64_t id) {
+    std::lock_guard<std::mutex> g(threads_lock_);
+    auto it = threads_.find(id);
+    return it == threads_.end() ? nullptr : it->second;
+}
+
+uint32_t Kernel::join_thread(uint64_t id, uint64_t& value) {
+    auto t = find_thread(id);
+    if (!t) return CELL_ESRCH;
+    if (t.get() == current_thread()) return CELL_EDEADLK;
+    {
+        std::unique_lock<std::mutex> lk(t->m);
+        if (!t->joinable || t->joined) return CELL_EINVAL;
+        t->joined = true;
+        t->cv.wait(lk, [&] { return t->done; });
+        value = t->exit_value;
+    }
+    std::lock_guard<std::mutex> g(threads_lock_);
+    threads_.erase(id);
+    return CELL_OK;
+}
+
+uint32_t Kernel::detach_thread(uint64_t id) {
+    auto t = find_thread(id);
+    if (!t) return CELL_ESRCH;
+    std::lock_guard<std::mutex> lk(t->m);
+    if (!t->joinable || t->joined) return CELL_EINVAL;
+    t->joinable = false;
+    if (t->done) {
+        std::lock_guard<std::mutex> g(threads_lock_);
+        threads_.erase(id);
+    }
+    return CELL_OK;
+}
+
+void call_guest(PPUContext& c, GuestMemory& m, GuestAddr opd) {
+    const uint64_t lr = c.lr, r1 = c.gpr[1], r2 = c.gpr[2];
+    // A fresh frame below the caller's, leaving its 288-byte protected zone alone.
+    c.gpr[1] = (r1 - 0x200) & ~uint64_t(0xF);
+    m.write<uint64_t>(uint32_t(c.gpr[1]), r1);
+    c.gpr[2] = m.read<uint32_t>(opd + 4);
+    c.lr = hle().thread_return();
+    rt::call_indirect(c, m, m.read<uint32_t>(opd));
+    c.lr = lr;
+    c.gpr[1] = r1;
+    c.gpr[2] = r2;
+}
+
 
 void Kernel::print_summary() const {
     auto hs = hle().stats();

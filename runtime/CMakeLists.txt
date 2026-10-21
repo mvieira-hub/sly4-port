@@ -29,6 +29,9 @@ add_library(sly4_kernel STATIC
     kernel/hle.cpp
     kernel/hle_sys_prx_for_user.cpp
     kernel/kernel.cpp
+    kernel/memory.cpp
+    kernel/sync.cpp
     kernel/syscalls.cpp
+    kernel/syscalls_sync.cpp
 )
 target_link_libraries(sly4_kernel PUBLIC sly4_cpu)

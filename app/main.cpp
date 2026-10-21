@@ -147,8 +147,9 @@ bool load_executable(const Args& args, sly4::GuestMemory& mem, sly4::LoadedImage
 
 // ---------------------------------------------------------------- phase 3: the game
 sly4::Kernel* g_kernel = nullptr;
-std::atomic<bool> g_game_done{false};
-std::atomic<int> g_game_status{0};
+// The game is over once any guest thread calls sys_process_exit (or main returns).
+bool game_over() { return g_kernel && g_kernel->exited(); }
+int game_status() { return g_kernel ? g_kernel->exit_status() : 0; }
 
 [[noreturn]] void stop_with_summary(int code) {
     if (g_kernel) g_kernel->print_summary();
@@ -170,8 +171,7 @@ LONG WINAPI on_unhandled(EXCEPTION_POINTERS* e) {
 }
 
 DWORD WINAPI game_thread(void*) {
-    g_game_status = g_kernel->run_main();
-    g_game_done = true;
+    g_kernel->run_main();
     return 0;
 }
 #endif
@@ -219,9 +219,9 @@ int main(int argc, char** argv) {
     };
     if (!args.window) {
         if (!game) return 0;
-        while (!g_game_done && !game_timed_out()) Sleep(10);
-        if (!g_game_done) SLY4_INFO("tempo esgotado (%ld s): o jogo continua rodando; parando", args.seconds);
-        stop_with_summary(g_game_done ? g_game_status.load() : 0);
+        while (!game_over() && !game_timed_out()) Sleep(10);
+        if (!game_over()) SLY4_INFO("tempo esgotado (%ld s): o jogo continua rodando; parando", args.seconds);
+        stop_with_summary(game_over() ? game_status() : 0);
     }
 
     if (!SDL_Init(SDL_INIT_VIDEO)) {
@@ -276,7 +276,7 @@ int main(int argc, char** argv) {
         }
         ++presented;
         if (args.frames > 0 && presented >= args.frames) break;
-        if (game && (g_game_done || game_timed_out())) break;
+        if (game && (game_over() || game_timed_out())) break;
     }
 
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
@@ -287,6 +287,6 @@ int main(int argc, char** argv) {
     SDL_DestroyWindow(window);
     SDL_Quit();
     // Guest threads cannot be interrupted: leave without waiting for them.
-    if (game) stop_with_summary(ok ? (g_game_done ? g_game_status.load() : 0) : 1);
+    if (game) stop_with_summary(ok ? game_status() : 1);
     return ok ? 0 : 1;
 }
