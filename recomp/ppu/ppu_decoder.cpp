@@ -217,6 +217,16 @@ Op decode_63(uint32_t w) {
 }  // namespace
 
 const char* mnemonic(Op op) { return kOps[static_cast<size_t>(op)].name; }
+
+const char* enum_name(Op op) {
+    static constexpr const char* kEnumNames[] = {
+        "invalid",
+#define X(e, name, f) #e,
+#include "ppu_ops.inc"
+#undef X
+    };
+    return kEnumNames[static_cast<size_t>(op)];
+}
 Form form(Op op) { return kOps[static_cast<size_t>(op)].form; }
 
 Insn decode(uint32_t w) {

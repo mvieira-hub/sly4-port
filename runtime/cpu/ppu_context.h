@@ -42,6 +42,10 @@ struct PPUContext {
     uint64_t reserve_value = 0;
     uint8_t reserve_size = 0;
 
+    // Instruction / block budget, decremented only by test builds of the generated code
+    // and by the fallback interpreter (rt::interpret_until_return).
+    int64_t budget = INT64_MAX;
+
     uint64_t xer() const {
         return (uint64_t(xer_so) << 31) | (uint64_t(xer_ov) << 30) | (uint64_t(xer_ca) << 29) | xer_count;
     }

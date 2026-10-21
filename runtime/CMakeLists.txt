@@ -14,8 +14,8 @@ target_link_libraries(sly4_runtime PUBLIC SDL3::SDL3-static)
 # PPU reference interpreter (phase 2c): oracle for the C++ emitter and runtime fallback.
 add_library(sly4_cpu STATIC
     cpu/ppu_interpreter.cpp
-    cpu/ppu_interp_fpu.cpp
-    cpu/ppu_interp_vmx.cpp
+    cpu/ppu_fpu.cpp
+    cpu/ppu_rt.cpp
 )
 target_link_libraries(sly4_cpu PUBLIC sly4_runtime sly4_ppu)
 # FP results depend on the rounding mode set at run time and on IEEE flags. -mfma makes

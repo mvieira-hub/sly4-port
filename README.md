@@ -56,13 +56,18 @@ $env:SLY4_EBOOT = "$PWD\PS3_GAME\USRDIR\EBOOT.elf"; .\build\mingw-release\sly4_t
 
 Requisitos para rodar: Windows 10/11 e uma GPU com Vulkan 1.3 (o `vulkan-1.dll` vem com o driver).
 
-Recompilador (Fase 2, em andamento; ver [docs/RECOMP.md](docs/RECOMP.md)):
+Recompilador (Fase 2; ver [docs/RECOMP.md](docs/RECOMP.md)). Ele gera o C++ do jogo a partir do seu `EBOOT.elf`. O próximo build compila esse código e o teste diferencial:
 
 ```powershell
-.\build\mingw-release\sly4_recomp.exe disasm --eboot PS3_GAME\USRDIR\EBOOT.elf --out work\ours_raw.txt
+.\build\mingw-release\sly4_recomp.exe emit --eboot PS3_GAME\USRDIR\EBOOT.elf --out-dir generated\ppu
+.\docker\build.ps1
+.\build\mingw-release\sly4_gendiff.exe --eboot PS3_GAME\USRDIR\EBOOT.elf --cases 8
 ```
 
-Estado atual: **Fases 0 e 1 concluídas. Na Fase 2, o decodificador, a análise de fluxo e o interpretador PPU estão prontos; o interpretador foi validado contra o QEMU com 195 mil casos e 0 divergências.**
+Estado atual: **Fases 0, 1 e 2 concluídas.**
+- O EBOOT inteiro vira C++: 24.164 funções que compilam sem avisos.
+- Comparado com o interpretador, o código gerado deu igual em todos os 98 mil casos.
+- O interpretador foi validado antes contra o QEMU: 195 mil casos, 0 divergências.
 - O programa abre a janela Vulkan 1.3 na GPU dedicada.
 - Reserva os 4 GiB do espaço de endereços do PS3 e carrega o `EBOOT.elf`: segmentos, TLS, parâmetros do processo e as 251 importações, idênticas às do `eboot_scan.py`.
 - A CI (`.github/workflows/build.yml`) compila o `.exe`, roda os testes num runner Windows e publica os binários como artefato.

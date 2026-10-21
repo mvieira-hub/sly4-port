@@ -6,8 +6,9 @@ add_library(sly4_ppu STATIC
 )
 target_include_directories(sly4_ppu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
-# Control-flow analysis of the executable (functions, blocks, jump tables).
-add_library(sly4_analysis STATIC analysis/program.cpp)
+# Control-flow analysis of the executable (functions, blocks, jump tables) and the
+# PPU -> C++ emitter.
+add_library(sly4_analysis STATIC analysis/program.cpp emit/ppu_emitter.cpp)
 target_link_libraries(sly4_analysis PUBLIC sly4_ppu sly4_runtime)
 
 add_executable(sly4_recomp tools/sly4_recomp.cpp tools/oracle.cpp)

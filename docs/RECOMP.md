@@ -7,8 +7,8 @@ O recompilador lê o `EBOOT.elf` de quem compila e gera C++ a partir do código 
 | 2a. Decodificador PPU | **Concluída** (2026-10-21) |
 | 2b. Análise: funções, blocos, tabelas de salto | **Concluída** (2026-10-21) |
 | 2c. Interpretador de referência (semântica de cada instrução) | **Concluída** (2026-10-21) |
-| 2d. Gerador de C++ + teste diferencial contra o interpretador | Próxima |
-| 2e. EBOOT inteiro → C++ compilando | — |
+| 2d. Gerador de C++ + teste diferencial contra o interpretador | **Concluída** (2026-10-21) |
+| 2e. EBOOT inteiro → C++ compilando | **Concluída** (2026-10-21) |
 
 ## 2a. Decodificador PPU
 
@@ -123,9 +123,12 @@ Código em `runtime/cpu/`, biblioteca `sly4_cpu`:
 | Arquivo | Conteúdo |
 |---|---|
 | `ppu_context.h` | Estado da thread PPU: GPR, FPR em bits crus (*payloads* de NaN preservados), VR, CR, LR, CTR, XER, FPSCR, VSCR (NJ ligado por padrão, como no PS3) e reserva de `lwarx` |
-| `ppu_interpreter.cpp` | Inteiros, CR, rotações, cargas/gravações, desvios, reservas (CAS sobre o valor reservado), `sc`, armadilhas e `dcbz` (linha de 128 bytes do Cell) |
-| `ppu_interp_fpu.cpp` | FPU com as regras do PowerPC: ordem de NaN A, B, C e NaN padrão `0x7FF8…`; FPSCR completo (FX só na transição 0→1, VX\*, OX/UX/ZX/XX, FI/FR, FPRF); `fnmadd` arredonda e depois nega; `lfs`/`stfs` bit a bit |
-| `ppu_interp_vmx.cpp` | VMX inteiro (com saturação e SAT) e de ponto flutuante (modo NJ, NaN padrão `0x7FC00000`, FMA real), mais `lvlx`/`lvrx`/`stvlx`/`stvrx` do Cell |
+| `ppu_semantics.h` + `ppu_sem_int.inl` | Uma função `inline` por instrução (`sem::op<Op::X>`): inteiros, CR, rotações, cargas/gravações, reservas (CAS sobre o valor reservado) e `dcbz` (linha de 128 bytes do Cell) |
+| `ppu_sem_fpu.inl` + `ppu_fpu.cpp` | FPU com as regras do PowerPC: ordem de NaN A, B, C e NaN padrão `0x7FF8…`; FPSCR completo (FX só na transição 0→1, VX\*, OX/UX/ZX/XX, FI/FR, FPRF); `fnmadd` arredonda e depois nega; `lfs`/`stfs` bit a bit |
+| `ppu_sem_vmx.inl` | VMX inteiro (com saturação e SAT) e de ponto flutuante (modo NJ, NaN padrão `0x7FC00000`, FMA real), mais `lvlx`/`lvrx`/`stvlx`/`stvrx` do Cell |
+| `ppu_interpreter.cpp` | O laço: desvios, `sc`, armadilhas e `attn`; o resto vai para `sem::op<>` |
+
+A semântica fica em funções `inline` (2d) para que o interpretador e o C++ gerado usem exatamente o mesmo código.
 
 Ele tem dois papéis: oráculo do gerador de C++ (2d) e rede de segurança no runtime para destinos que a análise não conhecer.
 
@@ -187,3 +190,78 @@ Cada diferença explicada é contada à parte. São três tipos:
 - armadilhas, `sc` e `attn`;
 - `lmw`/`stmw` e LR/CTR;
 - as instruções do Cell `lvlx`/`lvrx`/`stvlx`/`stvrx`.
+
+## 2d. Gerador de C++
+
+### Semântica compartilhada
+
+A semântica de cada instrução saiu do interpretador e virou uma função `inline` por instrução, `sem::op<Op::X>(c, mem, insn)` (`runtime/cpu/ppu_semantics.h` e os três `.inl`). O interpretador despacha para ela pelo opcode decodificado. O C++ gerado chama a mesma função com a palavra da instrução constante, e o compilador dobra a extração dos operandos. Assim o código gerado herda a validação contra o QEMU (2c) sem uma segunda implementação. A refatoração foi conferida de novo: os 195 mil casos do oráculo e os testes unitários continuam sem divergência.
+
+### O que o emissor gera
+
+`recomp/emit/ppu_emitter.cpp`, comando `sly4_recomp emit`:
+
+```powershell
+.\build\mingw-release\sly4_recomp.exe emit --eboot PS3_GAME\USRDIR\EBOOT.elf --out-dir generated\ppu
+```
+
+| Construção PowerPC | C++ gerado |
+|---|---|
+| Função do convidado | `void f_XXXXXXXX(PPUContext&, GuestMemory&)` |
+| Bloco básico | rótulo `L_XXXXXXXX:` |
+| `b` / `bc` dentro da função | `goto` (condicional com `sem::branch_taken`, que também cuida do CTR) |
+| `bl` | `c.lr = retorno; f_destino(c, m);` |
+| *Tail call* (`b` para outra função) | chamada seguida de `return` |
+| `blr` | `return`, conferindo que o LR é o mesmo da entrada (`rt::lr_mismatch` se não for) |
+| Tabela de salto (`bctr` resolvido na 2b) | `switch` no CTR com um `case` por destino; destino fora da tabela vai para `rt::bad_jump` |
+| `bctrl`, `bctr` não resolvido, destino sem função | `rt::call_indirect`: busca binária na tabela de funções e, se não achar, o interpretador roda até o retorno |
+| `sc`, armadilhas, instrução inválida | `rt::syscall`, `rt::trap`, `rt::invalid` |
+
+A saída fica em `generated/ppu/`, que o Git ignora porque é derivada do jogo:
+- `functions.h`, com as declarações;
+- `ppu_NNNN.cpp`, com 300 funções por arquivo, para compilar em paralelo;
+- `table.cpp`, a tabela endereço → função usada pelo despacho indireto;
+- `sources.cmake`.
+
+O CMake só monta a biblioteca `sly4_gen` e o `sly4_gendiff` quando essa pasta existe. Por isso a CI, que não tem o jogo, continua compilando só o recompilador e o runtime.
+
+Com `SLY4_GEN_BUDGET` (ligado por padrão), cada bloco desconta de `c.budget`. O teste usa isso para parar laços infinitos causados pelo estado aleatório.
+
+### Teste diferencial contra o interpretador
+
+`tests/gendiff/gendiff.cpp`, executável `sly4_gendiff`:
+
+```powershell
+.\build\mingw-release\sly4_gendiff.exe --eboot PS3_GAME\USRDIR\EBOOT.elf --cases 8 --seed 3
+```
+
+Para cada função gerada e cada caso, o teste:
+- sorteia um estado plausível:
+  - GPRs entre ponteiros válidos e valores pequenos;
+  - `r1` numa pilha de 256 KiB, `r2` = TOC e `r13` numa área de rascunho de 1 MiB preenchida com zeros, ponteiros e inteiros pequenos;
+  - FPR, VR e CR aleatórios e CTR pequeno;
+- roda a função no interpretador (`rt::interpret_until_return`) e no C++ gerado, sempre a partir da mesma memória;
+- compara todos os registradores e as regiões de memória: a página nula, o rascunho, a pilha e os segmentos graváveis do EBOOT.
+
+O tempo base é fixo, e `sc` devolve 0 em `r3`. Falhas do convidado viram um retorno `false`: o acesso inválido vem do tratador de exceções vetorizado do Windows e o resto vem dos ganchos `rt::hooks()`. O caso é então deixado de lado.
+
+Um caso só conta como erro se os dois lados terminarem com estados diferentes, ou se só um lado falhar. Há duas exceções que não são divergência:
+- **Orçamento:** o do interpretador conta instruções, o do gerado conta blocos, então um pode esgotar antes do outro.
+- **`blr` com LR diferente do da entrada:** acontece quando a função recarrega da pilha um LR que o estado aleatório encheu de lixo. O convidado saltaria para esse lixo e o gerado volta para quem chamou. Os dois lados param e o caso sai da comparação.
+
+## 2e. O EBOOT inteiro em C++
+
+| | |
+|---|---|
+| Funções geradas | 24.164 (23.913 do jogo + 251 stubs de importação) |
+| Blocos | 300.984 |
+| Instruções | 2.773.440 |
+| Saída | 98 arquivos `.cpp`, 173 MB |
+| Compilação (`-O1`, MinGW-w64 GCC 14, no Docker) | 6,7 min, sem nenhum aviso |
+
+Diferencial do EBOOT inteiro, com 8 casos por função e semente 3, em 15,6 min:
+- **98.332 casos comparados: 98.332 iguais, 0 diferentes, 0 falhas de um lado só.**
+- 94.980 casos foram deixados de lado porque o estado aleatório leva a função a acesso inválido, a instrução inválida, à armadilha ou ao fim do orçamento. Fora o orçamento, os dois lados param, e as contagens por motivo batem quase uma a uma: 62.390 × 62.465 acessos inválidos e 31.768 × 31.762 instruções inválidas.
+- 7 casos param por `blr` com LR diferente do da entrada, em 4 pontos do código, todos com LR lido de memória sorteada (0x0, 0x6C, 0x88, 0x80000300).
+
+O próximo passo é a Fase 3: o kernel (syscalls) e o HLE para que o código gerado rode a partir do ponto de entrada de verdade.

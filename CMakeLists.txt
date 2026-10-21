@@ -22,3 +22,26 @@ add_subdirectory(runtime)
 add_subdirectory(recomp)
 add_subdirectory(app)
 add_subdirectory(tests)
+
+# Recompiled game code: generated locally by "sly4_recomp emit" from the user's own
+# EBOOT.elf into generated/ (ignored by git: it is derived from the game). Built only
+# when present; SLY4_GEN_BUDGET adds the block budget used by the differential test.
+set(SLY4_GEN_DIR "${CMAKE_SOURCE_DIR}/generated/ppu" CACHE PATH "Directory written by sly4_recomp emit")
+option(SLY4_GEN_BUDGET "Budget checks in the generated code (differential tests)" ON)
+if(EXISTS "${SLY4_GEN_DIR}/sources.cmake")
+    include("${SLY4_GEN_DIR}/sources.cmake")
+    add_library(sly4_gen STATIC ${SLY4_GEN_SOURCES})
+    target_include_directories(sly4_gen PUBLIC ${SLY4_GEN_DIR})
+    target_link_libraries(sly4_gen PUBLIC sly4_cpu)
+    # Same FP rules as the interpreter's inline semantics (VMX float uses fmaf); -O1
+    # keeps the build of millions of generated lines reasonable for now.
+    target_compile_options(sly4_gen PRIVATE -O1 -Wno-unused-label -frounding-math -fno-fast-math -ffp-contract=off -mfma)
+    if(SLY4_GEN_BUDGET)
+        target_compile_definitions(sly4_gen PUBLIC SLY4_GEN_BUDGET)
+    endif()
+    add_executable(sly4_gendiff tests/gendiff/gendiff.cpp)
+    target_link_libraries(sly4_gendiff PRIVATE sly4_gen)
+    target_compile_options(sly4_gendiff PRIVATE -frounding-math -mfma)
+    target_link_options(sly4_gendiff PRIVATE -static -static-libgcc -static-libstdc++ -mconsole)
+    set_target_properties(sly4_gendiff PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+endif()

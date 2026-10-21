@@ -17,8 +17,11 @@
 #include <set>
 #include <string>
 
+#include <random>
+
 #include "analysis/program.h"
 #include "core/log.h"
+#include "emit/ppu_emitter.h"
 #include "loader/elf_loader.h"
 #include "loader/nid.h"
 #include "oracle.h"
@@ -38,7 +41,9 @@ namespace {
 int usage() {
     std::fprintf(stderr,
                  "uso: sly4_recomp disasm  --eboot <EBOOT.elf> [--start 0x10230] [--end 0xABD560] [--out arquivo]\n"
-                 "     sly4_recomp analyze --eboot <EBOOT.elf> --out-dir <pasta> [--nid-names arquivo]\n");
+                 "     sly4_recomp analyze --eboot <EBOOT.elf> --out-dir <pasta> [--nid-names arquivo]\n"
+                 "     sly4_recomp emit    --eboot <EBOOT.elf> --out-dir <pasta> [--sample N --seed S] [--per-file 300]\n"
+                 "     sly4_recomp oracle-gen / oracle-check (ver docs/RECOMP.md)\n");
     return 2;
 }
 
@@ -170,6 +175,51 @@ int cmd_analyze(int argc, char** argv) {
     return st.invalid_reached ? 1 : 0;
 }
 
+int cmd_emit(int argc, char** argv) {
+    std::string eboot, out_dir;
+    size_t sample = 0, per_file = 300;
+    uint64_t seed = 1;
+    for (int i = 2; i < argc; ++i) {
+        if (i + 1 >= argc) return usage();
+        if (std::strcmp(argv[i], "--eboot") == 0) eboot = argv[++i];
+        else if (std::strcmp(argv[i], "--out-dir") == 0) out_dir = argv[++i];
+        else if (std::strcmp(argv[i], "--sample") == 0) sample = std::strtoull(argv[++i], nullptr, 0);
+        else if (std::strcmp(argv[i], "--seed") == 0) seed = std::strtoull(argv[++i], nullptr, 0);
+        else if (std::strcmp(argv[i], "--per-file") == 0) per_file = std::strtoull(argv[++i], nullptr, 0);
+        else return usage();
+    }
+    if (eboot.empty() || out_dir.empty()) return usage();
+    sly4::GuestMemory mem;
+    sly4::LoadedImage img;
+    if (!load(eboot, mem, img)) return 3;
+    const auto t0 = std::chrono::steady_clock::now();
+    const sly4::recomp::Program prog = sly4::recomp::analyze(mem, img);
+
+    sly4::recomp::EmitOptions opt;
+    opt.out_dir = out_dir;
+    opt.functions_per_file = per_file;
+    if (sample) {  // deterministic sample of code functions (stubs are reached indirectly)
+        std::vector<uint32_t> code;
+        for (const auto& [e, f] : prog.functions)
+            if (f.kind == sly4::recomp::FuncKind::Code) code.push_back(e);
+        std::mt19937_64 rng(seed);
+        std::shuffle(code.begin(), code.end(), rng);
+        code.resize(std::min(sample, code.size()));
+        std::sort(code.begin(), code.end());
+        opt.only = code;
+    }
+    sly4::recomp::EmitStats st;
+    std::string error;
+    if (!sly4::recomp::emit_program(prog, mem, opt, st, error)) {
+        SLY4_ERROR("%s", error.c_str());
+        return 3;
+    }
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    SLY4_INFO("%zu funções, %zu blocos, %zu instruções em %zu arquivos (%s) em %.1f s", st.functions, st.blocks,
+              st.instructions, st.files, out_dir.c_str(), secs);
+    return 0;
+}
+
 int cmd_disasm(int argc, char** argv) {
     std::string eboot, out;
     uint32_t start = 0x10230, end = 0xABD560;
@@ -221,6 +271,7 @@ int main(int argc, char** argv) {
     if (argc < 2) return usage();
     if (std::strcmp(argv[1], "disasm") == 0) return cmd_disasm(argc, argv);
     if (std::strcmp(argv[1], "analyze") == 0) return cmd_analyze(argc, argv);
+    if (std::strcmp(argv[1], "emit") == 0) return cmd_emit(argc, argv);
     if (std::strcmp(argv[1], "oracle-gen") == 0) return sly4::oracle::cmd_gen(argc, argv);
     if (std::strcmp(argv[1], "oracle-check") == 0) return sly4::oracle::cmd_check(argc, argv);
     return usage();

@@ -30,6 +30,7 @@ enum class Op : uint16_t {
 };
 
 const char* mnemonic(Op op);
+const char* enum_name(Op op);  // C++ identifier of the enumerator ("addi", "or_", "stwcx_")
 Form form(Op op);
 
 struct Insn {
