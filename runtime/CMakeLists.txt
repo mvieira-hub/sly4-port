@@ -27,11 +27,15 @@ target_compile_options(sly4_cpu PRIVATE -frounding-math -fno-fast-math -ffp-cont
 add_library(sly4_kernel STATIC
     kernel/guest_alloc.cpp
     kernel/hle.cpp
+    kernel/hle_cell_fs.cpp
+    kernel/hle_cell_game.cpp
     kernel/hle_sys_prx_for_user.cpp
+    kernel/hle_system.cpp
     kernel/kernel.cpp
     kernel/memory.cpp
     kernel/sync.cpp
     kernel/syscalls.cpp
     kernel/syscalls_sync.cpp
+    kernel/vfs.cpp
 )
 target_link_libraries(sly4_kernel PUBLIC sly4_cpu)

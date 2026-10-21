@@ -239,12 +239,18 @@ void syscall_dispatch(PPUContext& c, GuestMemory& m) {
     Table& t = table();
     const Entry* e = n < kCount ? &t.e[n] : nullptr;
     if (n < kCount) t.calls[n].fetch_add(1, std::memory_order_relaxed);
+    if (PpuThread* th = current_thread()) {
+        th->last_call = e && e->name ? e->name : "syscall ?";
+        th->last_lr = c.cia - 4;
+    }
     CallLog& log = call_log();
     if (log.first_call(0x10000 + uint32_t(std::min<uint64_t>(n, kCount))) || log.trace) {
-        char line[256];
-        std::snprintf(line, sizeof(line), "sc %" PRIu64 " %s(0x%" PRIX64 ", 0x%" PRIX64 ", 0x%" PRIX64 ", 0x%" PRIX64
-                      ") em 0x%08X%s",
-                      n, e && e->name ? e->name : "?", c.gpr[3], c.gpr[4], c.gpr[5], c.gpr[6], c.cia - 4,
+        char line[320];
+        const PpuThread* th = current_thread();
+        std::snprintf(line, sizeof(line),
+                      "{%s} sc %" PRIu64 " %s(0x%" PRIX64 ", 0x%" PRIX64 ", 0x%" PRIX64 ", 0x%" PRIX64 ") em 0x%08X%s",
+                      th ? th->name.c_str() : "?", n, e && e->name ? e->name : "?", c.gpr[3], c.gpr[4], c.gpr[5],
+                      c.gpr[6], c.cia - 4,
                       e && e->fn ? "" : "  [sem implementação: CELL_OK]");
         log.record(line);
     }

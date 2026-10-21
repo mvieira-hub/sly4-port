@@ -1,6 +1,8 @@
 #include "check.h"
 
 #include <atomic>
+#include <filesystem>
+#include <fstream>
 #include <thread>
 
 #include "cpu/ppu_rt.h"
@@ -8,6 +10,7 @@
 #include "kernel/hle.h"
 #include "kernel/kernel.h"
 #include "kernel/sync.h"
+#include "kernel/vfs.h"
 #include "loader/elf_loader.h"
 #include "loader/nid.h"
 
@@ -170,4 +173,75 @@ TEST(sync_event_queue_flag_semaphore) {
     CHECK_EQ(s.post(3), CELL_EBUSY);  // above max
     CHECK_EQ(s.post(2), CELL_OK);
     CHECK_EQ(s.value, 2);
+}
+
+// VFS paths and the file API on a temporary folder laid out like a dump.
+TEST(vfs_paths_and_files) {
+    namespace fsys = std::filesystem;
+    const fsys::path root = fsys::temp_directory_path() / "sly4_vfs_test";
+    std::error_code ec;
+    fsys::remove_all(root, ec);
+    fsys::create_directories(root / "dump" / "PS3_GAME" / "USRDIR" / "sub", ec);
+    {
+        std::ofstream f(root / "dump" / "PS3_GAME" / "USRDIR" / "data.bin", std::ios::binary);
+        f << "0123456789";
+    }
+    Vfs& v = vfs();
+    v.setup(root / "dump" / "PS3_GAME", root / "data");
+
+    fsys::path host;
+    CHECK(v.resolve("/dev_bdvd/PS3_GAME/USRDIR/data.bin", host));
+    CHECK(host == root / "dump" / "PS3_GAME" / "USRDIR" / "data.bin");
+    CHECK(v.resolve("/app_home//./sub/../data.bin", host));  // same file through /app_home
+    CHECK(host == root / "dump" / "PS3_GAME" / "USRDIR" / "data.bin");
+    CHECK(v.resolve("/DEV_HDD0/game", host));                // device names ignore case
+    CHECK(host == root / "data" / "hdd0" / "game");
+    CHECK(!v.resolve("/dev_bdvd/../etc", host));             // cannot climb out of a device
+    CHECK(!v.resolve("/dev_flash/x", host));                 // not mounted
+
+    uint32_t fd = 0;
+    CHECK_EQ(fs_open("/app_home/data.bin", fs_flag::kRdonly, fd), CELL_OK);
+    char buf[16] = {};
+    uint64_t done = 0, pos = 0;
+    CHECK_EQ(fs_lseek(fd, 4, 0, pos), CELL_OK);
+    CHECK_EQ(fs_read(fd, buf, 16, done), CELL_OK);
+    CHECK_EQ(done, uint64_t(6));
+    CHECK(std::string(buf) == "456789");
+    CHECK_EQ(fs_read_at(fd, 1, buf, 2, done), CELL_OK);  // does not move the position
+    CHECK(buf[0] == '1' && buf[1] == '2');
+    CHECK_EQ(fs_read(fd, buf, 4, done), CELL_OK);
+    CHECK_EQ(done, uint64_t(0));  // still at the end
+    FsStat st;
+    CHECK_EQ(fs_fstat(fd, st), CELL_OK);
+    CHECK_EQ(st.size, uint64_t(10));
+    CHECK_EQ(st.mode, 0100666);
+    CHECK_EQ(fs_close(fd), CELL_OK);
+    CHECK_EQ(fs_close(fd), 0x8001002Au);  // EBADF
+    CHECK_EQ(fs_open("/app_home/missing", fs_flag::kRdonly, fd), CELL_ENOENT);
+
+    CHECK_EQ(fs_mkdir("/dev_hdd0/game/TEST"), CELL_OK);
+    CHECK_EQ(fs_mkdir("/dev_hdd0/game/TEST"), CELL_EEXIST);
+    CHECK_EQ(fs_open("/dev_hdd0/game/TEST/save.dat", fs_flag::kWronly | fs_flag::kCreat | fs_flag::kTrunc, fd), CELL_OK);
+    CHECK_EQ(fs_write(fd, "abc", 3, done), CELL_OK);
+    CHECK_EQ(fs_close(fd), CELL_OK);
+    CHECK_EQ(fs_stat("/dev_hdd0/game/TEST/save.dat", st), CELL_OK);
+    CHECK_EQ(st.size, uint64_t(3));
+
+    CHECK_EQ(fs_opendir("/dev_hdd0/game/TEST", fd), CELL_OK);
+    std::vector<std::string> names;
+    for (;;) {
+        std::string name;
+        uint8_t type = 0;
+        bool got = false;
+        CHECK_EQ(fs_readdir(fd, name, type, nullptr, got), CELL_OK);
+        if (!got) break;
+        names.push_back(name + (type == 1 ? "/" : ""));
+    }
+    CHECK_EQ(fs_closedir(fd), CELL_OK);
+    CHECK_EQ(names.size(), size_t(3));
+    CHECK(names.size() == 3 && names[0] == "./" && names[1] == "../" && names[2] == "save.dat");
+    CHECK_EQ(fs_rmdir("/dev_hdd0/game/TEST"), 0x80010036u);  // ENOTEMPTY
+    CHECK_EQ(fs_unlink("/dev_hdd0/game/TEST/save.dat"), CELL_OK);
+    CHECK_EQ(fs_rmdir("/dev_hdd0/game/TEST"), CELL_OK);
+    fsys::remove_all(root, ec);
 }

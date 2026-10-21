@@ -5,6 +5,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -56,6 +57,10 @@ struct PpuThread {
     int32_t priority = 0;
     GuestAddr tls_block = 0;  // TLS slot (r13 - 0x7030), 0 before sys_initialize_tls
 
+    // Last library call or syscall and its caller, for the summary (where a thread waits).
+    std::atomic<const char*> last_call{nullptr};
+    std::atomic<uint32_t> last_lr{0};
+
     // Exit status for sys_ppu_thread_join.
     std::mutex m;
     std::condition_variable cv;
@@ -68,6 +73,8 @@ PpuThread* current_thread();
 
 struct KernelOptions {
     bool trace = false;  // log every HLE call and syscall, not only the first of each
+    std::string game_dir;  // the dump's PS3_GAME folder (/dev_bdvd/PS3_GAME)
+    std::string data_dir;  // where /dev_hdd0 and /dev_hdd1 live
 };
 
 class Kernel {
@@ -93,6 +100,10 @@ public:
     std::shared_ptr<PpuThread> create_thread(GuestAddr entry_opd, uint64_t arg, int32_t prio, uint32_t stack_size,
                                              bool joinable, std::string name, uint32_t& error);
     bool start_thread(const std::shared_ptr<PpuThread>& t);
+
+    // A system thread (AIO, callbacks): native `body` running on its own host thread with
+    // a guest context (stack, TLS, TOC) so it can call guest code with call_guest.
+    bool start_native_thread(const std::string& name, std::function<void(PpuThread&)> body);
     std::shared_ptr<PpuThread> find_thread(uint64_t id);
     uint32_t join_thread(uint64_t id, uint64_t& value);
     uint32_t detach_thread(uint64_t id);
@@ -156,6 +167,7 @@ using SyscallFn = void (*)(PPUContext&, GuestMemory&);
 void register_syscall(uint32_t n, const char* name, SyscallFn fn);
 void register_sync_syscalls();    // kernel/syscalls_sync.cpp
 void register_memory_syscalls();  // kernel/memory.cpp
+void register_fs_syscalls();      // kernel/hle_cell_fs.cpp
 
 // sys_mmapper memory blocks, also used by the sysPrxForUser wrappers (kernel/memory.cpp).
 uint32_t mmapper_allocate_memory(uint64_t size, uint64_t flags, uint32_t& mem_id);

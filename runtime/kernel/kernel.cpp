@@ -8,6 +8,7 @@
 #include "core/log.h"
 #include "cpu/ppu_rt.h"
 #include "kernel/hle.h"
+#include "kernel/vfs.h"
 #include "loader/elf_loader.h"
 #include "loader/nid.h"
 
@@ -57,10 +58,15 @@ bool Kernel::init(const NidNames& names, const KernelOptions& opt) {
 
     call_log().trace = opt.trace;
     HleTable& table = hle();
-    table.add(hle_sys_prx_for_user());
+    vfs().setup(path_from_utf8(opt.game_dir), path_from_utf8(opt.data_dir));
+    for (const HleModule& mod : {hle_sys_prx_for_user(), hle_sys_fs(), hle_cell_game(), hle_cell_sysutil(),
+                                 hle_cell_sysutil_avconf_ext(), hle_cell_sysmodule(), hle_cell_rtc(), hle_cell_net_ctl(),
+                                 hle_sys_net()})
+        table.add(mod);
     if (!table.bind(mem_, *main_, img_, names)) return false;
     register_sync_syscalls();
     register_memory_syscalls();
+    register_fs_syscalls();
 
     rt::Hooks& h = rt::hooks();
     h.syscall = syscall_dispatch;
@@ -227,19 +233,16 @@ std::shared_ptr<PpuThread> Kernel::create_thread(GuestAddr entry_opd, uint64_t a
 
 namespace {
 struct HostStart {
-    Kernel* k;
-    std::shared_ptr<PpuThread> t;
+    std::function<void()> body;
 };
 DWORD WINAPI host_thread(void* p) {
     std::unique_ptr<HostStart> s(static_cast<HostStart*>(p));
-    s->k->thread_entry_point(s->t);
+    s->body();
     return 0;
 }
-}  // namespace
-
-bool Kernel::start_thread(const std::shared_ptr<PpuThread>& t) {
-    // Recompiled guest calls nest as host calls: give each thread a large host stack.
-    auto* s = new HostStart{this, t};
+// Recompiled guest calls nest as host calls: give each thread a large host stack.
+bool start_host_thread(std::function<void()> body) {
+    auto* s = new HostStart{std::move(body)};
     HANDLE h = CreateThread(nullptr, 64u << 20, host_thread, s, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
     if (!h) {
         delete s;
@@ -247,6 +250,38 @@ bool Kernel::start_thread(const std::shared_ptr<PpuThread>& t) {
     }
     CloseHandle(h);
     return true;
+}
+}  // namespace
+
+bool Kernel::start_thread(const std::shared_ptr<PpuThread>& t) {
+    return start_host_thread([this, t] { thread_entry_point(t); });
+}
+
+bool Kernel::start_native_thread(const std::string& name, std::function<void(PpuThread&)> body) {
+    auto t = std::make_shared<PpuThread>();
+    t->id = next_thread_id();
+    t->name = name;
+    t->priority = 1000;
+    if (!alloc_stack(*t, 0x10000)) return false;
+    PPUContext& c = t->ctx;
+    c.gpr[1] = t->stack_addr + t->stack_size - 0x70;
+    c.gpr[2] = img_.toc;
+    c.gpr[13] = alloc_tls(*t);
+    {
+        std::lock_guard<std::mutex> g(threads_lock_);
+        threads_.emplace(t->id, t);
+    }
+    return start_host_thread([this, t, body = std::move(body)] {
+        SetThreadDescription(GetCurrentThread(), std::wstring(t->name.begin(), t->name.end()).c_str());
+        t_current = t.get();
+        try {
+            body(*t);
+        } catch (const ProcessExit& e) {
+            request_exit(e.status);
+        } catch (const ThreadExit&) {
+        }
+        t_current = nullptr;
+    });
 }
 
 void Kernel::thread_entry_point(const std::shared_ptr<PpuThread>& t) {
@@ -312,6 +347,15 @@ void call_guest(PPUContext& c, GuestMemory& m, GuestAddr opd) {
 
 
 void Kernel::print_summary() const {
+    {
+        std::lock_guard<std::mutex> g(const_cast<std::mutex&>(threads_lock_));
+        SLY4_INFO("threads: %zu", threads_.size());
+        for (const auto& [id, t] : threads_) {
+            const char* call = t->last_call.load();
+            std::fprintf(stderr, "  0x%08" PRIX64 " %-26s %s última chamada: %s (de 0x%08X)\n", id, t->name.c_str(),
+                         t->done ? "terminada" : "ativa    ", call ? call : "-", t->last_lr.load());
+        }
+    }
     auto hs = hle().stats();
     std::stable_sort(hs.begin(), hs.end(), [](const auto& a, const auto& b) { return a.calls > b.calls; });
     size_t called = 0, missing = 0;

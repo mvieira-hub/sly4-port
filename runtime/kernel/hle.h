@@ -99,5 +99,16 @@ HleTable& hle();
 
 // Modules (runtime/kernel/hle_*.cpp).
 HleModule hle_sys_prx_for_user();
+HleModule hle_sys_fs();
+HleModule hle_cell_game();
+HleModule hle_cell_sysutil();
+HleModule hle_cell_sysutil_avconf_ext();
+HleModule hle_cell_sysmodule();
+HleModule hle_cell_rtc();
+HleModule hle_cell_net_ctl();
+HleModule hle_sys_net();
+
+// A string from the game's PARAM.SFO ("" if missing), e.g. "TITLE_ID".
+std::string param_sfo_string(const char* key);
 
 }  // namespace sly4

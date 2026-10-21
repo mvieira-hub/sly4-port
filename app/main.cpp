@@ -9,6 +9,7 @@
 //   sly4.exe ... --no-run            loads only, does not start the game
 //   sly4.exe ... --seconds N         stops the game after N seconds and prints the summary
 //   sly4.exe ... --trace             logs every library call and syscall, not just the first
+//   sly4.exe ... --data <dir>        where /dev_hdd0 and /dev_hdd1 live (default %LOCALAPPDATA%\sly4-port)
 //   sly4.exe ... --dump-imports f.csv  writes module,nid,name,slot of every import
 //   sly4.exe --nid-names <file>      NID name candidates (default tools\data\ps3_nid_candidates.txt)
 //   sly4.exe --frames 300            presents 300 frames and exits (exit code 0 = ok)
@@ -58,7 +59,7 @@ constexpr const char* kDefaultNidNames = "tools/data/ps3_nid_candidates.txt";
 struct Args {
     long frames = 0;  // 0 = until the window is closed
     long seconds = 0;  // 0 = no limit for the game
-    std::string game_dir, eboot, nid_names, dump_imports;
+    std::string game_dir, eboot, nid_names, dump_imports, data_dir;
     bool window = true, run = true, trace = false;
     sly4::VulkanOptions vulkan;
 };
@@ -85,6 +86,8 @@ bool parse_args(int argc, char** argv, Args& out) {
             out.window = false;
         } else if (std::strcmp(argv[i], "--no-run") == 0) {
             out.run = false;
+        } else if (std::strcmp(argv[i], "--data") == 0) {
+            ok = value(out.data_dir);
         } else if (std::strcmp(argv[i], "--trace") == 0) {
             out.trace = true;
         } else if (std::strcmp(argv[i], "--seconds") == 0 && i + 1 < argc) {
@@ -185,6 +188,13 @@ bool start_game(const Args& args, sly4::GuestMemory& mem, const sly4::LoadedImag
     g_kernel = &kernel;
     sly4::KernelOptions opt;
     opt.trace = args.trace;
+    // PS3_GAME is the folder above USRDIR\EBOOT.elf; saves and caches go to %LOCALAPPDATA%.
+    const std::filesystem::path eboot = std::filesystem::absolute(args.eboot);
+    opt.game_dir = args.game_dir.empty() ? eboot.parent_path().parent_path().string()
+                                         : std::filesystem::absolute(args.game_dir).string();
+    const char* local = std::getenv("LOCALAPPDATA");
+    opt.data_dir = args.data_dir.empty() ? (std::filesystem::path(local ? local : ".") / "sly4-port").string()
+                                         : std::filesystem::absolute(args.data_dir).string();
     if (!kernel.init(names, opt)) return false;
     sly4::rt::hooks().fault = on_guest_fault;
     SetUnhandledExceptionFilter(on_unhandled);

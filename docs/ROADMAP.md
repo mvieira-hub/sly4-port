@@ -393,6 +393,7 @@ Plano original da fase, para referência:
 Andamento em [KERNEL.md](KERNEL.md):
 - **3a, partida do processo (concluída):** o EBOOT recompilado roda a partir do ponto de entrada real. As 251 importações estão ligadas a funções nativas, as 71 syscalls têm nome e cada chamada nova é registrada. O jogo inicializa memória, SPURS e `cellGame`, escreve no TTY e para esperando a primeira thread que ainda não existe.
 - **3b, threads, sincronização e memória (concluída):** threads PPU em threads do Windows, os objetos de sincronização do LV2 (lwmutex, mutex, cond, rwlock, semáforo, event flag, filas e portas de evento, timers) e o `sys_mmapper`. O jogo cria 5 threads, sobe o FIOS (o sistema de arquivos da Sony) e faz as primeiras chamadas de arquivo.
+- **3c, arquivos e módulos de sistema (concluída):** VFS, `cellFs` e `sc` 801–818, `cellGame` lendo o `PARAM.SFO`, `cellSysutil`, `cellSysmodule`, `cellRtc` e rede desconectada. O jogo abre o `Sly4.psarc`, lê o índice e monta o cache em `/dev_hdd1`. Depois para esperando a primeira descompressão, que o FIOS entrega a uma tarefa SPU do SPURS.
 
 Plano da fase:
 - Syscalls: threads, sincronização, timers, memória, TTY e arquivos.

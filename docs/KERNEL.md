@@ -6,7 +6,7 @@ O código recompilado do jogo (Fase 2) chama o sistema do PS3 de duas formas: po
 |---|---|
 | 3a. Partida do processo: o EBOOT roda do ponto de entrada, com HLE, syscalls e registro das chamadas | **Concluída** (2026-10-21) |
 | 3b. Memória, threads PPU e sincronização (lwmutex, mutex, cond, rwlock, semáforo, event flag, filas de evento, timers) | **Concluída** (2026-10-21) |
-| 3c. Arquivos (VFS, `cellFs` e `sc` 801–818) e módulos de sistema (`cellGame`, `cellSysutil`, `cellSysmodule`, `cellRtc`, stubs de NP e rede) | Próxima |
+| 3c. Arquivos (VFS, `cellFs` e `sc` 801–818) e módulos de sistema (`cellGame`, `cellSysutil`, `cellSysmodule`, `cellRtc`, stubs de NP e rede) | **Concluída** (2026-10-21) |
 | 3d. Chegar ao `cellGcmInit`, com o log comparado ao do RPCS3 | Pendente |
 
 Código em `runtime/kernel/`, biblioteca `sly4_kernel`.
@@ -144,3 +144,63 @@ Testes novos no `sly4_tests.exe`, com threads de verdade:
 - fila de evento: cheia, vazia com *timeout* e recepção bloqueante;
 - event flag: AND/OR com limpeza;
 - semáforo: limite máximo.
+
+## 3c. Arquivos e módulos de sistema
+
+### VFS
+
+| Caminho do PS3 | No PC |
+|---|---|
+| `/dev_bdvd/...` | A pasta que contém o `PS3_GAME` do dump (`--game`) |
+| `/app_home/...` | `PS3_GAME/USRDIR` |
+| `/dev_hdd0/...` | `%LOCALAPPDATA%\sly4-port\hdd0` (ou `--data <pasta>`) |
+| `/dev_hdd1/...` | `...\hdd1`. Depois do `cellSysCacheMount`, passa a ser `hdd1\caches\<TITLE_ID>_<id do cache>\`, esvaziada a cada montagem, como no RPCS3 |
+
+Os caminhos são normalizados (`//`, `.`, `..`) e nunca saem do dispositivo. O nome do dispositivo ignora maiúsculas, e o Windows já ignora no resto.
+
+### cellFs e syscalls 801–818
+
+Uma tabela de descritores (a partir de 3) sobre `CreateFileW`, compartilhada por `cellFs*` e pelos `sc` diretos:
+- open (flags `O_CREAT`/`EXCL`/`TRUNC`/`APPEND`), read, write, close, lseek, fsync;
+- stat e fstat (`CellFsStat` de 52 bytes);
+- opendir, readdir (com `.` e `..`) e closedir, mais `cellFsGetDirectoryEntries`;
+- mkdir, rmdir, unlink e `cellFsGetFreeSize` (40 GiB livres);
+- `cellFsAioRead`/`Write` numa thread de sistema `FsAio`, que chama o *callback* do jogo pelo `call_guest`.
+
+Os erros seguem os códigos do PS3 (`ENOENT`, `EEXIST`, `EBADF`, `ENOTEMPTY`…). Cada `open`/`stat`/`mkdir` vai para o log como `[fs]`, para comparar com o RPCS3.
+
+### Módulos
+
+| Módulo | O que responde |
+|---|---|
+| `cellGame` | Jogo em disco: tipo DISC, 40 GiB livres e tamanho "não calculado". `ContentPermit` devolve `/dev_bdvd/PS3_GAME` e `.../USRDIR`. `GetParamInt`/`String` leem o `PARAM.SFO` do dump. `PatchCheck` responde `NOTPATCH` |
+| `cellSysutil` | *Callbacks* registrados (sem eventos ainda); parâmetros do sistema (inglês, X confirma, 24 h); vídeo 1280×720 16:9 a 59,94 Hz; áudio estéreo LPCM; `cellSysCacheMount`; diálogos só no log |
+| `cellSysutilAvconfExt` | Tela de 40", gama |
+| `cellSysmodule` | Carregar e descarregar módulos só marca o estado |
+| `cellRtc` | Hora local do Windows |
+| `cellNetCtl`, `sys_net` | Rede desconectada; `_sys_net_errno_loc` |
+
+### Resultado
+
+O jogo agora escreve no TTY os valores reais:
+- `CELL_GAME_GAMETYPE_DISC`;
+- título "Sly Cooper: Thieves in Time™" e `TITLE_ID` BCES01284;
+- `PARENTAL_LEVEL` 3;
+- os caminhos `/dev_bdvd/PS3_GAME/USRDIR`.
+
+Não há mais queda. O FIOS:
+1. monta o cache e cria `/dev_hdd1/dev_hdd1/cache.idx` e `cache.dat`;
+2. sobe mais 4 threads de mídia;
+3. abre o `Sly4.psarc`, lê o cabeçalho e o índice (cerca de 3 MB) e copia blocos de dados para o cache com duas threads em paralelo.
+
+Para a primeira leitura comprimida, o FIOS manda um pedido para uma **tarefa SPU do SPURS** (`_cellSpursLFQueuePushBody`; a tarefa foi criada com `cellSpursCreateTask` a partir do ELF SPU em `0xE42D00`). Depois espera o término em `cellSpursEventFlagWait`. Sem SPURS, ninguém descomprime e a espera não acaba.
+
+O próximo bloqueio é, portanto, o SPU, e não mais o kernel ou os arquivos.
+
+O resumo final agora também lista cada thread com a última chamada que fez, o que mostra onde cada uma está esperando.
+
+Teste novo no `sly4_tests.exe`, sobre uma pasta temporária com a estrutura de um dump:
+- resolução de caminhos, inclusive a recusa de sair do dispositivo;
+- leitura com `lseek` e `read_at`, e `stat`/`fstat`;
+- criação e escrita em `/dev_hdd0`;
+- listagem de pasta e os erros `EEXIST`, `EBADF`, `ENOENT` e `ENOTEMPTY`.

@@ -5,6 +5,7 @@
 
 #include "core/log.h"
 #include "kernel/guest_alloc.h"
+#include "kernel/kernel.h"
 #include "loader/elf_loader.h"
 #include "loader/nid.h"
 
@@ -91,12 +92,18 @@ void HleTable::call(PPUContext& c, GuestMemory& m, uint32_t target) {
     }
     Import& im = imports_[i];
     im.calls.fetch_add(1, std::memory_order_relaxed);
+    if (PpuThread* t = current_thread()) {
+        t->last_call = im.name.c_str();
+        t->last_lr = uint32_t(c.lr) & ~3u;
+    }
     CallLog& log = call_log();
     const bool first = log.first_call(i);
     if (first || log.trace) {
-        char line[256];
-        std::snprintf(line, sizeof(line), "%s.%s(0x%" PRIX64 ", 0x%" PRIX64 ", 0x%" PRIX64 ", 0x%" PRIX64 ") <- 0x%08X%s",
-                      im.module.c_str(), im.name.c_str(), c.gpr[3], c.gpr[4], c.gpr[5], c.gpr[6],
+        char line[320];
+        const PpuThread* t = current_thread();
+        std::snprintf(line, sizeof(line),
+                      "{%s} %s.%s(0x%" PRIX64 ", 0x%" PRIX64 ", 0x%" PRIX64 ", 0x%" PRIX64 ") <- 0x%08X%s",
+                      t ? t->name.c_str() : "?", im.module.c_str(), im.name.c_str(), c.gpr[3], c.gpr[4], c.gpr[5], c.gpr[6],
                       uint32_t(c.lr) & ~3u, im.fn ? "" : "  [sem implementação: CELL_OK]");
         log.record(line);
     }
