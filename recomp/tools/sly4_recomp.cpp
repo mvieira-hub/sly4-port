@@ -4,14 +4,23 @@
 //       Decodes every word of the range and prints "addr:\tword\tinstruction" in the
 //       syntax of objdump -M cell,raw, to be compared with binutils
 //       (tools/ppc/compare_disasm.py). Default range: the EBOOT .text section.
+//   sly4_recomp analyze --eboot <EBOOT.elf> --out-dir <dir>
+//       Control-flow analysis (functions, blocks, jump tables, code vs data); writes
+//       functions.csv, jumptables.csv, wordmap.csv, noreturn.csv and invalid.csv.
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <map>
+#include <set>
 #include <string>
 
+#include "analysis/program.h"
 #include "core/log.h"
 #include "loader/elf_loader.h"
+#include "loader/nid.h"
 #include "memory/guest_memory.h"
 #include "ppu/ppu_decoder.h"
 #include "ppu/ppu_disasm.h"
@@ -27,8 +36,137 @@ namespace {
 
 int usage() {
     std::fprintf(stderr,
-                 "uso: sly4_recomp disasm --eboot <EBOOT.elf> [--start 0x10230] [--end 0xABD560] [--out arquivo]\n");
+                 "uso: sly4_recomp disasm  --eboot <EBOOT.elf> [--start 0x10230] [--end 0xABD560] [--out arquivo]\n"
+                 "     sly4_recomp analyze --eboot <EBOOT.elf> --out-dir <pasta> [--nid-names arquivo]\n");
     return 2;
+}
+
+bool load(const std::string& eboot, sly4::GuestMemory& mem, sly4::LoadedImage& img) {
+    std::string error;
+    if (!mem.reserve() || !sly4::load_elf(eboot, mem, img, error)) {
+        SLY4_ERROR("falha ao carregar %s: %s", eboot.c_str(), error.c_str());
+        return false;
+    }
+    return true;
+}
+
+FILE* open_out(const std::filesystem::path& p) {
+    FILE* f = std::fopen(p.string().c_str(), "w");
+    if (!f) SLY4_ERROR("não foi possível criar %s", p.string().c_str());
+    return f;
+}
+
+int cmd_analyze(int argc, char** argv) {
+    std::string eboot, out_dir, nid_file = "tools/data/ps3_nid_candidates.txt";
+    for (int i = 2; i < argc; ++i) {
+        if (i + 1 >= argc) return usage();
+        if (std::strcmp(argv[i], "--eboot") == 0) eboot = argv[++i];
+        else if (std::strcmp(argv[i], "--out-dir") == 0) out_dir = argv[++i];
+        else if (std::strcmp(argv[i], "--nid-names") == 0) nid_file = argv[++i];
+        else return usage();
+    }
+    if (eboot.empty() || out_dir.empty()) return usage();
+    sly4::GuestMemory mem;
+    sly4::LoadedImage img;
+    if (!load(eboot, mem, img)) return 3;
+    sly4::NidNames names;
+    names.load_file(nid_file);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const sly4::recomp::Program prog = sly4::recomp::analyze(mem, img);
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+
+    using sly4::recomp::FuncKind;
+    using sly4::recomp::Term;
+    const auto& st = prog.stats;
+    size_t code_funcs = 0, stubs = 0, opd = 0, blocks = 0, calls = 0, tails = 0, indirect = 0;
+    std::map<Term, size_t> terms;
+    for (const auto& [e, f] : prog.functions) {
+        (f.kind == FuncKind::ImportStub ? stubs : code_funcs)++;
+        opd += f.from_opd;
+        blocks += f.blocks.size();
+        calls += f.calls.size();
+        tails += f.tail_calls.size();
+        indirect += f.indirect_calls;
+        for (const auto& b : f.blocks) ++terms[b.term];
+    }
+    SLY4_INFO("análise em %.2f s, %u passadas", secs, st.passes);
+    SLY4_INFO("funções: %zu de código (%zu pelo .opd, %zu só por chamada) + %zu stubs de importação", code_funcs,
+              opd, code_funcs - opd, stubs);
+    SLY4_INFO("blocos: %zu; chamadas diretas: %zu; tail calls: %zu; chamadas indiretas: %zu", blocks, calls, tails,
+              indirect);
+    std::string tl;
+    for (auto [t, n] : terms) tl += std::string(" ") + sly4::recomp::term_name(t) + "=" + std::to_string(n);
+    SLY4_INFO("fim de bloco:%s", tl.c_str());
+    SLY4_INFO("tabelas de salto: %u (%u com limite pelo cmpli; base da TOC diferente de bctr+4: %u)", st.jump_tables,
+              st.bounded_tables, st.toc_base_mismatch);
+    SLY4_INFO("palavras executáveis: %u; não nulas: %u; código: %u (%.2f%% das não nulas); tabelas: %u",
+              st.exec_words, st.nonzero_words, st.code_words, 100.0 * st.code_words / std::max(1u, st.nonzero_words),
+              st.table_words);
+    SLY4_INFO("instruções em mais de uma função: %u; chamadas sem retorno: %u; inválidas alcançadas: %u",
+              st.overlapping_instructions, st.noreturn_calls, st.invalid_reached);
+
+    std::filesystem::create_directories(out_dir);
+    const std::filesystem::path dir(out_dir);
+    if (FILE* f = open_out(dir / "functions.csv")) {
+        std::fprintf(f, "entry,lo,hi,kind,opd,instructions,blocks,calls,tail_calls,indirect_calls,tables,name\n");
+        for (const auto& [e, fn] : prog.functions) {
+            std::string name;
+            if (fn.kind == FuncKind::ImportStub) {
+                const std::string* n = names.find(fn.import_nid);
+                char buf[32];
+                std::snprintf(buf, sizeof(buf), "nid_%08X", fn.import_nid);
+                name = fn.import_module + "::" + (n ? *n : std::string(buf));
+            }
+            std::fprintf(f, "0x%08X,0x%08X,0x%08X,%s,%d,%u,%zu,%zu,%zu,%u,%zu,%s\n", e, fn.lo, fn.hi,
+                         fn.kind == FuncKind::ImportStub ? "stub" : "code", fn.from_opd ? 1 : 0, fn.instructions,
+                         fn.blocks.size(), fn.calls.size(), fn.tail_calls.size(), fn.indirect_calls,
+                         fn.tables.size(), name.c_str());
+        }
+        std::fclose(f);
+    }
+    if (FILE* f = open_out(dir / "jumptables.csv")) {
+        std::fprintf(f, "function,bctr,base,count,bounded,toc_base,targets\n");
+        for (const auto& [e, fn] : prog.functions)
+            for (const auto& jt : fn.tables)
+                std::fprintf(f, "0x%08X,0x%08X,0x%08X,%u,%d,%d,%zu\n", e, jt.bcctr, jt.base, jt.count, jt.bounded,
+                             jt.toc_base, std::set<uint32_t>(jt.targets.begin(), jt.targets.end()).size());
+        std::fclose(f);
+    }
+    // Runs of words by class: code / table / unreached (only non-zero unreached runs listed).
+    if (FILE* f = open_out(dir / "wordmap.csv")) {
+        std::fprintf(f, "start,end,class,words,nonzero,decodable\n");
+        for (auto [lo, hi] : prog.exec_ranges) {
+            uint32_t a = lo;
+            while (a < hi) {
+                const uint8_t cls = prog.class_of(a);
+                uint32_t b = a, nonzero = 0, valid = 0;
+                while (b < hi && prog.class_of(b) == cls) {
+                    const uint32_t w = mem.read<uint32_t>(b);
+                    nonzero += w != 0;
+                    valid += sly4::ppu::decode(w).op != sly4::ppu::Op::invalid;
+                    b += 4;
+                }
+                if (cls != 0 || nonzero)
+                    std::fprintf(f, "0x%08X,0x%08X,%s,%u,%u,%u\n", a, b, cls == 1 ? "code" : cls == 2 ? "table" : "unreached",
+                                 (b - a) / 4, nonzero, valid);
+                a = b;
+            }
+        }
+        std::fclose(f);
+    }
+    if (FILE* f = open_out(dir / "noreturn.csv")) {
+        std::fprintf(f, "call,callee\n");
+        for (auto [call, callee] : prog.noreturn_sites) std::fprintf(f, "0x%08X,0x%08X\n", call, callee);
+        std::fclose(f);
+    }
+    if (FILE* f = open_out(dir / "invalid.csv")) {
+        std::fprintf(f, "address,function\n");
+        for (auto [a, fn] : prog.invalid_sites) std::fprintf(f, "0x%08X,0x%08X\n", a, fn);
+        std::fclose(f);
+    }
+    SLY4_INFO("CSVs gravados em %s", out_dir.c_str());
+    return st.invalid_reached ? 1 : 0;
 }
 
 int cmd_disasm(int argc, char** argv) {
@@ -46,11 +184,7 @@ int cmd_disasm(int argc, char** argv) {
 
     sly4::GuestMemory mem;
     sly4::LoadedImage img;
-    std::string error;
-    if (!mem.reserve() || !sly4::load_elf(eboot, mem, img, error)) {
-        SLY4_ERROR("falha ao carregar %s: %s", eboot.c_str(), error.c_str());
-        return 3;
-    }
+    if (!load(eboot, mem, img)) return 3;
     if (!mem.is_committed(start, end - start)) {
         SLY4_ERROR("faixa 0x%X-0x%X fora da imagem", start, end);
         return 3;
@@ -85,5 +219,6 @@ int main(int argc, char** argv) {
 #endif
     if (argc < 2) return usage();
     if (std::strcmp(argv[1], "disasm") == 0) return cmd_disasm(argc, argv);
+    if (std::strcmp(argv[1], "analyze") == 0) return cmd_analyze(argc, argv);
     return usage();
 }

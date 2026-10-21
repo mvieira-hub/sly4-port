@@ -54,6 +54,16 @@ struct ImportedModule {
     std::vector<ImportedFunction> functions;
 };
 
+// ELF section header. RPCS3's decrypted EBOOT keeps the section table but not the
+// name table, so sections are told apart by flags and by what they contain.
+struct ElfSection {
+    GuestAddr addr = 0;
+    uint32_t size = 0;
+    uint32_t type = 0;   // SHT_PROGBITS = 1, SHT_NOBITS = 8
+    uint64_t flags = 0;  // SHF_WRITE = 1, SHF_ALLOC = 2, SHF_EXECINSTR = 4
+    bool executable() const { return (flags & 4) && type == 1 && size; }
+};
+
 struct LoadedImage {
     GuestAddr entry_descriptor = 0;  // e_entry points to an .opd descriptor {function, toc}
     GuestAddr entry_function = 0;
@@ -65,8 +75,12 @@ struct LoadedImage {
     GuestAddr libent_start = 0, libent_end = 0;   // exports (empty for a game)
     GuestAddr libstub_start = 0, libstub_end = 0;  // imports
     std::vector<ImportedModule> imports;
+    std::vector<ElfSection> sections;
+    // .opd: the section holding the entry descriptor; 8-byte {function, toc} records.
+    GuestAddr opd_start = 0, opd_end = 0;
 
     size_t imported_function_count() const;
+    const ElfSection* section_containing(GuestAddr a) const;
 };
 
 // Loads `path` into `mem` (which must be reserved). On failure returns false and

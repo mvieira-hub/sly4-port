@@ -367,7 +367,9 @@ As durações são estimativas para uma pessoa em dedicação parcial, com o Cla
 
 ### Fase 2: recompilador PPU (6–10 semanas) — **em andamento**
 
-Andamento em [RECOMP.md](RECOMP.md). A entrega 2a (decodificador) está concluída: nas 2,8 milhões de instruções, o texto é idêntico ao do binutils em tudo o que ele decodifica (0 divergências).
+Andamento em [RECOMP.md](RECOMP.md):
+- **2a, decodificador (concluída):** nas 2,8 milhões de instruções, o texto é idêntico ao do binutils em tudo o que ele decodifica (0 divergências).
+- **2b, análise de fluxo (concluída):** 23.913 funções e 251 stubs, 301 mil blocos, as 178 tabelas de salto resolvidas e 0 instruções inválidas alcançadas. Nenhuma palavra que o binutils rejeita foi classificada como código.
 
 - **Decodificador próprio** (as tabelas do binutils servem de referência): 315 mnemônicos, cerca de 200 operações-base.
 - **Análise:** limites de função (`functions.csv` e Ghidra), tabelas de salto e dados no meio do código. Há 10.044 palavras no `.text` que o objdump não decodifica (`.long`), e cada uma precisa ser classificada como tabela ou dado.

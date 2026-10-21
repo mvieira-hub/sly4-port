@@ -5,8 +5,8 @@ O recompilador lê o `EBOOT.elf` de quem compila e gera C++ a partir do código 
 | Entrega | Estado |
 |---|---|
 | 2a. Decodificador PPU | **Concluída** (2026-10-21) |
-| 2b. Análise: funções, blocos, tabelas de salto | Próxima |
-| 2c. Interpretador de referência (semântica de cada instrução) | — |
+| 2b. Análise: funções, blocos, tabelas de salto | **Concluída** (2026-10-21) |
+| 2c. Interpretador de referência (semântica de cada instrução) | Próxima |
 | 2d. Gerador de C++ + teste diferencial contra o interpretador | — |
 | 2e. EBOOT inteiro → C++ compilando | — |
 
@@ -52,3 +52,66 @@ A classe "o objdump rejeita" tem duas origens:
 Separar código de dado é tarefa da análise de fluxo (2b), não do decodificador.
 
 A decodificação do `.text` inteiro (2,8 milhões de palavras) leva cerca de 1,6 s. O `sly4_tests.exe` traz 64 instruções reais, uma por forma, com o texto esperado do objdump, e roda na CI sem precisar do jogo.
+
+## 2b. Análise de fluxo
+
+Código em `recomp/analysis/program.{h,cpp}`, biblioteca `sly4_analysis`. Para rodar:
+
+```powershell
+.\build\mingw-release\sly4_recomp.exe analyze --eboot PS3_GAME\USRDIR\EBOOT.elf --out-dir work\analysis
+.\tools\run.ps1 ppc/check_analysis.py --objdump /work/objdump_raw.txt --analysis /work/analysis --eboot-scan /work/eboot/functions.csv
+```
+
+**Como funciona.** É uma descida recursiva a partir de pontos de entrada conhecidos:
+- os descritores do `.opd`: toda função que tem o endereço tomado no ABI PPC64;
+- a entrada do ELF;
+- os stubs de importação;
+- todo alvo de `bl` que for sendo alcançado.
+
+Cada função é explorada seguindo os desvios. O que nunca é alcançado não vira código, então constantes, tabelas e preenchimento no meio do `.text` ficam de fora sozinhos. Como novas chamadas mudam a classificação dos desvios (tail call para outra função ou desvio local), o processo repete até estabilizar; foram 10 passadas, em 3 s.
+
+| Situação | Classificação |
+|---|---|
+| `b` para a entrada de outra função | *tail call* |
+| `bl` seguido de dado ou de outra função | chamada sem retorno |
+| `bcl 20,31,$+4` | só lê o PC; não é chamada |
+| `tw`/`twi` com TO = 31 e `attn` | armadilha (fim de bloco) |
+| `bclrl`/`bcctrl` | chamada indireta |
+| `bcctr` reconhecido | tabela de salto |
+| `bcctr` não reconhecido | salto indireto |
+
+**Stubs de importação.** O padrão é `li r12,0 ; oris r12,r12,slot@h ; lwz r12,slot@l(r12) ; … ; bctr`, em que `slot` é um dos *slots* da `.lib.stub`. Cada stub vira uma função do tipo `stub`, com módulo e NID.
+
+**Tabelas de salto.** O padrão do compilador é:
+```
+cmpli crN,0,rI,K ; bc 12,crN+gt,default ; lwz rB,D(r2) ; rldic/rlwinm rX,rI,2,..
+lwzx rY,rX,rB ; extsw rY,rY ; add rZ,rY,rB ; mtctr rZ ; bctr ; .long deslocamentos relativos a rB
+```
+A busca para trás segue só o código em linha reta: para em qualquer desvio incondicional, e o `cmpli` precisa comparar o registrador de origem do índice. Sem guarda, a tabela termina no primeiro alvo depois da base, porque o código dos casos vem logo após ela. Esse limite também vale para as tabelas com guarda. Uma primeira versão, que atravessava blocos, pegou o `cmpli` errado na função `0x854208`: leu 10 entradas em vez de 19 ou mais e deixou casos de fora.
+
+### Resultado no EBOOT
+
+| Medida | Valor |
+|---|---|
+| Funções | 23.913 de código (13.858 pelo `.opd`, 10.055 só por chamada) + 251 stubs (uma por importação) |
+| Blocos básicos | 300.984 |
+| Chamadas diretas / indiretas / tail calls | 97.516 / 24.055 / 400 |
+| Tabelas de salto | 178 (todos os `bcctr` incondicionais do jogo): 127 com guarda confirmado, 51 delimitadas pelo primeiro alvo; base na TOC sempre igual a `bctr+4` |
+| Saltos indiretos não resolvidos | 251, exatamente os stubs |
+| Instruções inválidas alcançadas | **0** |
+| Código | 2.770.846 palavras (99,14% das não nulas); 4.430 de tabelas |
+
+**Conferências independentes** (`check_analysis.py`):
+- os 1.159 `mftb` estão todos no código;
+- **nenhuma das 8.885 outras palavras que o binutils rejeita está no código**: 4.398 são entradas de tabela e 4.487 não são alcançadas;
+- 24.147 entradas coincidem com o `eboot_scan.py`. As 25 que só ele tem são `bl` achados por varredura linear em área não alcançada. As 17 que só nós temos são stubs de importações que o jogo nunca chama.
+
+**O que sobra não alcançado** são 19.557 palavras não nulas. Nos 144 trechos de 8 palavras ou mais que decodificam quase inteiros:
+- 60 são grupos de constantes `float`;
+- 14 são pares `nop; b` mortos;
+- 69 são fragmentos mortos com `blr`: epílogos soltos e funções minúsculas que o compilador expandiu em todo lugar;
+- 1 é misto.
+
+Nenhum tem prólogo de função (`stdu r1` / `mflr`). Mesmo assim, o runtime vai ter um interpretador (2c) como rede de segurança para qualquer destino indireto que a análise não conheça.
+
+O `sly4_tests.exe` monta à mão um programa com `switch` por tabela, chamada, tail call e `float` no meio do código, e confere a análise na CI.

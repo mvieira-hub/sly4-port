@@ -75,6 +75,12 @@ size_t LoadedImage::imported_function_count() const {
     return n;
 }
 
+const ElfSection* LoadedImage::section_containing(GuestAddr a) const {
+    for (const auto& s : sections)
+        if (s.size && a >= s.addr && a - s.addr < s.size) return &s;
+    return nullptr;
+}
+
 bool load_elf(const std::string& path, GuestMemory& mem, LoadedImage& out, std::string& error) {
     out = LoadedImage{};
     if (!mem.reserved()) {
@@ -180,6 +186,26 @@ bool load_elf(const std::string& path, GuestMemory& mem, LoadedImage& out, std::
     }
     out.entry_function = mem.read<uint32_t>(out.entry_descriptor);
     out.toc = mem.read<uint32_t>(out.entry_descriptor + 4);
+
+    // Section headers (optional for loading, needed by the recompiler's analysis).
+    const uint64_t shoff = load_be<uint64_t>(b + 0x28);
+    const uint16_t shentsize = load_be<uint16_t>(b + 0x3A);
+    const uint16_t shnum = load_be<uint16_t>(b + 0x3C);
+    if (shoff && shentsize >= 0x40 && in_file(shoff, uint64_t(shentsize) * shnum)) {
+        for (uint16_t i = 0; i < shnum; ++i) {
+            const uint8_t* s = b + shoff + uint64_t(i) * shentsize;
+            ElfSection sec;
+            sec.type = load_be<uint32_t>(s + 0x04);
+            sec.flags = load_be<uint64_t>(s + 0x08);
+            sec.addr = static_cast<GuestAddr>(load_be<uint64_t>(s + 0x10));
+            sec.size = static_cast<uint32_t>(load_be<uint64_t>(s + 0x20));
+            out.sections.push_back(sec);
+        }
+    }
+    if (const ElfSection* opd = out.section_containing(out.entry_descriptor); opd && !opd->executable()) {
+        out.opd_start = opd->addr;
+        out.opd_end = opd->addr + opd->size;
+    }
 
     if (out.libstub_end > out.libstub_start) {
         if (!mem.is_committed(out.libstub_start, out.libstub_end - out.libstub_start)) {
