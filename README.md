@@ -47,9 +47,19 @@ O runtime C++20 (`runtime/`, `app/`) é compilado para Windows x86-64 dentro de 
 
 Outras opções: `--no-vsync` e `--validation`. Esta última exige a camada de validação do Vulkan SDK; sem ela, o programa só avisa.
 
+Carregar o executável do jogo (EBOOT descriptografado) na memória do PS3:
+
+```powershell
+.\build\mingw-release\sly4.exe --game PS3_GAME --no-window --dump-imports work\imports.csv
+$env:SLY4_EBOOT = "$PWD\PS3_GAME\USRDIR\EBOOT.elf"; .\build\mingw-release\sly4_tests.exe
+```
+
 Requisitos para rodar: Windows 10/11 e uma GPU com Vulkan 1.3 (o `vulkan-1.dll` vem com o driver).
 
-Estado atual: **Fase 0 concluída**. Abre a janela, escolhe a GPU dedicada e apresenta uma *swapchain* Vulkan 1.3 limpa a cada quadro. A CI (`.github/workflows/build.yml`) compila o mesmo `.exe` a cada push e o publica como artefato.
+Estado atual: **Fases 0 e 1 concluídas.**
+- O programa abre a janela Vulkan 1.3 na GPU dedicada.
+- Reserva os 4 GiB do espaço de endereços do PS3 e carrega o `EBOOT.elf`: segmentos, TLS, parâmetros do processo e as 251 importações, idênticas às do `eboot_scan.py`.
+- A CI (`.github/workflows/build.yml`) compila o `.exe`, roda os testes num runner Windows e publica os binários como artefato.
 
 ## Ambiente
 

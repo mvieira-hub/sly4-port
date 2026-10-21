@@ -26,5 +26,20 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: sly4-windows-x64
-          path: build/ci/sly4.exe
+          path: |
+            build/ci/sly4.exe
+            build/ci/sly4_tests.exe
           if-no-files-found: error
+
+  # The tests are Windows executables: run them on a Windows runner. The EBOOT test is
+  # skipped there (no game data in CI); it runs locally with SLY4_EBOOT.
+  tests:
+    needs: windows-x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: sly4-windows-x64
+
+      - name: sly4_tests.exe
+        run: .\sly4_tests.exe

@@ -20,3 +20,4 @@ add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initi
 
 add_subdirectory(runtime)
 add_subdirectory(app)
+add_subdirectory(tests)

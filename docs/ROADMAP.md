@@ -347,11 +347,23 @@ As durações são estimativas para uma pessoa em dedicação parcial, com o Cla
 - CI no GitHub Actions (`.github/workflows/build.yml`) com artefato `sly4-windows-x64`.
 - **Saída verificada:** `sly4.exe --frames 300` sai com código 0 na RTX 5060 Ti: Vulkan 1.4.351, swapchain 1280×720 `B8G8R8A8_SRGB`, 145 fps com vsync (FIFO) e 7.500 fps em MAILBOX.
 
-### Fase 1: memória e loader (1–2 semanas)
-- `runtime/memory/guest_memory` (seção 6).
-- Loader do `EBOOT.elf`: segmentos `PT_LOAD`, `.opd`, `.lib.stub`, TLS (segmento `0x7`) e o *process param*.
-- Tabela de NIDs (`tools/data/ps3_nid_candidates.txt`) → mapa stub → função HLE.
-- **Saída:** o loader carrega o EBOOT na memória do convidado e confere o descritor de entrada `0xF3B2D8`, a TOC `0xF50800` e as 251 importações com o mesmo resultado do `eboot_scan.py`.
+### Fase 1: memória e loader (1–2 semanas) — **concluída em 2026-10-21**
+- `runtime/core/endian.h`: `load_be`/`store_be` para inteiros, `float` e `double` sem alinhamento.
+- `runtime/memory/guest_memory`:
+  - 4 GiB reservados; *commit* por página, com proteção `ReadOnly`/`ReadWrite`; `VirtualQuery` responde o que está confirmado;
+  - acesso big-endian e `Vec128` com bytes invertidos;
+  - `read_cstring` que para em memória não confirmada;
+  - *handler* de exceção que traduz acessos inválidos para o endereço do PS3.
+- `runtime/loader/elf_loader`:
+  - valida ELF64 BE, `ET_EXEC` e `EM_PPC64`;
+  - carrega os `PT_LOAD`, zera o `.bss` (2,9 MB) e deixa o código somente leitura no host;
+  - lê o descritor de entrada (função `0x4FC7B4`, TOC `0xF50800`);
+  - lê o TLS (`0xF55680`, 0x160 bytes), o `sys_process_param` (SDK 4.10, prioridade 1001, pilha de 64 KiB, malloc de 1 MiB) e o `sys_process_prx_param`;
+  - lê as 20 entradas `sys_stub` da `.lib.stub`, com NIDs e *slots*. Os *slots* serão preenchidos pelo HLE na Fase 3.
+- `runtime/loader/nid`: SHA-1 próprio e `nid_of(nome)`; nomes vindos de `tools/data/ps3_nid_candidates.txt`.
+- `sly4.exe --game <PS3_GAME> [--no-window] [--dump-imports f.csv]`.
+- `sly4_tests.exe`: 9 testes, entre eles vetores FIPS do SHA-1, NIDs conhecidos e o EBOOT real (via `SLY4_EBOOT`). Rodam também na CI, num runner Windows.
+- **Saída verificada:** o EBOOT carrega em cerca de 25 ms, com 17,9 MiB confirmados. As 251 importações (20 módulos, 241 com nome) do `--dump-imports` são **idênticas, linha a linha e na mesma ordem**, às do `eboot_scan.py`.
 
 ### Fase 2: recompilador PPU (6–10 semanas)
 - **Decodificador próprio** (as tabelas do binutils servem de referência): 315 mnemônicos, cerca de 200 operações-base.
