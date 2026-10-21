@@ -62,7 +62,7 @@ Recompilador (Fase 2, em andamento; ver [docs/RECOMP.md](docs/RECOMP.md)):
 .\build\mingw-release\sly4_recomp.exe disasm --eboot PS3_GAME\USRDIR\EBOOT.elf --out work\ours_raw.txt
 ```
 
-Estado atual: **Fases 0 e 1 concluídas; Fase 2 com o decodificador PPU pronto.**
+Estado atual: **Fases 0 e 1 concluídas. Na Fase 2, o decodificador, a análise de fluxo e o interpretador PPU estão prontos; o interpretador foi validado contra o QEMU com 195 mil casos e 0 divergências.**
 - O programa abre a janela Vulkan 1.3 na GPU dedicada.
 - Reserva os 4 GiB do espaço de endereços do PS3 e carrega o `EBOOT.elf`: segmentos, TLS, parâmetros do processo e as 251 importações, idênticas às do `eboot_scan.py`.
 - A CI (`.github/workflows/build.yml`) compila o `.exe`, roda os testes num runner Windows e publica os binários como artefato.
@@ -78,6 +78,7 @@ Tudo roda em **Docker**; no Windows só são necessários Docker e Git.
 | `eclipse-temurin:21-jdk` | Ghidra sem interface (`tools\run_ghidra.ps1`) |
 | `sly4-spu:1` | binutils 2.35 para SPU (`tools/spu/Dockerfile`) |
 | `sly4-ppc:1` | binutils 2.35 para PowerPC com as instruções do Cell (`tools/ppc/Dockerfile`) |
+| `sly4-ppc-oracle:1` | QEMU + GCC PowerPC64: oráculo do interpretador PPU (`tools/ppc/oracle`) |
 
 Ferramentas externas, cada um baixa a sua:
 - **RPCS3**: descriptografa o EBOOT e serve de referência durante o port;

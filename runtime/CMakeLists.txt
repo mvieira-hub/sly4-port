@@ -10,3 +10,15 @@ add_library(sly4_runtime STATIC
 target_include_directories(sly4_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${VULKAN_HEADERS_DIR})
 target_compile_definitions(sly4_runtime PUBLIC VK_NO_PROTOTYPES)
 target_link_libraries(sly4_runtime PUBLIC SDL3::SDL3-static)
+
+# PPU reference interpreter (phase 2c): oracle for the C++ emitter and runtime fallback.
+add_library(sly4_cpu STATIC
+    cpu/ppu_interpreter.cpp
+    cpu/ppu_interp_fpu.cpp
+    cpu/ppu_interp_vmx.cpp
+)
+target_link_libraries(sly4_cpu PUBLIC sly4_runtime sly4_ppu)
+# FP results depend on the rounding mode set at run time and on IEEE flags. -mfma makes
+# std::fma/fmaf the hardware fused multiply-add (MinGW's library versions round twice,
+# which breaks fmadd/vmaddfp by one ulp); x86 CPUs have had FMA3 since 2013.
+target_compile_options(sly4_cpu PRIVATE -frounding-math -fno-fast-math -ffp-contract=off -mfma)

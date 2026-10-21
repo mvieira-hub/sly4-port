@@ -21,6 +21,7 @@
 #include "core/log.h"
 #include "loader/elf_loader.h"
 #include "loader/nid.h"
+#include "oracle.h"
 #include "memory/guest_memory.h"
 #include "ppu/ppu_decoder.h"
 #include "ppu/ppu_disasm.h"
@@ -220,5 +221,7 @@ int main(int argc, char** argv) {
     if (argc < 2) return usage();
     if (std::strcmp(argv[1], "disasm") == 0) return cmd_disasm(argc, argv);
     if (std::strcmp(argv[1], "analyze") == 0) return cmd_analyze(argc, argv);
+    if (std::strcmp(argv[1], "oracle-gen") == 0) return sly4::oracle::cmd_gen(argc, argv);
+    if (std::strcmp(argv[1], "oracle-check") == 0) return sly4::oracle::cmd_check(argc, argv);
     return usage();
 }

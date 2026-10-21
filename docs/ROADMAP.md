@@ -370,6 +370,7 @@ As durações são estimativas para uma pessoa em dedicação parcial, com o Cla
 Andamento em [RECOMP.md](RECOMP.md):
 - **2a, decodificador (concluída):** nas 2,8 milhões de instruções, o texto é idêntico ao do binutils em tudo o que ele decodifica (0 divergências).
 - **2b, análise de fluxo (concluída):** 23.913 funções e 251 stubs, 301 mil blocos, as 178 tabelas de salto resolvidas e 0 instruções inválidas alcançadas. Nenhuma palavra que o binutils rejeita foi classificada como código.
+- **2c, interpretador de referência (concluída):** inteiros, FPU (FPSCR completo) e VMX (modo NJ). Validado contra execução PowerPC real no QEMU: 195 instruções, 195 mil casos, 0 divergências. As diferenças explicadas (desvios do QEMU, comportamento indefinido, estimativas) são contadas e documentadas.
 
 - **Decodificador próprio** (as tabelas do binutils servem de referência): 315 mnemônicos, cerca de 200 operações-base.
 - **Análise:** limites de função (`functions.csv` e Ghidra), tabelas de salto e dados no meio do código. Há 10.044 palavras no `.text` que o objdump não decodifica (`.long`), e cada uma precisa ser classificada como tabela ou dado.

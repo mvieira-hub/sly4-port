@@ -6,8 +6,8 @@ O recompilador lê o `EBOOT.elf` de quem compila e gera C++ a partir do código 
 |---|---|
 | 2a. Decodificador PPU | **Concluída** (2026-10-21) |
 | 2b. Análise: funções, blocos, tabelas de salto | **Concluída** (2026-10-21) |
-| 2c. Interpretador de referência (semântica de cada instrução) | Próxima |
-| 2d. Gerador de C++ + teste diferencial contra o interpretador | — |
+| 2c. Interpretador de referência (semântica de cada instrução) | **Concluída** (2026-10-21) |
+| 2d. Gerador de C++ + teste diferencial contra o interpretador | Próxima |
 | 2e. EBOOT inteiro → C++ compilando | — |
 
 ## 2a. Decodificador PPU
@@ -115,3 +115,75 @@ A busca para trás segue só o código em linha reta: para em qualquer desvio in
 Nenhum tem prólogo de função (`stdu r1` / `mflr`). Mesmo assim, o runtime vai ter um interpretador (2c) como rede de segurança para qualquer destino indireto que a análise não conheça.
 
 O `sly4_tests.exe` monta à mão um programa com `switch` por tabela, chamada, tail call e `float` no meio do código, e confere a análise na CI.
+
+## 2c. Interpretador de referência
+
+Código em `runtime/cpu/`, biblioteca `sly4_cpu`:
+
+| Arquivo | Conteúdo |
+|---|---|
+| `ppu_context.h` | Estado da thread PPU: GPR, FPR em bits crus (*payloads* de NaN preservados), VR, CR, LR, CTR, XER, FPSCR, VSCR (NJ ligado por padrão, como no PS3) e reserva de `lwarx` |
+| `ppu_interpreter.cpp` | Inteiros, CR, rotações, cargas/gravações, desvios, reservas (CAS sobre o valor reservado), `sc`, armadilhas e `dcbz` (linha de 128 bytes do Cell) |
+| `ppu_interp_fpu.cpp` | FPU com as regras do PowerPC: ordem de NaN A, B, C e NaN padrão `0x7FF8…`; FPSCR completo (FX só na transição 0→1, VX\*, OX/UX/ZX/XX, FI/FR, FPRF); `fnmadd` arredonda e depois nega; `lfs`/`stfs` bit a bit |
+| `ppu_interp_vmx.cpp` | VMX inteiro (com saturação e SAT) e de ponto flutuante (modo NJ, NaN padrão `0x7FC00000`, FMA real), mais `lvlx`/`lvrx`/`stvlx`/`stvrx` do Cell |
+
+Ele tem dois papéis: oráculo do gerador de C++ (2d) e rede de segurança no runtime para destinos que a análise não conhecer.
+
+Três detalhes de ponto flutuante que custaram atenção:
+- **Precisão simples sem dupla rodada:** a operação é feita em `double` rumo a zero e marcada *round-to-odd*, e só então arredondada uma vez para `float`. Isso dá o resultado correto mesmo com entradas `double` completas. O zero exato, porém, pega o sinal do modo real: `x − x` arredondando para baixo dá −0.
+- **Underflow com "pequenez" antes do arredondamento,** como o PowerPC faz. O x86 mede depois. O teste usa o resultado truncado: o exato é não nulo e o truncado fica abaixo do menor normal.
+- **FMA de verdade:** o `fma`/`fmaf` da biblioteca do MinGW arredonda duas vezes, e isso errava `fmadd`/`vmaddfp` por 1 ulp. A biblioteca agora é compilada com `-mfma`, que usa a instrução do processador (FMA3, presente em todo PC desde 2013).
+
+### Validação diferencial contra o QEMU
+
+```powershell
+docker build -t sly4-ppc-oracle:1 tools\ppc\oracle
+.\build\mingw-release\sly4_recomp.exe oracle-gen --eboot PS3_GAME\USRDIR\EBOOT.elf --out-dir work\oracle --per-op 1000 --seed 11
+docker run --rm -v "${PWD}\work\oracle:/case" -v "${PWD}\tools\ppc\oracle:/o:ro" sly4-ppc-oracle:1 sh /o/run.sh
+.\build\mingw-release\sly4_recomp.exe oracle-check --dir work\oracle
+```
+
+**Geração dos casos (`oracle-gen`):**
+- pega no EBOOT um exemplo de cada instrução testável, só de palavras que a análise provou serem código;
+- sorteia os campos de operando. Os registradores ficam longe de `r1`/`r2`/`r13`/`r30`/`r31`, e as instruções de memória apontam para uma janela de 256 bytes em `0x20000000`;
+- sorteia o estado de entrada com valores difíceis: limites de sinal, NaN silencioso e sinalizador, infinitos, denormais, os quatro modos de arredondamento e NJ ligado e desligado.
+
+**Execução:** o harness (`harness.S`, gerado) carrega o estado, executa a instrução e salva tudo. Ele é compilado com o GCC PowerPC e roda no `qemu-ppc64 -cpu 970`, o parente mais próximo do PPU do Cell.
+
+**Comparação (`oracle-check`):** roda o interpretador nos mesmos casos e compara cada GPR, FPR, VR, CR, XER, CTR, FPSCR e VSCR, mais a janela de memória.
+
+**Resultado: 195 instruções (todas as testáveis que o jogo usa, inclusive as de memória), 195.000 casos, 0 divergências.**
+
+Cada diferença explicada é contada à parte. São três tipos:
+
+**Onde o QEMU se afasta da ISA ou do hardware IBM** (o interpretador segue a ISA):
+
+| Diferença | Fonte |
+|---|---|
+| FPSCR[FR] não é modelado pelo QEMU; fica fora da comparação | — |
+| O QEMU liga FX em toda exceção; a ISA só na transição 0→1 de um bit de exceção | ISA, descrição do FX |
+| O QEMU zera FI em `fcmpu`/`fcmpo`; a ISA não altera FI | ISA, *Special Registers Altered* |
+| FPRF de resultado de precisão simples denormal: o QEMU classifica pela faixa `double` | FPU do Microwatt (OpenPOWER) normaliza com mínimo de −126 em precisão simples |
+| `fnmadd`/`fnmsub` em arredondamento direcionado: o QEMU nega antes de arredondar | IBM: arredonda e depois nega |
+| `dcbz`: o Cell zera a linha de 128 bytes; o 970 do QEMU, 32 (aceito só se a área zerada pelo QEMU estiver contida na nossa) | Cache do Cell PPU; RPCS3 |
+
+**Indefinidos pela ISA** (o interpretador segue o RPCS3, conferido em PS3 real):
+- palavra alta de `mulhw`/`mulhwu`;
+- quociente de divisão por zero ou estouro;
+- palavra alta de `fctiw[z]` e FPRF de `fcti*`;
+- elementos não endereçados de `lvebx`/`lvehx`/`lvewx` (o RPCS3 carrega o quadword inteiro).
+
+**Estimativas:** `fres`/`frsqrte` aceitas com tolerância de 2^-12 e `vrefp`/`vrsqrtefp`/`vexptefp`/`vlogefp` com 2^-11, porque no hardware o resultado é uma aproximação.
+
+**Bugs encontrados pelo oráculo e corrigidos:**
+- o FMA duplamente arredondado do MinGW;
+- o sinal do zero exato em precisão simples nos modos direcionados;
+- a detecção de *underflow*, que passou a medir antes do arredondamento, inclusive quando o truncado vira 0;
+- `mtfsf`/`mtfsfi` gravando o bit reservado 20 do FPSCR.
+
+**O que o QEMU não cobre**, testado à mão no `sly4_tests.exe` (`test_interpreter.cpp`):
+- desvios com CTR e LR;
+- `lwarx`/`stwcx.` em sucesso e falha;
+- armadilhas, `sc` e `attn`;
+- `lmw`/`stmw` e LR/CTR;
+- as instruções do Cell `lvlx`/`lvrx`/`stvlx`/`stvrx`.
