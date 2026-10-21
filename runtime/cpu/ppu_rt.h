@@ -37,12 +37,17 @@ void bad_jump(PPUContext& c, GuestMemory& m, uint32_t from, uint32_t target);  /
 void lr_mismatch(PPUContext& c, GuestMemory& m, uint32_t at, uint32_t expected);
 void budget_exceeded(PPUContext& c, GuestMemory& m);
 
-// The kernel installs the syscall handler (phase 3); tests install a fault handler that
-// abandons the current case. Defaults: syscall -> r3 = CELL_ENOSYS, fault -> log + abort.
+// The kernel installs the syscall handler and the HLE range (phase 3); tests install a
+// fault handler that abandons the current case. Defaults: syscall -> r3 = CELL_ENOSYS,
+// fault -> log + abort.
 struct Hooks {
     void (*syscall)(PPUContext&, GuestMemory&) = nullptr;
     void (*fault)(PPUContext&, GuestMemory&, const char* what) = nullptr;
     void (*lr_mismatch)(PPUContext&, GuestMemory&, uint32_t at, uint32_t expected) = nullptr;
+    // Calls and branches to [hle_base, hle_base + hle_size) run a native library function
+    // instead of guest code; the function returns to LR like a blr.
+    void (*hle)(PPUContext&, GuestMemory&, uint32_t target) = nullptr;
+    uint32_t hle_base = 0, hle_size = 0;
 };
 Hooks& hooks();
 

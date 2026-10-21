@@ -47,9 +47,18 @@ GenFn find_function(uint32_t addr) {
     return it != end && it->addr == addr ? it->fn : nullptr;
 }
 
+static bool is_hle(uint32_t target) {
+    const Hooks& h = hooks();
+    return h.hle && target - h.hle_base < h.hle_size;
+}
+
 void call_indirect(PPUContext& c, GuestMemory& m, uint32_t target) {
     if (GenFn fn = find_function(target)) {
         fn(c, m);
+        return;
+    }
+    if (is_hle(target)) {
+        hooks().hle(c, m, target);
         return;
     }
     interpret_until_return(c, m, target);
@@ -59,6 +68,11 @@ void interpret_until_return(PPUContext& c, GuestMemory& m, uint32_t entry) {
     const uint32_t ret = uint32_t(c.lr) & ~3u;
     c.cia = entry;
     while (c.cia != ret) {
+        if (is_hle(c.cia)) {  // reached by bctr/bctrl: run it and return to LR
+            hooks().hle(c, m, c.cia);
+            c.cia = uint32_t(c.lr) & ~3u;
+            continue;
+        }
         if (--c.budget < 0) {
             budget_exceeded(c, m);
             return;

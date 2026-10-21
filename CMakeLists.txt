@@ -20,12 +20,11 @@ add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initi
 
 add_subdirectory(runtime)
 add_subdirectory(recomp)
-add_subdirectory(app)
-add_subdirectory(tests)
 
 # Recompiled game code: generated locally by "sly4_recomp emit" from the user's own
 # EBOOT.elf into generated/ (ignored by git: it is derived from the game). Built only
-# when present; SLY4_GEN_BUDGET adds the block budget used by the differential test.
+# when present; sly4.exe then runs the game, otherwise it stops after loading.
+# SLY4_GEN_BUDGET adds the block budget used by the differential test.
 set(SLY4_GEN_DIR "${CMAKE_SOURCE_DIR}/generated/ppu" CACHE PATH "Directory written by sly4_recomp emit")
 option(SLY4_GEN_BUDGET "Budget checks in the generated code (differential tests)" ON)
 if(EXISTS "${SLY4_GEN_DIR}/sources.cmake")
@@ -45,3 +44,6 @@ if(EXISTS "${SLY4_GEN_DIR}/sources.cmake")
     target_link_options(sly4_gendiff PRIVATE -static -static-libgcc -static-libstdc++ -mconsole)
     set_target_properties(sly4_gendiff PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 endif()
+
+add_subdirectory(app)
+add_subdirectory(tests)

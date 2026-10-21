@@ -22,3 +22,13 @@ target_link_libraries(sly4_cpu PUBLIC sly4_runtime sly4_ppu)
 # std::fma/fmaf the hardware fused multiply-add (MinGW's library versions round twice,
 # which breaks fmadd/vmaddfp by one ulp); x86 CPUs have had FMA3 since 2013.
 target_compile_options(sly4_cpu PRIVATE -frounding-math -fno-fast-math -ffp-contract=off -mfma)
+
+# LV2 kernel and HLE firmware libraries (phase 3).
+add_library(sly4_kernel STATIC
+    kernel/guest_alloc.cpp
+    kernel/hle.cpp
+    kernel/hle_sys_prx_for_user.cpp
+    kernel/kernel.cpp
+    kernel/syscalls.cpp
+)
+target_link_libraries(sly4_kernel PUBLIC sly4_cpu)

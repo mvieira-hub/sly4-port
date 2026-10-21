@@ -388,7 +388,12 @@ Plano original da fase, para referência:
 - **Teste diferencial:** um interpretador PPC mínimo, escrito junto, executa cada instrução com entradas aleatórias, e o resultado é comparado com o código emitido.
 - **Saída:** os 2,8 milhões de instruções geram C++ que compila sem erro, e o diferencial passa para todas as operações usadas.
 
-### Fase 3: kernel e HLE básico, "o jogo boota" (4–6 semanas)
+### Fase 3: kernel e HLE básico, "o jogo boota" (4–6 semanas) — **em andamento**
+
+Andamento em [KERNEL.md](KERNEL.md):
+- **3a, partida do processo (concluída):** o EBOOT recompilado roda a partir do ponto de entrada real. As 251 importações estão ligadas a funções nativas, as 71 syscalls têm nome e cada chamada nova é registrada. O jogo inicializa memória, SPURS e `cellGame`, escreve no TTY e para esperando a primeira thread que ainda não existe.
+
+Plano da fase:
 - Syscalls: threads, sincronização, timers, memória, TTY e arquivos.
 - `sysPrxForUser`, `cellFs` sobre o VFS, `cellGame`, `cellSysutil` mínimo, `cellSysmodule`, `cellRtc`, e stubs de NP e rede.
 - Tudo o que não existe ainda registra a chamada e devolve `CELL_OK`, para mapear o que o jogo precisa.

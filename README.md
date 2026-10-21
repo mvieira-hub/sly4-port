@@ -64,10 +64,17 @@ Recompilador (Fase 2; ver [docs/RECOMP.md](docs/RECOMP.md)). Ele gera o C++ do j
 .\build\mingw-release\sly4_gendiff.exe --eboot PS3_GAME\USRDIR\EBOOT.elf --cases 8
 ```
 
-Estado atual: **Fases 0, 1 e 2 concluídas.**
+Com o código gerado no build, o `sly4.exe` roda o jogo (Fase 3; ver [docs/KERNEL.md](docs/KERNEL.md)):
+
+```powershell
+.\build\mingw-release\sly4.exe --game PS3_GAME --no-window --seconds 20
+```
+
+Estado atual: **Fases 0, 1 e 2 concluídas; Fase 3 em andamento.**
 - O EBOOT inteiro vira C++: 24.164 funções que compilam sem avisos.
 - Comparado com o interpretador, o código gerado deu igual em todos os 98 mil casos.
 - O interpretador foi validado antes contra o QEMU: 195 mil casos, 0 divergências.
+- O jogo recompilado já roda do ponto de entrada: inicializa memória, SPURS e `cellGame` e escreve no console. Para quando precisa da primeira thread, a próxima entrega.
 - O programa abre a janela Vulkan 1.3 na GPU dedicada.
 - Reserva os 4 GiB do espaço de endereços do PS3 e carrega o `EBOOT.elf`: segmentos, TLS, parâmetros do processo e as 251 importações, idênticas às do `eboot_scan.py`.
 - A CI (`.github/workflows/build.yml`) compila o `.exe`, roda os testes num runner Windows e publica os binários como artefato.
