@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sly4 glTF Viewer</title>
+<style>
+  :root { --bg: #1b1d22; --panel: #262a31; --fg: #e6e6e6; --muted: #9aa0a8; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 13px system-ui, sans-serif; }
+  #ui { position: fixed; top: 8px; left: 8px; background: var(--panel); padding: 8px 10px; border-radius: 6px; max-width: 360px; }
+  #ui label { display: block; margin: 2px 0; }
+  #ui input[type=text] { width: 100%; box-sizing: border-box; background: #111; color: var(--fg); border: 1px solid #444; padding: 3px; }
+  #info { color: var(--muted); margin-top: 6px; white-space: pre-line; }
+  canvas { display: block; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="ui">
+  <input id="model" type="text" placeholder="models/.../arquivo.gltf">
+  <label><input id="flipz" type="checkbox"> espelhar Z (mão esquerda → direita)</label>
+  <label><input id="vcol" type="checkbox" checked> cores de vértice</label>
+  <label><input id="tex" type="checkbox" checked> texturas</label>
+  <div id="info">carregando…</div>
+</div>
+<script type="module">
+import * as THREE from "three";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+const params = new URLSearchParams(location.search);
+const $ = id => document.getElementById(id);
+$("model").value = params.get("model") || "";
+$("flipz").checked = params.get("flipz") === "1";
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(devicePixelRatio);
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x30343c);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x404040, 1.6));
+const sun = new THREE.DirectionalLight(0xffffff, 1.4); sun.position.set(1, 2, 1.5); scene.add(sun);
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.01, 1e6);
+const controls = new OrbitControls(camera, renderer.domElement);
+let root = null, original = new Map();
+let mixer = null, clips = [];
+const clock = new THREE.Clock();
+// exposed for scripted screenshots: __viewer.look([x,y,z],[tx,ty,tz]) / __viewer.only(/regex/)
+window.__viewer = {
+  THREE, camera, controls, get root() { return root; },
+  look(pos, target) { camera.position.set(...pos); controls.target.set(...target); controls.update(); this.render(); },
+  only(re) { root.traverse(o => { if (o.isMesh) o.visible = !re || re.test(o.name) || re.test(o.parent?.name || ""); }); this.render(); },
+  frame,
+  // a hidden tab gets no animation frames, so scripted views render explicitly
+  render() { renderer.render(scene, camera); },
+};
+
+function frame(dir) {
+  const box = new THREE.Box3();
+  root.updateMatrixWorld(true);
+  root.traverse(o => { if (o.isMesh && o.visible) box.expandByObject(o); });
+  const size = box.getSize(new THREE.Vector3()).length() || 1, c = box.getCenter(new THREE.Vector3());
+  const d = new THREE.Vector3(...(dir || [0.6, 0.5, 1])).normalize();
+  camera.position.copy(c).addScaledVector(d, size * 0.9);
+  camera.near = size / 1000; camera.far = size * 20; camera.updateProjectionMatrix();
+  controls.target.copy(c); controls.update();
+}
+function apply() {
+  if (!root) return;
+  root.scale.z = $("flipz").checked ? -1 : 1;
+  root.traverse(o => {
+    if (!o.isMesh) return;
+    const m = original.get(o);
+    o.material.vertexColors = $("vcol").checked && !!o.geometry.attributes.color;
+    o.material.map = $("tex").checked ? m.map : null;
+    o.material.needsUpdate = true;
+  });
+}
+function load(url) {
+  new GLTFLoader().load(url, g => {
+    if (root) scene.remove(root);
+    root = g.scene; scene.add(root); original.clear();
+    let tris = 0, meshes = 0;
+    root.traverse(o => { if (o.isMesh) { meshes++; original.set(o, { map: o.material.map });
+      tris += (o.geometry.index ? o.geometry.index.count : o.geometry.attributes.position.count) / 3; } });
+    // URL options: only=/hide=<regex on mesh/node/texture name>, cam=x,y,z, tgt=x,y,z, alpha=1 (alpha test)
+    const only = params.get("only") && new RegExp(params.get("only"), "i");
+    const hide = params.get("hide") && new RegExp(params.get("hide"), "i");
+    const hits = (re, o) => re.test(o.name) || re.test(o.parent?.name || "") || re.test(o.material.map?.name || "");
+    root.traverse(o => {
+      if (!o.isMesh) return;
+      if (only) o.visible = hits(only, o);
+      if (hide && hits(hide, o)) o.visible = false;
+      if (params.get("alpha") === "1") o.material.alphaTest = 0.3;
+    });
+    apply(); frame(params.get("dir") && params.get("dir").split(",").map(Number));
+    // anim=<clip name or index> plays a clip; t=<seconds> freezes it at that time
+    clips = g.animations || [];
+    if (clips.length) {
+      mixer = new THREE.AnimationMixer(root);
+      const want = params.get("anim");
+      const clip = want === null ? clips[0] : (clips.find(c => c.name === want) || clips[Number(want)] || clips[0]);
+      const action = mixer.clipAction(clip); action.play();
+      if (params.get("t") !== null) { mixer.setTime(Number(params.get("t"))); action.paused = true; }
+      window.__viewer.clip = clip.name;
+    }
+    window.__viewer.clips = clips.map(c => `${c.name} (${c.duration.toFixed(2)}s)`);
+    if (params.get("cam") && params.get("tgt")) {
+      camera.near = 0.01; camera.updateProjectionMatrix();
+      window.__viewer.look(params.get("cam").split(",").map(Number), params.get("tgt").split(",").map(Number));
+    }
+    $("info").textContent = `${url}\n${meshes} malhas desenhadas, ${Math.round(tris).toLocaleString()} triângulos` +
+      (clips.length ? `\n${clips.length} animações; tocando: ${window.__viewer.clip}` : "");
+    window.__ready = true;
+  }, undefined, e => { $("info").textContent = "erro: " + e.message; window.__ready = true; });
+}
+$("model").addEventListener("change", () => load($("model").value));
+["flipz", "vcol", "tex"].forEach(id => $(id).addEventListener("change", apply));
+addEventListener("resize", () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+renderer.setAnimationLoop(() => { if (mixer) mixer.update(clock.getDelta()); controls.update(); renderer.render(scene, camera); });
+if ($("model").value) load($("model").value);
+</script>
+</body>
+</html>

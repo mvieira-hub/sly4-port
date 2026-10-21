@@ -1,0 +1,7 @@
+* text=auto
+# rodam dentro de contêineres Linux
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.py text eol=lf
+# PowerShell 5.1 no Windows
+*.ps1 text eol=crlf

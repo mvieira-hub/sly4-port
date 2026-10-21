@@ -1,0 +1,23 @@
+# Conteúdo do jogo (Sony) — nunca vai para o repositório.
+# Cada um usa o próprio dump do disco em PS3_GAME/.
+PS3_GAME/
+PS3_UPDATE/
+PS3_DISC.SFB
+*.elf
+*.self
+*.sprx
+*.psarc
+*.san
+*.cooked
+
+# Saídas das ferramentas: EBOOT descriptografado, assets extraídos, modelos,
+# texturas, projeto e código decompilado do Ghidra, desmontagens.
+work/
+
+# Python / editores
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
