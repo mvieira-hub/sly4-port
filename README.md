@@ -19,6 +19,8 @@ O repositório guarda só o trabalho próprio: ferramentas, documentação dos f
 
 ## Roteiro do port nativo
 
+O plano completo, com auditoria, arquitetura do runtime, fases e critérios de saída, está em **[docs/ROADMAP.md](docs/ROADMAP.md)**. Resumo:
+
 O jogo tem três partes de código, e cada uma pede uma abordagem:
 
 1. **PPU (lógica do jogo, ~15 MB de PowerPC 64):** recompilação estática para C/C++. Base existente: mapa de funções, TOC (r2 = `0xF50800`), imports por NID e tratadores de bloco nomeados.

@@ -23,6 +23,12 @@ O `run.ps1` monta as pastas assim:
 Grava em `work/psarc/` com o mesmo caminho interno. Arquivos já extraídos (mesmo tamanho) são pulados.
 Sem `--filter`, extrai tudo (~20 GB descompactados, dos quais 11 GB são áudio `.xvag`).
 
+Inventário do pacote inteiro por pasta e extensão, com os bytes mágicos de cada tipo:
+
+```powershell
+.\tools\run.ps1 psarc_inventory.py /game/USRDIR/Sly4.psarc
+```
+
 ## 2. Texturas TEXR para DDS: `texr2dds.py`
 
 ```powershell
@@ -121,6 +127,17 @@ Usa o Ghidra extraído em `Documents\ghidra_12.1.4_PUBLIC` com o JDK 21 do cont�
 - O `export` gera o código C decompilado e a tabela dos **144 tratadores de bloco** (`work\ghidra\export\registry.md`).
 
 Detalhes e o uso pela interface gráfica estão em [docs/GHIDRA.md](docs/GHIDRA.md).
+
+## 4c. Desmontagem PPU com instruções do Cell: `tools/ppc`
+
+O Ghidra e o capstone não decodificam `lvlx`/`lvrx`/`stvlx`/`stvrx`. A imagem `sly4-ppc:1` traz o objdump do binutils 2.35 para PowerPC, que entende essas instruções com `-M cell`.
+
+```powershell
+docker build -t sly4-ppc:1 tools\ppc
+docker run --rm -v "${PWD}\PS3_GAME:/game:ro" -v "${PWD}\tools\ppc:/s:ro" sly4-ppc:1 sh /s/opcode_stats.sh
+```
+
+O `opcode_stats.sh` gera o histograma de mnemônicos do código PPU: 2,8 milhões de instruções, 315 mnemônicos, 103 cobrem 99%. Esses números dimensionam o recompilador ([docs/ROADMAP.md](../docs/ROADMAP.md)).
 
 ## 5. Shaders: `cgbin_info.py`
 
