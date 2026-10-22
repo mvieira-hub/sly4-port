@@ -215,6 +215,8 @@ Teste novo no `sly4_tests.exe`, sobre uma pasta temporária com a estrutura de u
 
 O FIOS lê o `Sly4.psarc` em blocos de 64 KiB comprimidos com zlib, e quem descomprime é uma **tarefa SPU do SPURS**. Sem SPU (Fase 4), o boot parava na primeira leitura comprimida. Seguindo o "atalho opcional" do roteiro, a tarefa foi trocada por código nativo, e o resto do SPURS que o FIOS usa foi implementado no PPU.
 
+Desde a Fase 4 este é o caminho sem firmware. Com `--firmware`, as funções do SPURS vêm do módulo `libsre` recompilado e a tarefa roda num SPU interpretado ([SPU.md](SPU.md), 4c e 4d).
+
 ### Identificação da tarefa
 
 - `cellSpursCreateTask` recebe o ELF SPU em `0xE42D00`, de 38.100 bytes. É o `spu_00E32D00.elf` do `tools/spu_extract.py`.

@@ -1,4 +1,4 @@
-// sly4.exe: native PC port of Sly Cooper: Thieves in Time (BCES01284).
+﻿// sly4.exe: native PC port of Sly Cooper: Thieves in Time (BCES01284).
 // Loads the decrypted EBOOT into the PS3 address space and, when the build includes the
 // recompiled game code (generated/ppu), starts the game's main thread on the phase 3
 // kernel; the Vulkan window of phase 0 runs alongside.
@@ -9,9 +9,21 @@
 //   sly4.exe ... --no-run            loads only, does not start the game
 //   sly4.exe ... --seconds N         stops the game after N seconds and prints the summary
 //   sly4.exe ... --trace             logs every library call and syscall, not just the first
+//   sly4.exe ... --firmware <dir>    decrypted firmware modules run as they are (libsre.prx: SPURS)
 //   sly4.exe ... --ring N            prints the last N calls (kept in memory) with the summary
+//   sly4.exe ... --spu-cache f.bin   records the SPU blocks run in the interpreter (for sly4_recomp spu-emit)
+//   sly4.exe ... --spu-interp        runs every SPU instruction in the interpreter, even when compiled
+//   sly4.exe ... --spu-profile       samples the SPUs' PCs and prints the hottest with the summary
+//   sly4.exe ... --ppu-profile NAME  samples where the PPU thread NAME runs in sly4.exe (resolve with nm)
+//   sly4.exe ... --verify-zlib       checks every block the SPU EDGE zlib task inflates (with --firmware)
+//   sly4.exe ... --rsx-capture N,f.txt  writes the RSX commands of frame N (counted in flips)
+//   sly4.exe ... --render            with --no-window: renders anyway (Vulkan without a window)
+//   sly4.exe ... --watch 0xADDR       logs every change of the 128-byte guest line at ADDR (debugging)
+//   sly4.exe ... --watch-line 0xADDR[,0xADDR...]  logs every atomic/DMA write to those lines, with who and what (debugging)
+//   sly4.exe ... --dump-frames dir[,N]  writes every Nth displayed frame (default 60) as PNG
 //   sly4.exe ... --data <dir>        where /dev_hdd0 and /dev_hdd1 live (default %LOCALAPPDATA%\sly4-port)
 //   sly4.exe ... --dump-imports f.csv  writes module,nid,name,slot of every import
+//   sly4.exe ... --dump-mem addr,size,f.bin  writes that guest memory to a file when the game stops
 //   sly4.exe --nid-names <file>      NID name candidates (default tools\data\ps3_nid_candidates.txt)
 //   sly4.exe --frames 300            presents 300 frames and exits (exit code 0 = ok)
 //   sly4.exe --validation            enables VK_LAYER_KHRONOS_validation when installed
@@ -19,22 +31,29 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <string>
+#include <thread>
 
+#include "cpu/guest_atomic.h"
 #include "cpu/ppu_rt.h"
+#include "gpu/rsx_vk.h"
 #include "gpu/vulkan_context.h"
 #include "kernel/kernel.h"
 #include "loader/elf_loader.h"
 #include "loader/image_report.h"
 #include "loader/nid.h"
 #include "memory/guest_memory.h"
+#include "rsx/rsx.h"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
 
+#include "core/host_sleep.h"
 #include "core/log.h"
 
 #ifdef _WIN32
@@ -49,7 +68,9 @@
 
 #ifdef SLY4_HAS_GEN
 namespace sly4::gen {
-void register_functions();  // generated/ppu/table.cpp
+void register_functions();           // generated/ppu/table.cpp
+void register_firmware_functions();  // gen_firmware.cpp (one call per generated/fw_*)
+void register_spu_code();             // gen_firmware.cpp (generated/spu, when present)
 }
 #endif
 
@@ -61,8 +82,15 @@ struct Args {
     long frames = 0;  // 0 = until the window is closed
     long seconds = 0;  // 0 = no limit for the game
     long ring = 0;     // last calls printed with the summary
-    std::string game_dir, eboot, nid_names, dump_imports, data_dir;
-    bool window = true, run = true, trace = false;
+    std::string dump_mem;  // "addr,size,file" written at the end
+    std::string rsx_capture;  // "frame,file"
+    std::string watch;        // guest address of a 128-byte line whose changes are logged
+    std::string ppu_profile;  // PPU thread name sampled by --ppu-profile
+    std::string watch_line;   // guest addresses (comma-separated) of 128-byte lines whose every write is logged
+    std::string game_dir, eboot, nid_names, dump_imports, data_dir, firmware_dir, spu_cache;
+    bool window = true, run = true, trace = false, spu_interp = false, spu_profile = false, verify_zlib = false;
+    bool render = false;      // render without a window (Vulkan headless)
+    std::string dump_frames;  // "dir[,every]": PNG of every Nth flip
     sly4::VulkanOptions vulkan;
 };
 
@@ -84,12 +112,36 @@ bool parse_args(int argc, char** argv, Args& out) {
             ok = value(out.nid_names);
         } else if (std::strcmp(argv[i], "--dump-imports") == 0) {
             ok = value(out.dump_imports);
+        } else if (std::strcmp(argv[i], "--dump-mem") == 0) {
+            ok = value(out.dump_mem);
+        } else if (std::strcmp(argv[i], "--rsx-capture") == 0) {
+            ok = value(out.rsx_capture);
+        } else if (std::strcmp(argv[i], "--watch") == 0) {
+            ok = value(out.watch);
+        } else if (std::strcmp(argv[i], "--watch-line") == 0) {
+            ok = value(out.watch_line);
         } else if (std::strcmp(argv[i], "--no-window") == 0) {
             out.window = false;
         } else if (std::strcmp(argv[i], "--no-run") == 0) {
             out.run = false;
         } else if (std::strcmp(argv[i], "--data") == 0) {
             ok = value(out.data_dir);
+        } else if (std::strcmp(argv[i], "--firmware") == 0) {
+            ok = value(out.firmware_dir);
+        } else if (std::strcmp(argv[i], "--spu-cache") == 0) {
+            ok = value(out.spu_cache);
+        } else if (std::strcmp(argv[i], "--spu-interp") == 0) {
+            out.spu_interp = true;
+        } else if (std::strcmp(argv[i], "--ppu-profile") == 0) {
+            ok = value(out.ppu_profile);
+        } else if (std::strcmp(argv[i], "--spu-profile") == 0) {
+            out.spu_profile = true;
+        } else if (std::strcmp(argv[i], "--verify-zlib") == 0) {
+            out.verify_zlib = true;
+        } else if (std::strcmp(argv[i], "--render") == 0) {
+            out.render = true;
+        } else if (std::strcmp(argv[i], "--dump-frames") == 0) {
+            ok = value(out.dump_frames);
         } else if (std::strcmp(argv[i], "--trace") == 0) {
             out.trace = true;
         } else if (std::strcmp(argv[i], "--ring") == 0 && i + 1 < argc) {
@@ -104,7 +156,7 @@ bool parse_args(int argc, char** argv, Args& out) {
             ok = false;
         }
         if (!ok) {
-            SLY4_ERROR("opção desconhecida ou sem valor: %s", argv[i]);
+            SLY4_ERROR("opÃ§Ã£o desconhecida ou sem valor: %s", argv[i]);
             return false;
         }
     }
@@ -131,7 +183,7 @@ bool load_executable(const Args& args, sly4::GuestMemory& mem, sly4::LoadedImage
     if (names.load_file(nid_file))
         SLY4_INFO("%zu nomes de NID carregados de %s", names.size(), nid_file.c_str());
     else if (!args.nid_names.empty())
-        SLY4_WARN("lista de NIDs não encontrada: %s", nid_file.c_str());
+        SLY4_WARN("lista de NIDs nÃ£o encontrada: %s", nid_file.c_str());
 
     std::string error;
     const auto t0 = std::chrono::steady_clock::now();
@@ -140,26 +192,74 @@ bool load_executable(const Args& args, sly4::GuestMemory& mem, sly4::LoadedImage
         return false;
     }
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    SLY4_INFO("%s carregado em %.1f ms; %.1f MiB confirmados na memória do PS3", args.eboot.c_str(), ms,
+    SLY4_INFO("%s carregado em %.1f ms; %.1f MiB confirmados na memÃ³ria do PS3", args.eboot.c_str(), ms,
               mem.committed_bytes() / 1048576.0);
     sly4::log_image_summary(img, names);
     if (!args.dump_imports.empty()) {
         if (sly4::write_imports_csv(img, names, args.dump_imports))
-            SLY4_INFO("importações gravadas em %s", args.dump_imports.c_str());
+            SLY4_INFO("importaÃ§Ãµes gravadas em %s", args.dump_imports.c_str());
         else
-            SLY4_ERROR("não foi possível gravar %s", args.dump_imports.c_str());
+            SLY4_ERROR("nÃ£o foi possÃ­vel gravar %s", args.dump_imports.c_str());
     }
     return true;
 }
 
 // ---------------------------------------------------------------- phase 3: the game
 sly4::Kernel* g_kernel = nullptr;
+std::unique_ptr<sly4::rsx::VulkanRenderer> g_renderer;
+sly4::GuestMemory* g_mem = nullptr;
+std::string g_dump_mem;
 // The game is over once any guest thread calls sys_process_exit (or main returns).
 bool game_over() { return g_kernel && g_kernel->exited(); }
 int game_status() { return g_kernel ? g_kernel->exit_status() : 0; }
 
+// --dump-mem addr,size,file (numbers in hex or decimal).
+void dump_memory() {
+    if (!g_mem || g_dump_mem.empty()) return;
+    char* end = nullptr;
+    const unsigned long addr = std::strtoul(g_dump_mem.c_str(), &end, 0);
+    const unsigned long size = *end == ',' ? std::strtoul(end + 1, &end, 0) : 0;
+    if (*end != ',' || !size) {
+        SLY4_ERROR("--dump-mem: use endereÃ§o,tamanho,arquivo");
+        return;
+    }
+    FILE* f = std::fopen(end + 1, "wb");
+    if (!f) {
+        SLY4_ERROR("--dump-mem: nÃ£o foi possÃ­vel gravar %s", end + 1);
+        return;
+    }
+    std::fwrite(g_mem->host(uint32_t(addr)), 1, size, f);
+    std::fclose(f);
+    SLY4_INFO("memÃ³ria 0x%08lX (+0x%lX) gravada em %s", addr, size, end + 1);
+}
+
+// --watch: a host thread compares the line with its last copy every ~250 us.
+void start_watch(sly4::GuestMemory& mem, const std::string& spec) {
+    const uint32_t line = uint32_t(std::strtoul(spec.c_str(), nullptr, 0)) & ~127u;
+    std::thread([&mem, line] {
+        while (!game_over() && !mem.is_committed(line, 128)) sly4::host_sleep_us(1000);  // not allocated yet
+        uint32_t last[32];
+        std::memcpy(last, mem.host(line), 128);
+        const auto t0 = std::chrono::steady_clock::now();
+        while (!game_over()) {
+            sly4::host_sleep_us(250);
+            uint32_t now[32];
+            std::memcpy(now, mem.host(line), 128);
+            for (int i = 0; i < 32; ++i)
+                if (now[i] != last[i]) {
+                    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                    SLY4_INFO("watch %9.3f ms: 0x%08X = %08X (era %08X)", ms, line + 4 * i, __builtin_bswap32(now[i]),
+                              __builtin_bswap32(last[i]));
+                }
+            std::memcpy(last, now, 128);
+        }
+    }).detach();
+}
+
 [[noreturn]] void stop_with_summary(int code) {
     if (g_kernel) g_kernel->print_summary();
+    if (g_renderer) g_renderer->summary();
+    dump_memory();
     std::fflush(stderr);
     std::_Exit(code);
 }
@@ -172,7 +272,7 @@ void on_guest_fault(sly4::PPUContext& c, sly4::GuestMemory&, const char* what) {
 
 LONG WINAPI on_unhandled(EXCEPTION_POINTERS* e) {
     const sly4::PpuThread* t = sly4::current_thread();
-    SLY4_ERROR("exceção 0x%08lX no host%s; LR do convidado 0x%08llX", e->ExceptionRecord->ExceptionCode,
+    SLY4_ERROR("exceÃ§Ã£o 0x%08lX no host%s; LR do convidado 0x%08llX", e->ExceptionRecord->ExceptionCode,
                t ? (" na thread " + t->name).c_str() : "", t ? static_cast<unsigned long long>(t->ctx.lr) : 0ull);
     stop_with_summary(5);
 }
@@ -188,11 +288,25 @@ DWORD WINAPI game_thread(void*) {
 bool start_game(const Args& args, sly4::GuestMemory& mem, const sly4::LoadedImage& img, const sly4::NidNames& names) {
 #ifdef SLY4_HAS_GEN
     sly4::gen::register_functions();
+    sly4::gen::register_firmware_functions();
+    if (!args.spu_interp) sly4::gen::register_spu_code();
     static sly4::Kernel kernel(mem, img);
     g_kernel = &kernel;
+    g_mem = &mem;
+    g_dump_mem = args.dump_mem;
     sly4::KernelOptions opt;
     opt.trace = args.trace;
+    opt.firmware_dir = args.firmware_dir;
     opt.ring = size_t(args.ring);
+    opt.spu_cache = args.spu_cache;
+    opt.spu_profile = args.spu_profile;
+    opt.ppu_profile = args.ppu_profile;
+    opt.verify_zlib = args.verify_zlib;
+    if (!args.rsx_capture.empty()) {
+        const size_t comma = args.rsx_capture.find(',');
+        sly4::rsx::set_capture(uint32_t(std::strtoul(args.rsx_capture.c_str(), nullptr, 10)),
+                               comma == std::string::npos ? "rsx_frame.txt" : args.rsx_capture.substr(comma + 1));
+    }
     // PS3_GAME is the folder above USRDIR\EBOOT.elf; saves and caches go to %LOCALAPPDATA%.
     const std::filesystem::path eboot = std::filesystem::absolute(args.eboot);
     opt.game_dir = args.game_dir.empty() ? eboot.parent_path().parent_path().string()
@@ -208,7 +322,7 @@ bool start_game(const Args& args, sly4::GuestMemory& mem, const sly4::LoadedImag
     CloseHandle(h);
     return true;
 #else
-    SLY4_WARN("este build não tem o código do jogo: gere com \"sly4_recomp emit\" e compile de novo");
+    SLY4_WARN("este build nÃ£o tem o cÃ³digo do jogo: gere com \"sly4_recomp emit\" e compile de novo");
     return false;
 #endif
 }
@@ -227,7 +341,52 @@ int main(int argc, char** argv) {
     sly4::LoadedImage image;
     sly4::NidNames names;
     if (!args.eboot.empty() && !load_executable(args, mem, image, names)) return 3;
+    // The GPU comes first: the RSX renderer must exist before the game reaches cellGcmInit.
+    SDL_Window* window = nullptr;
+    static sly4::VulkanContext gpu;
+    bool gpu_ok = false;
+    if (args.window) {
+        if (!SDL_Init(SDL_INIT_VIDEO)) {
+            SLY4_ERROR("SDL_Init: %s", SDL_GetError());
+            return 1;
+        }
+        window = SDL_CreateWindow("Sly Cooper: Thieves in Time - port nativo", 1280, 720,
+                                  SDL_WINDOW_VULKAN || SDL_WINDOW_HIGH_PIXEL_DENSITY);
+        if (!window) {
+            SLY4_ERROR("SDL_CreateWindow: %s", SDL_GetError());
+            SDL_Quit();
+            return 1;
+        }
+        if (!gpu.init(window, args.vulkan)) {
+            gpu.shutdown();
+            SDL_DestroyWindow(window);
+            SDL_Quit();
+            return 1;
+        }
+        gpu_ok = true;
+    } else if (args.render || !args.dump_frames.empty()) {
+        gpu_ok = gpu.init_headless(args.vulkan);
+    }
+    if (gpu_ok && args.run && !args.eboot.empty()) {
+        sly4::rsx::VulkanRendererOptions ro;
+        if (!args.dump_frames.empty()) {
+            const size_t comma = args.dump_frames.find(',');
+            ro.dump_dir = args.dump_frames.substr(0, comma);
+            ro.dump_every =
+                comma == std::string::npos ? 60 : uint32_t(std::strtoul(args.dump_frames.c_str() + comma + 1, nullptr, 10));
+        }
+        g_renderer = sly4::rsx::create_vulkan_renderer(gpu, ro);
+        if (g_renderer) sly4::rsx::set_backend(g_renderer.get());
+    }
     const bool game = !args.eboot.empty() && args.run && start_game(args, mem, image, names);
+    if (game && !args.watch.empty()) start_watch(mem, args.watch);
+    for (const char* p = args.watch_line.c_str(); *p;) {  // a comma-separated list
+        char* end = nullptr;
+        const uint32_t line = uint32_t(std::strtoul(p, &end, 0));
+        if (end == p) break;
+        sly4::add_debug_line(line);
+        p = *end == ',' ? end + 1 : end;
+    }
     const auto game_start = std::chrono::steady_clock::now();
     auto game_timed_out = [&] {
         return args.seconds > 0 && std::chrono::steady_clock::now() - game_start >= std::chrono::seconds(args.seconds);
@@ -239,30 +398,11 @@ int main(int argc, char** argv) {
         stop_with_summary(game_over() ? game_status() : 0);
     }
 
-    if (!SDL_Init(SDL_INIT_VIDEO)) {
-        SLY4_ERROR("SDL_Init: %s", SDL_GetError());
-        return 1;
-    }
-    SDL_Window* window = SDL_CreateWindow("Sly Cooper: Thieves in Time - port nativo", 1280, 720,
-                                          SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
-    if (!window) {
-        SLY4_ERROR("SDL_CreateWindow: %s", SDL_GetError());
-        SDL_Quit();
-        return 1;
-    }
-
-    sly4::VulkanContext gpu;
-    if (!gpu.init(window, args.vulkan)) {
-        gpu.shutdown();
-        SDL_DestroyWindow(window);
-        SDL_Quit();
-        return 1;
-    }
     VkExtent2D ext = gpu.swapchain_extent();
     SLY4_INFO("swapchain %ux%u, formato %d, %s", ext.width, ext.height, static_cast<int>(gpu.swapchain_format()),
               present_mode_name(gpu.present_mode()));
 
-    // Sly's blue (linear values; the sRGB swapchain converts them on write).
+    // Sly's blue, until the game shows something.
     const std::array<float, 4> clear = {0.02f, 0.09f, 0.35f, 1.0f};
     const auto start = std::chrono::steady_clock::now();
     long presented = 0;
@@ -285,7 +425,7 @@ int main(int argc, char** argv) {
             SDL_Delay(16);
             continue;
         }
-        if (!gpu.draw_frame(clear)) {
+        if (!gpu.draw_frame(clear, g_renderer ? g_renderer->front() : sly4::VulkanContext::Source{})) {
             ok = false;
             break;
         }
@@ -298,10 +438,11 @@ int main(int argc, char** argv) {
     SLY4_INFO("%ld quadros em %.2f s (%.1f fps) em %s", presented, secs, secs > 0 ? presented / secs : 0.0,
               gpu.device_name().c_str());
 
+    // Guest threads (and the RSX thread drawing with the device) cannot be interrupted:
+    // leave without waiting for them.
+    if (game) stop_with_summary(ok ? game_status() : 1);
     gpu.shutdown();
     SDL_DestroyWindow(window);
     SDL_Quit();
-    // Guest threads cannot be interrupted: leave without waiting for them.
-    if (game) stop_with_summary(ok ? game_status() : 1);
     return ok ? 0 : 1;
 }

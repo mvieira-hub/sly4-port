@@ -1,4 +1,6 @@
-#include "kernel/sync.h"
+﻿#include "kernel/sync.h"
+
+#include <algorithm>
 
 #include "kernel/kernel.h"
 
@@ -23,6 +25,27 @@ IdManager& idm() {
 }
 
 // ---------------------------------------------------------------- mutex
+bool Mutex::acquire_locked(std::unique_lock<std::mutex>& lk, uint64_t tid, uint64_t timeout_us) {
+    if (owner == 0 && queue.empty()) {
+        owner = tid;
+        return true;
+    }
+    queue.push_back(tid);
+    if (wait_for(cv, lk, timeout_us, [&] { return owner == tid; })) return true;
+    queue.erase(std::find(queue.begin(), queue.end(), tid));
+    return false;
+}
+
+void Mutex::release_locked() {
+    if (queue.empty()) {
+        owner = 0;
+        return;
+    }
+    owner = queue.front();
+    queue.pop_front();
+    cv.notify_all();  // the new owner sees owner == its id
+}
+
 uint32_t Mutex::lock(uint64_t tid, uint64_t timeout_us) {
     std::unique_lock<std::mutex> lk(m);
     if (owner == tid) {
@@ -30,8 +53,7 @@ uint32_t Mutex::lock(uint64_t tid, uint64_t timeout_us) {
         ++count;
         return CELL_OK;
     }
-    if (!wait_for(cv, lk, timeout_us, [&] { return owner == 0; })) return CELL_ETIMEDOUT;
-    owner = tid;
+    if (!acquire_locked(lk, tid, timeout_us)) return CELL_ETIMEDOUT;
     count = 1;
     return CELL_OK;
 }
@@ -52,10 +74,7 @@ uint32_t Mutex::trylock(uint64_t tid) {
 uint32_t Mutex::unlock(uint64_t tid) {
     std::lock_guard<std::mutex> lk(m);
     if (owner != tid) return CELL_EPERM;
-    if (--count == 0) {
-        owner = 0;
-        cv.notify_one();
-    }
+    if (--count == 0) release_locked();
     return CELL_OK;
 }
 
@@ -65,9 +84,8 @@ uint32_t Cond::wait(uint64_t tid, uint64_t timeout_us) {
     std::unique_lock<std::mutex> lk(mx.m);
     if (mx.owner != tid) return CELL_EPERM;
     const uint32_t saved = mx.count;
-    mx.owner = 0;
     mx.count = 0;
-    mx.cv.notify_one();
+    mx.release_locked();
     ++waiters;
     const uint64_t ticket = ++issued;
     bool signalled = wait_for(cv, lk, timeout_us, [&] { return released >= ticket; });
@@ -76,8 +94,7 @@ uint32_t Cond::wait(uint64_t tid, uint64_t timeout_us) {
         if (!signalled) abandoned.insert(ticket);
     }
     --waiters;
-    mx.cv.wait(lk, [&] { return mx.owner == 0; });
-    mx.owner = tid;
+    mx.acquire_locked(lk, tid, 0);
     mx.count = saved;
     return signalled ? CELL_OK : CELL_ETIMEDOUT;
 }

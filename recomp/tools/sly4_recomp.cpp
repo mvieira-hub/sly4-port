@@ -14,20 +14,26 @@
 #include <cstring>
 #include <filesystem>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
+#include <vector>
 
 #include <random>
 
 #include "analysis/program.h"
 #include "core/log.h"
 #include "emit/ppu_emitter.h"
+#include "emit/spu_emitter.h"
 #include "loader/elf_loader.h"
 #include "loader/nid.h"
 #include "oracle.h"
+#include "spu_oracle.h"
 #include "memory/guest_memory.h"
 #include "ppu/ppu_decoder.h"
 #include "ppu/ppu_disasm.h"
+#include "loader/spu_elf.h"
+#include "spu/spu_decoder.h"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -43,7 +49,11 @@ int usage() {
                  "uso: sly4_recomp disasm  --eboot <EBOOT.elf> [--start 0x10230] [--end 0xABD560] [--out arquivo]\n"
                  "     sly4_recomp analyze --eboot <EBOOT.elf> --out-dir <pasta> [--nid-names arquivo]\n"
                  "     sly4_recomp emit    --eboot <EBOOT.elf> --out-dir <pasta> [--sample N --seed S] [--per-file 300]\n"
-                 "     sly4_recomp oracle-gen / oracle-check (ver docs/RECOMP.md)\n");
+                 "     sly4_recomp oracle-gen / oracle-check (ver docs/RECOMP.md)\n"
+                 "     sly4_recomp spu-disasm --elf <programa SPU .elf> [--out arquivo]\n"
+                 "     sly4_recomp spu-oracle --spu-elf <tarefa EDGE zlib .elf> --psarc <Sly4.psarc> [--blocks 200]\n"
+                 "     sly4_recomp spu-emit [--cache work\\spu_cache.bin] [--elf programa.elf ...] --out-dir generated\\spu\n"
+                 "     sly4_recomp psarc-hash --psarc <Sly4.psarc> --out arquivo.txt\n");
     return 2;
 }
 
@@ -56,6 +66,36 @@ bool load(const std::string& eboot, sly4::GuestMemory& mem, sly4::LoadedImage& i
     return true;
 }
 
+// The image analysed/emitted: the game's EBOOT (--eboot) or a firmware PRX module
+// (--prx, loaded at --base, the same address the runtime loads it at).
+struct ImageArgs {
+    std::string eboot, prx;
+    uint32_t base = 0;
+    bool parse(int& i, int argc, char** argv) {
+        if (i + 1 >= argc) return false;
+        if (std::strcmp(argv[i], "--eboot") == 0) eboot = argv[++i];
+        else if (std::strcmp(argv[i], "--prx") == 0) prx = argv[++i];
+        else if (std::strcmp(argv[i], "--base") == 0) base = std::strtoul(argv[++i], nullptr, 0);
+        else return false;
+        return true;
+    }
+    bool empty() const { return eboot.empty() && (prx.empty() || !base); }
+    bool load(sly4::GuestMemory& mem, sly4::LoadedImage& img) const {
+        if (!eboot.empty()) return ::load(eboot, mem, img);
+        std::string error;
+        if (!mem.reserve() || !sly4::load_prx(prx, mem, base, img, error)) {
+            SLY4_ERROR("falha ao carregar %s: %s", prx.c_str(), error.c_str());
+            return false;
+        }
+        SLY4_INFO("%s: módulo %s em 0x%08X, TOC 0x%08X, %zu bibliotecas exportadas, %zu importadas, %zu funções conhecidas",
+                  prx.c_str(), img.module_name.c_str(), base, img.toc, img.exports.size(), img.imports.size(),
+                  img.function_entries.size());
+        for (const auto& lib : img.exports) SLY4_INFO("  exporta %s: %zu funções", lib.name.c_str(), lib.functions.size());
+        for (const auto& m : img.imports) SLY4_INFO("  importa %s: %zu funções", m.name.c_str(), m.functions.size());
+        return true;
+    }
+};
+
 FILE* open_out(const std::filesystem::path& p) {
     FILE* f = std::fopen(p.string().c_str(), "w");
     if (!f) SLY4_ERROR("não foi possível criar %s", p.string().c_str());
@@ -63,18 +103,19 @@ FILE* open_out(const std::filesystem::path& p) {
 }
 
 int cmd_analyze(int argc, char** argv) {
-    std::string eboot, out_dir, nid_file = "tools/data/ps3_nid_candidates.txt";
+    ImageArgs image;
+    std::string out_dir, nid_file = "tools/data/ps3_nid_candidates.txt";
     for (int i = 2; i < argc; ++i) {
         if (i + 1 >= argc) return usage();
-        if (std::strcmp(argv[i], "--eboot") == 0) eboot = argv[++i];
+        if (image.parse(i, argc, argv)) continue;
         else if (std::strcmp(argv[i], "--out-dir") == 0) out_dir = argv[++i];
         else if (std::strcmp(argv[i], "--nid-names") == 0) nid_file = argv[++i];
         else return usage();
     }
-    if (eboot.empty() || out_dir.empty()) return usage();
+    if (image.empty() || out_dir.empty()) return usage();
     sly4::GuestMemory mem;
     sly4::LoadedImage img;
-    if (!load(eboot, mem, img)) return 3;
+    if (!image.load(mem, img)) return 3;
     sly4::NidNames names;
     names.load_file(nid_file);
 
@@ -176,28 +217,31 @@ int cmd_analyze(int argc, char** argv) {
 }
 
 int cmd_emit(int argc, char** argv) {
-    std::string eboot, out_dir;
+    ImageArgs image;
+    std::string out_dir, name;
     size_t sample = 0, per_file = 300;
     uint64_t seed = 1;
     for (int i = 2; i < argc; ++i) {
         if (i + 1 >= argc) return usage();
-        if (std::strcmp(argv[i], "--eboot") == 0) eboot = argv[++i];
+        if (image.parse(i, argc, argv)) continue;
         else if (std::strcmp(argv[i], "--out-dir") == 0) out_dir = argv[++i];
+        else if (std::strcmp(argv[i], "--name") == 0) name = argv[++i];
         else if (std::strcmp(argv[i], "--sample") == 0) sample = std::strtoull(argv[++i], nullptr, 0);
         else if (std::strcmp(argv[i], "--seed") == 0) seed = std::strtoull(argv[++i], nullptr, 0);
         else if (std::strcmp(argv[i], "--per-file") == 0) per_file = std::strtoull(argv[++i], nullptr, 0);
         else return usage();
     }
-    if (eboot.empty() || out_dir.empty()) return usage();
+    if (image.empty() || out_dir.empty()) return usage();
     sly4::GuestMemory mem;
     sly4::LoadedImage img;
-    if (!load(eboot, mem, img)) return 3;
+    if (!image.load(mem, img)) return 3;
     const auto t0 = std::chrono::steady_clock::now();
     const sly4::recomp::Program prog = sly4::recomp::analyze(mem, img);
 
     sly4::recomp::EmitOptions opt;
     opt.out_dir = out_dir;
     opt.functions_per_file = per_file;
+    opt.name = name;
     if (sample) {  // deterministic sample of code functions (stubs are reached indirectly)
         std::vector<uint32_t> code;
         for (const auto& [e, f] : prog.functions)
@@ -262,6 +306,105 @@ int cmd_disasm(int argc, char** argv) {
     return 0;
 }
 
+// Disassembles the executable segments of an SPU ELF file (tools/spu_extract.py output).
+int cmd_spu_disasm(int argc, char** argv) {
+    std::string elf, out;
+    for (int i = 2; i < argc; ++i) {
+        if (i + 1 >= argc) return usage();
+        if (std::strcmp(argv[i], "--elf") == 0) elf = argv[++i];
+        else if (std::strcmp(argv[i], "--out") == 0) out = argv[++i];
+        else return usage();
+    }
+    if (elf.empty()) return usage();
+    FILE* in = std::fopen(elf.c_str(), "rb");
+    if (!in) {
+        SLY4_ERROR("não foi possível abrir %s", elf.c_str());
+        return 3;
+    }
+    std::vector<uint8_t> data;
+    for (int c; (c = std::fgetc(in)) != EOF;) data.push_back(uint8_t(c));
+    std::fclose(in);
+    sly4::SpuImage img;
+    std::string error;
+    if (!sly4::parse_spu_elf(data.data(), data.size(), img, error)) {
+        SLY4_ERROR("%s: %s", elf.c_str(), error.c_str());
+        return 3;
+    }
+    FILE* f = out.empty() ? stdout : std::fopen(out.c_str(), "w");
+    if (!f) {
+        SLY4_ERROR("não foi possível criar %s", out.c_str());
+        return 3;
+    }
+    size_t count = 0, invalid = 0;
+    for (const sly4::SpuSegment& seg : img.segments) {
+        if (!seg.executable()) continue;
+        for (uint32_t off = 0; off + 4 <= seg.file_size; off += 4) {
+            const uint32_t w = sly4::load_be<uint32_t>(data.data() + seg.offset + off);
+            const sly4::spu::Insn insn = sly4::spu::decode(w);
+            invalid += insn.op == sly4::spu::Op::invalid;
+            std::fprintf(f, "%x:\t%08x\t%s\n", seg.vaddr + off, w, sly4::spu::disasm(insn, seg.vaddr + off).c_str());
+            ++count;
+        }
+    }
+    if (f != stdout) std::fclose(f);
+    SLY4_INFO("%s: %zu palavras (%zu sem instrução válida)", elf.c_str(), count, invalid);
+    return 0;
+}
+
+// C++ for SPU blocks: the ones the SPU cache recorded while the game ran (--cache) and
+// the ones found statically in SPU ELF files (--elf, any number).
+int cmd_spu_emit(int argc, char** argv) {
+    std::string cache, out_dir;
+    std::vector<std::string> elfs;
+    for (int i = 2; i < argc; ++i) {
+        if (i + 1 >= argc) return usage();
+        if (std::strcmp(argv[i], "--cache") == 0) cache = argv[++i];
+        else if (std::strcmp(argv[i], "--elf") == 0) elfs.push_back(argv[++i]);
+        else if (std::strcmp(argv[i], "--out-dir") == 0) out_dir = argv[++i];
+        else return usage();
+    }
+    if (out_dir.empty() || (cache.empty() && elfs.empty())) return usage();
+    std::vector<sly4::SpuCachedBlock> blocks;
+    if (!cache.empty()) {
+        if (!sly4::spu_cache_read(cache, blocks)) return 3;
+        SLY4_INFO("%s: %zu blocos", cache.c_str(), blocks.size());
+    }
+    auto ls = std::make_unique<sly4::SpuLocalStore>();
+    for (const std::string& path : elfs) {
+        FILE* in = std::fopen(path.c_str(), "rb");
+        if (!in) {
+            SLY4_ERROR("não foi possível abrir %s", path.c_str());
+            return 3;
+        }
+        std::vector<uint8_t> data;
+        for (int c; (c = std::fgetc(in)) != EOF;) data.push_back(uint8_t(c));
+        std::fclose(in);
+        sly4::SpuImage img;
+        std::string error;
+        if (!sly4::parse_spu_elf(data.data(), data.size(), img, error)) {
+            SLY4_ERROR("%s: %s", path.c_str(), error.c_str());
+            return 3;
+        }
+        std::memset(ls->data, 0, sizeof(ls->data));
+        sly4::load_spu_segments(data.data(), img, ls->data);
+        std::vector<std::pair<uint32_t, uint32_t>> code;
+        for (const sly4::SpuSegment& s : img.segments)
+            if (s.executable()) code.emplace_back(s.vaddr, s.vaddr + s.file_size);
+        const size_t before = blocks.size();
+        sly4::recomp::spu_static_blocks(ls->data, code, img.entry, blocks);
+        SLY4_INFO("%s: %zu blocos achados no código", path.c_str(), blocks.size() - before);
+    }
+    sly4::recomp::SpuEmitStats stats;
+    std::string error;
+    if (!sly4::recomp::emit_spu_blocks(blocks, out_dir, stats, error)) {
+        SLY4_ERROR("%s", error.c_str());
+        return 3;
+    }
+    SLY4_INFO("%zu blocos (%zu instruções) em %zu arquivos em %s", stats.blocks, stats.instructions, stats.files,
+              out_dir.c_str());
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -270,6 +413,10 @@ int main(int argc, char** argv) {
 #endif
     if (argc < 2) return usage();
     if (std::strcmp(argv[1], "disasm") == 0) return cmd_disasm(argc, argv);
+    if (std::strcmp(argv[1], "spu-disasm") == 0) return cmd_spu_disasm(argc, argv);
+    if (std::strcmp(argv[1], "spu-oracle") == 0) return sly4::spu_oracle::cmd(argc, argv);
+    if (std::strcmp(argv[1], "spu-emit") == 0) return cmd_spu_emit(argc, argv);
+    if (std::strcmp(argv[1], "psarc-hash") == 0) return sly4::spu_oracle::cmd_hash(argc, argv);
     if (std::strcmp(argv[1], "analyze") == 0) return cmd_analyze(argc, argv);
     if (std::strcmp(argv[1], "emit") == 0) return cmd_emit(argc, argv);
     if (std::strcmp(argv[1], "oracle-gen") == 0) return sly4::oracle::cmd_gen(argc, argv);

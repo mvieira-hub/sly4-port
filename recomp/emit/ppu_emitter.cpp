@@ -233,6 +233,7 @@ bool emit_program(const Program& prog, const GuestMemory& mem, const EmitOptions
     }
     std::unordered_set<uint32_t> emitted;
     for (const Function* f : funcs) emitted.insert(f->entry);
+    const std::string reg = opt.name.empty() ? "register_functions" : "register_functions_" + opt.name;
 
     {
         std::ofstream h(opt.out_dir / "functions.h");
@@ -243,7 +244,7 @@ bool emit_program(const Program& prog, const GuestMemory& mem, const EmitOptions
              "#else\n#define SLY4_BLOCK()\n#endif\n\n"
              "namespace sly4::gen {\n\nusing namespace sly4;\nusing ppu::Insn;\nusing ppu::Op;\n\n";
         for (const Function* f : funcs) h << "void " << fname(f->entry) << "(PPUContext& c, GuestMemory& m);\n";
-        h << "\nvoid register_functions();\n\n}  // namespace sly4::gen\n";
+        h << "\nvoid " << reg << "();\n\n}  // namespace sly4::gen\n";
     }
 
     std::vector<std::string> sources;
@@ -265,7 +266,7 @@ bool emit_program(const Program& prog, const GuestMemory& mem, const EmitOptions
         std::vector<uint32_t> sorted(emitted.begin(), emitted.end());
         std::sort(sorted.begin(), sorted.end());
         for (uint32_t e : sorted) t << "    {" << hex32(e) << ", &" << fname(e) << "},\n";
-        t << "};\n}  // namespace\n\nvoid register_functions() { rt::set_function_table(kTable, "
+        t << "};\n}  // namespace\n\nvoid " << reg << "() { rt::set_function_table(kTable, "
           << sorted.size() << "); }\n\n}  // namespace sly4::gen\n";
         sources.push_back("table.cpp");
     }

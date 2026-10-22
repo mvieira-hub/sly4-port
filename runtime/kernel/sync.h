@@ -58,17 +58,25 @@ bool wait_for(std::condition_variable& cv, std::unique_lock<std::mutex>& lk, uin
     return cv.wait_for(lk, std::chrono::microseconds(timeout_us), pred);
 }
 
+// As in LV2, unlocking a mutex others wait for hands it to the oldest waiter: a thread
+// that unlocks and tries again at once cannot keep it from them.
 struct Mutex : KernelObject {
     std::mutex m;
-    std::condition_variable cv;  // signalled when the mutex becomes free
+    std::condition_variable cv;  // signalled when the owner changes
     uint64_t owner = 0;
     uint32_t count = 0;  // recursion depth
     bool recursive = false;
     uint32_t cond_users = 0;
+    std::deque<uint64_t> queue;  // waiting threads, oldest first
 
     uint32_t lock(uint64_t tid, uint64_t timeout_us);
     uint32_t trylock(uint64_t tid);
     uint32_t unlock(uint64_t tid);
+
+    // With m held: takes the mutex (waiting in line), false on timeout; and releases it
+    // to the next waiter.
+    bool acquire_locked(std::unique_lock<std::mutex>& lk, uint64_t tid, uint64_t timeout_us);
+    void release_locked();
 };
 
 // Waiters take tickets in arrival order; a signal releases the oldest ticket still

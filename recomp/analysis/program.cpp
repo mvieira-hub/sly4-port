@@ -394,6 +394,8 @@ Program analyze(const GuestMemory& mem, const LoadedImage& img) {
         if (c.in_exec(fn)) entries.insert(fn), opd_entries.insert(fn);
     }
     if (c.in_exec(img.entry_function)) entries.insert(img.entry_function);
+    for (uint32_t fn : img.function_entries)  // PRX modules: descriptors found by the loader
+        if (c.in_exec(fn)) entries.insert(fn), opd_entries.insert(fn);
 
     // Exploring a function can reveal new call targets, which in turn change how
     // branches into them are classified (tail call vs local), so iterate to a fixpoint.

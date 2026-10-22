@@ -4,7 +4,14 @@
 // it raises are translated to FPSCR bits. Single-precision results are computed in
 // double with round-to-odd and then rounded once to single, which gives the correctly
 // rounded single result even for full double inputs (no double rounding).
+//
+// The rounding mode and the flags are the SSE ones, in MXCSR, set and read directly: with
+// -mfma every operation here is an SSE/AVX instruction. <cfenv> is not used because
+// MinGW's fesetround/feclearexcept execute CPUID on every call, and CPUID traps to the
+// hypervisor (Hyper-V under Docker/WSL2): the Bink decoder spent most of its time there.
 #include "cpu/ppu_fpu.h"
+
+#include <immintrin.h>
 
 #include <cfenv>
 #include <cmath>
@@ -80,6 +87,31 @@ void set_fi_fr(PPUContext& c, bool fi, bool fr) {
     if (fi) raise(c, fpscr::XX);
 }
 
+// MXCSR: rounding control in bits 13-14, exception flags in bits 0-5 (the same values as
+// the FE_* flags of x86 <cfenv>).
+constexpr unsigned kCsrRound = 0x6000, kCsrFlags = 0x3F;
+unsigned csr_round(int mode) {
+    switch (mode) {
+        case FE_DOWNWARD: return 0x2000;
+        case FE_UPWARD: return 0x4000;
+        case FE_TOWARDZERO: return 0x6000;
+        default: return 0;
+    }
+}
+// Sets the rounding mode and clears the flags for its lifetime; restores MXCSR after.
+// Operands go through volatile loads after the set and results through volatile stores
+// before the flags are read: ldmxcsr/stmxcsr are volatile, so they stay in order.
+class Mxcsr {
+public:
+    explicit Mxcsr(int mode) : saved_(_mm_getcsr()) { _mm_setcsr((saved_ & ~(kCsrRound | kCsrFlags)) | csr_round(mode)); }
+    ~Mxcsr() { _mm_setcsr(saved_); }
+    void round(int mode) { _mm_setcsr((_mm_getcsr() & ~kCsrRound) | csr_round(mode)); }
+    int flags() const { return int(_mm_getcsr() & kCsrFlags); }
+
+private:
+    unsigned saved_;
+};
+
 // Round-to-odd helper: the double result r was computed toward zero; if it was
 // inexact, force the last bit to 1 so a later rounding to single is exact.
 double make_odd(double r, bool inexact) { return inexact ? dbl(bits(r) | 1) : r; }
@@ -102,14 +134,10 @@ double host_op(Arith k, double a, double b, double cc) {
 }
 
 HostResult run_host(Arith k, double a, double b, double cc, int mode) {
-    const int old = std::fegetround();
-    std::fesetround(mode);
-    std::feclearexcept(FE_ALL_EXCEPT);
     volatile double va = a, vb = b, vc = cc;
-    const double r = host_op(k, va, vb, vc);
-    const int fl = std::fetestexcept(FE_ALL_EXCEPT);
-    std::fesetround(old);
-    return {r, fl};
+    Mxcsr csr(mode);
+    volatile double r = host_op(k, va, vb, vc);
+    return {r, csr.flags()};
 }
 
 }  // namespace
@@ -206,15 +234,12 @@ void arith(PPUContext& c, uint32_t frt, uint64_t A, uint64_t B, uint64_t C, Arit
         // takes its sign from the real rounding mode (x - x is -0 when rounding down).
         double odd = make_odd(z.value, z.flags & FE_INEXACT);
         if (z.value == 0 && !(z.flags & FE_INEXACT)) odd = run_host(k, a, b, cc, mode).value;
-        const int old = std::fegetround();
-        std::feclearexcept(FE_ALL_EXCEPT);
-        std::fesetround(mode);
         volatile double vo = odd;
-        const float f = static_cast<float>(vo);
-        flags = std::fetestexcept(FE_ALL_EXCEPT) | (z.flags & (FE_INEXACT | FE_DIVBYZERO));
-        std::fesetround(FE_TOWARDZERO);
-        const float fz = static_cast<float>(vo);
-        std::fesetround(old);
+        Mxcsr csr(mode);
+        volatile float f = static_cast<float>(vo);
+        flags = csr.flags() | (z.flags & (FE_INEXACT | FE_DIVBYZERO));
+        csr.round(FE_TOWARDZERO);
+        volatile float fz = static_cast<float>(vo);
         res = static_cast<double>(f);
         fr = std::fabs(f) != std::fabs(fz);
     }
@@ -260,15 +285,12 @@ void frsp(PPUContext& c, uint32_t frt, uint64_t B) {
         set_fprf(c, 0x11);
     } else {
         const int mode = host_round(c.fpscr);
-        const int old = std::fegetround();
-        std::feclearexcept(FE_ALL_EXCEPT);
-        std::fesetround(mode);
         volatile double vb = dbl(B);
-        const float f = static_cast<float>(vb);
-        const int fl = std::fetestexcept(FE_ALL_EXCEPT);
-        std::fesetround(FE_TOWARDZERO);
-        const float fz = static_cast<float>(vb);
-        std::fesetround(old);
+        Mxcsr csr(mode);
+        volatile float f = static_cast<float>(vb);
+        const int fl = csr.flags();
+        csr.round(FE_TOWARDZERO);
+        volatile float fz = static_cast<float>(vb);
         u32 exc = 0;
         if (fl & FE_OVERFLOW) exc |= fpscr::OX;
         // tiny before rounding (see arith): the input itself is the exact value
@@ -283,15 +305,12 @@ void frsp(PPUContext& c, uint32_t frt, uint64_t B) {
 }
 
 void fcfid(PPUContext& c, uint32_t frt, uint64_t B) {
-    const int old = std::fegetround();
-    std::feclearexcept(FE_ALL_EXCEPT);
-    std::fesetround(host_round(c.fpscr));
     volatile s64 v = static_cast<s64>(B);
-    const double r = static_cast<double>(v);
-    const int fl = std::fetestexcept(FE_ALL_EXCEPT);
-    std::fesetround(FE_TOWARDZERO);
-    const double rz = static_cast<double>(v);
-    std::fesetround(old);
+    Mxcsr csr(host_round(c.fpscr));
+    volatile double r = static_cast<double>(v);
+    const int fl = csr.flags();
+    csr.round(FE_TOWARDZERO);
+    volatile double rz = static_cast<double>(v);
     c.set_f(frt, r);
     set_fi_fr(c, fl & FE_INEXACT, (fl & FE_INEXACT) && std::fabs(r) != std::fabs(rz));
     set_fprf(c, fprf_of(c.fpr[frt], false));
@@ -309,11 +328,13 @@ void convert_to_int(PPUContext& c, uint32_t frt, uint64_t B, bool word, bool tow
         res = word ? 0x80000000u : 0x8000000000000000ull;
     } else {
         const int mode = toward_zero ? FE_TOWARDZERO : host_round(c.fpscr);
-        const int old = std::fegetround();
-        std::fesetround(mode);
         volatile double vb = b;
-        const double rounded = std::nearbyint(vb);
-        std::fesetround(old);
+        double rounded;
+        {
+            Mxcsr csr(mode);
+            volatile double vr = std::nearbyint(vb);
+            rounded = vr;
+        }
         if (rounded < double(lo) || rounded > double(hi) || (!word && rounded >= 9223372036854775808.0)) {
             raise(c, fpscr::VXCVI);
             res = u64(rounded < 0 ? lo : hi);

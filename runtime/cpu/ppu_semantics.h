@@ -17,6 +17,7 @@
 
 #include "core/endian.h"
 #include "cpu/ppu_context.h"
+#include "cpu/guest_atomic.h"
 #include "cpu/ppu_fpu.h"
 #include "memory/guest_memory.h"
 #include "ppu/ppu_decoder.h"
@@ -116,11 +117,9 @@ inline bool store_conditional(PPUContext& c, GuestMemory& mem, GuestAddr ea, T v
     const bool ok = c.reserved && c.reserve_addr == ea && c.reserve_size == sizeof(T);
     c.reserved = false;
     if (!ok) return false;
-    // Compare-and-swap on the raw big-endian bytes the reservation saw.
-    T expected = byteswap(static_cast<T>(c.reserve_value));
-    const T desired = byteswap(value);
-    auto* p = reinterpret_cast<T*>(mem.host(ea));
-    return __atomic_compare_exchange_n(p, &expected, desired, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    // The whole reserved line must be unchanged, checked under the lock the SPU's
+    // lock-line commands take too (cpu/guest_atomic.h).
+    return guest_store_conditional(mem, ea, c.reserve_line, uint64_t(byteswap(value)), int(sizeof(T)));
 }
 
 uint64_t timebase();  // PS3 time base (79.8 MHz), ppu_interpreter.cpp

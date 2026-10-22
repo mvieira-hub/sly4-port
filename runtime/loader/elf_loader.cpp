@@ -38,8 +38,13 @@ std::string hex(uint64_t v) {
 //   +0x06 u16 num_func  +0x08 u16 num_var  +0x0A u16 num_tlsvar
 //   +0x10 module name  +0x14 function NID table  +0x18 function slot table
 //   +0x1C variable NIDs  +0x20 variable slots  +0x24 TLS NIDs  +0x28 TLS slots
-bool read_imports(const GuestMemory& mem, LoadedImage& img, std::string& error) {
-    for (GuestAddr a = img.libstub_start; a + kStubRecordSize <= img.libstub_end;) {
+}  // namespace
+
+// The same 0x2C-byte records describe the imports of an executable (.lib.stub) and of a
+// PRX module (library info imports_start..imports_end).
+bool read_import_table(const GuestMemory& mem, GuestAddr start, GuestAddr end, std::vector<ImportedModule>& out,
+                       std::string& error) {
+    for (GuestAddr a = start; a + kStubRecordSize <= end;) {
         const uint8_t size = mem.read<uint8_t>(a);
         if (size < kStubRecordSize) {
             error = "registro .lib.stub com tamanho inválido em " + hex(a);
@@ -61,13 +66,11 @@ bool read_imports(const GuestMemory& mem, LoadedImage& img, std::string& error) 
         }
         for (uint16_t i = 0; i < num_func; ++i)
             m.functions.push_back({mem.read<uint32_t>(nids + 4u * i), slots + 4u * i});
-        img.imports.push_back(std::move(m));
+        out.push_back(std::move(m));
         a += size;
     }
     return true;
 }
-
-}  // namespace
 
 size_t LoadedImage::imported_function_count() const {
     size_t n = 0;
@@ -212,7 +215,7 @@ bool load_elf(const std::string& path, GuestMemory& mem, LoadedImage& out, std::
             error = ".lib.stub fora da imagem";
             return false;
         }
-        if (!read_imports(mem, out, error)) return false;
+        if (!read_import_table(mem, out.libstub_start, out.libstub_end, out.imports, error)) return false;
     }
 
     // Code segments become read-only on the host: a write to them is a bug worth a fault.

@@ -26,7 +26,9 @@ namespace sly4::vk {
     X(vkGetPhysicalDeviceSurfaceSupportKHR)        \
     X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)   \
     X(vkGetPhysicalDeviceSurfaceFormatsKHR)        \
-    X(vkGetPhysicalDeviceSurfacePresentModesKHR)
+    X(vkGetPhysicalDeviceSurfacePresentModesKHR)   \
+    X(vkGetPhysicalDeviceMemoryProperties)         \
+    X(vkGetPhysicalDeviceFormatProperties)
 
 #define SLY4_VK_DEVICE_FUNCS(X)      \
     X(vkDestroyDevice)               \
@@ -54,7 +56,50 @@ namespace sly4::vk {
     X(vkCreateFence)                 \
     X(vkDestroyFence)                \
     X(vkWaitForFences)               \
-    X(vkResetFences)
+    X(vkResetFences)                 \
+    X(vkQueueWaitIdle)               \
+    X(vkCreateBuffer)                \
+    X(vkDestroyBuffer)               \
+    X(vkCreateImage)                 \
+    X(vkDestroyImage)                \
+    X(vkGetBufferMemoryRequirements) \
+    X(vkGetImageMemoryRequirements)  \
+    X(vkAllocateMemory)              \
+    X(vkFreeMemory)                  \
+    X(vkBindBufferMemory)            \
+    X(vkBindImageMemory)             \
+    X(vkMapMemory)                   \
+    X(vkCreateShaderModule)          \
+    X(vkDestroyShaderModule)         \
+    X(vkCreatePipelineLayout)        \
+    X(vkDestroyPipelineLayout)       \
+    X(vkCreateGraphicsPipelines)     \
+    X(vkDestroyPipeline)             \
+    X(vkCreateDescriptorSetLayout)   \
+    X(vkDestroyDescriptorSetLayout)  \
+    X(vkCreateDescriptorPool)        \
+    X(vkDestroyDescriptorPool)       \
+    X(vkResetDescriptorPool)         \
+    X(vkAllocateDescriptorSets)      \
+    X(vkUpdateDescriptorSets)        \
+    X(vkCreateSampler)               \
+    X(vkDestroySampler)              \
+    X(vkCmdBindPipeline)             \
+    X(vkCmdBindDescriptorSets)       \
+    X(vkCmdBindVertexBuffers)        \
+    X(vkCmdBindIndexBuffer)          \
+    X(vkCmdDraw)                     \
+    X(vkCmdDrawIndexed)              \
+    X(vkCmdSetViewport)              \
+    X(vkCmdSetScissor)               \
+    X(vkCmdCopyBufferToImage)        \
+    X(vkCmdCopyImageToBuffer)        \
+    X(vkCmdBlitImage)                \
+    X(vkCmdClearColorImage)          \
+    X(vkCmdClearDepthStencilImage)   \
+    X(vkCmdClearAttachments)         \
+    X(vkCmdSetBlendConstants)        \
+    X(vkCmdSetStencilReference)
 
 #define SLY4_VK_DECLARE(name) extern PFN_##name name;
 SLY4_VK_GLOBAL_FUNCS(SLY4_VK_DECLARE)

@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -21,11 +22,27 @@ struct VulkanOptions {
 class VulkanContext {
 public:
     bool init(SDL_Window* window, const VulkanOptions& options);
+    // Without a window (no surface or swapchain): rendering only, for tests and frame dumps.
+    bool init_headless(const VulkanOptions& options);
     void shutdown();
 
-    // Clears the next swapchain image to `rgba` (linear) and presents it.
-    // Returns false only on an unrecoverable error (device lost...).
-    bool draw_frame(const std::array<float, 4>& rgba);
+    // An image to show: kept in TRANSFER_SRC_OPTIMAL by its owner (the RSX renderer).
+    struct Source {
+        VkImage image = VK_NULL_HANDLE;
+        uint32_t width = 0, height = 0;
+    };
+    // Presents `source` scaled to the window (keeping its aspect), or clears the next
+    // swapchain image to `rgba` when there is none. Returns false only on an unrecoverable
+    // error (device lost...).
+    bool draw_frame(const std::array<float, 4>& rgba, const Source& source);
+    bool draw_frame(const std::array<float, 4>& rgba) { return draw_frame(rgba, Source()); }
+
+    // For the renderer: the device and the queue, which is shared (submit under queue_lock).
+    VkDevice device() const { return device_; }
+    VkPhysicalDevice physical_device() const { return physical_; }
+    VkQueue queue() const { return queue_; }
+    uint32_t queue_family() const { return queue_family_; }
+    std::mutex& queue_lock() { return queue_lock_; }
 
     void notify_resized() { resize_pending_ = true; }
 
@@ -52,6 +69,8 @@ private:
     void destroy_swapchain_resources();
     bool recreate_swapchain();
     bool create_frames();
+    bool headless_ = false;
+    std::mutex queue_lock_;
 
     SDL_Window* window_ = nullptr;
     VulkanOptions options_{};

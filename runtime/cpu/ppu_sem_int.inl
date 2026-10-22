@@ -224,10 +224,12 @@ SLY4_SEM(lhbrx, r[d] = byteswap(mem.read<uint16_t>(ea_x(c, in))))
 SLY4_SEM(lwbrx, r[d] = byteswap(mem.read<uint32_t>(ea_x(c, in))))
 SLY4_SEM(sthbrx, mem.write<uint16_t>(ea_x(c, in), byteswap(uint16_t(r[d]))))
 SLY4_SEM(stwbrx, mem.write<uint32_t>(ea_x(c, in), byteswap(u32(r[d]))))
-SLY4_SEM(lwarx, const GuestAddr ea = ea_x(c, in); r[d] = mem.read<uint32_t>(ea); c.reserved = true;
-         c.reserve_addr = ea; c.reserve_value = r[d]; c.reserve_size = 4)
-SLY4_SEM(ldarx, const GuestAddr ea = ea_x(c, in); r[d] = mem.read<uint64_t>(ea); c.reserved = true;
-         c.reserve_addr = ea; c.reserve_value = r[d]; c.reserve_size = 8)
+SLY4_SEM(lwarx, const GuestAddr ea = ea_x(c, in); guest_load_reserve(mem, ea, c.reserve_line);
+         r[d] = load_be<uint32_t>(c.reserve_line + (ea & 124)); c.reserved = true; c.reserve_addr = ea;
+         c.reserve_value = r[d]; c.reserve_size = 4)
+SLY4_SEM(ldarx, const GuestAddr ea = ea_x(c, in); guest_load_reserve(mem, ea, c.reserve_line);
+         r[d] = load_be<uint64_t>(c.reserve_line + (ea & 120)); c.reserved = true; c.reserve_addr = ea;
+         c.reserve_value = r[d]; c.reserve_size = 8)
 SLY4_SEM(stwcx_, const bool ok = store_conditional<uint32_t>(c, mem, ea_x(c, in), u32(r[d]));
          c.set_crf(0, (ok ? 2u : 0u) | (c.xer_so ? 1u : 0u)))
 SLY4_SEM(stdcx_, const bool ok = store_conditional<uint64_t>(c, mem, ea_x(c, in), r[d]);

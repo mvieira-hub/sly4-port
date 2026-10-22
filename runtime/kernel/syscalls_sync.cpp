@@ -180,11 +180,14 @@ void sys_semaphore_get_value(PPUContext& c, GuestMemory& m) {
 }
 
 // ---------------------------------------------------------------- event flag
+void log_object(const PPUContext& c, const char* what, uint32_t id, const char* name);
 void sys_event_flag_create(PPUContext& c, GuestMemory& m) {
     auto f = std::make_shared<EventFlag>();
     f->bits = c.gpr[5];
     f->name = name8(m, a32(c, 4) + 24);
-    c.gpr[3] = publish(m, a32(c, 3), f, idbase::kEventFlag);
+    const GuestAddr out = a32(c, 3);
+    c.gpr[3] = publish(m, out, f, idbase::kEventFlag);
+    if (c.gpr[3] == CELL_OK) log_object(c, "event flag", m.read<uint32_t>(out), f->name.c_str());
 }
 void sys_event_flag_destroy(PPUContext& c, GuestMemory&) {
     OBJ(EventFlag, f, c.gpr[3]);
@@ -216,6 +219,17 @@ void sys_event_flag_clear(PPUContext& c, GuestMemory&) {
 }
 
 // ---------------------------------------------------------------- event queue / port
+// Event queues and ports are few: their creation is always logged, to follow who talks
+// to whom.
+const char* thread_name() {
+    const PpuThread* t = current_thread();
+    return t ? t->name.c_str() : "?";
+}
+void log_object(const PPUContext& c, const char* what, uint32_t id, const char* name) {
+    SLY4_INFO("{%s} %s 0x%08X criada%s%s (LR 0x%08X)", thread_name(), what, id, *name ? ": " : "", name,
+              uint32_t(c.lr));
+}
+
 void sys_event_queue_create(PPUContext& c, GuestMemory& m) {
     const int32_t size = int32_t(c.gpr[6]);
     if (size <= 0 || size > 127) {
@@ -226,7 +240,9 @@ void sys_event_queue_create(PPUContext& c, GuestMemory& m) {
     q->size = uint32_t(size);
     q->key = c.gpr[5];
     q->name = name8(m, a32(c, 4) + 8);
-    c.gpr[3] = publish(m, a32(c, 3), q, idbase::kEventQueue);
+    const GuestAddr out = a32(c, 3);
+    c.gpr[3] = publish(m, out, q, idbase::kEventQueue);
+    if (c.gpr[3] == CELL_OK) log_object(c, "fila de evento", m.read<uint32_t>(out), q->name.c_str());
 }
 void sys_event_queue_destroy(PPUContext& c, GuestMemory&) {
     OBJ(EventQueue, q, c.gpr[3]);
@@ -286,6 +302,7 @@ void sys_event_port_create(PPUContext& c, GuestMemory& m) {
     const uint32_t id = idm().add(p, idbase::kEventPort);
     p->id = id;
     m.write<uint32_t>(a32(c, 3), id);
+    log_object(c, "porta de evento", id, "");
     c.gpr[3] = CELL_OK;
 }
 void sys_event_port_destroy(PPUContext& c, GuestMemory&) {
@@ -305,6 +322,8 @@ void sys_event_port_connect_local(PPUContext& c, GuestMemory&) {
         return;
     }
     p->queue = q;
+    SLY4_INFO("{%s} porta 0x%08X ligada à fila 0x%08X (LR 0x%08X)", thread_name(), a32(c, 3), a32(c, 4),
+              uint32_t(c.lr));
     c.gpr[3] = CELL_OK;
 }
 void sys_event_port_disconnect(PPUContext& c, GuestMemory&) {

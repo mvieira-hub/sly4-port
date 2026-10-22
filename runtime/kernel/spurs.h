@@ -9,6 +9,7 @@
 #include <mutex>
 #include <vector>
 
+#include "cpu/ppu_context.h"
 #include "memory/guest_memory.h"
 
 namespace sly4 {
@@ -43,5 +44,10 @@ struct SpursTaskInfo {
 // Starts the native version of the task if its SPU program is a known one; returns its
 // name, or nullptr when the task cannot run (no SPU recompiler yet).
 const char* start_native_spurs_task(GuestMemory& m, const SpursTaskInfo& task);
+
+// --verify-zlib: every request to the real EDGE zlib task (LLE SPURS) is inflated natively
+// too and compared once the requesting thread is back from its wait.
+void zlib_verify_call(PPUContext& c, GuestMemory& m, const char* name);
+void zlib_verify_summary();
 
 }  // namespace sly4

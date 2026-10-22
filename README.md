@@ -70,7 +70,9 @@ Com o código gerado no build, o `sly4.exe` roda o jogo (Fase 3; ver [docs/KERNE
 .\build\mingw-release\sly4.exe --game PS3_GAME --no-window --seconds 20
 ```
 
-Estado atual: **Fases 0 a 3 concluídas.**
+Com o firmware do PS3 instalado no RPCS3, o SPURS do firmware roda como está (Fase 4; ver [docs/SPU.md](docs/SPU.md), 4c). O `libsre.prx` descriptografado vai em `work\firmware`, é recompilado para `generated\fw_libsre` e o jogo roda com `--firmware work\firmware`.
+
+Estado atual: **Fases 0 a 4 concluídas; Fase 5 (GPU) em andamento.**
 - O EBOOT inteiro vira C++: 24.164 funções que compilam sem avisos.
 - Comparado com o interpretador, o código gerado deu igual em todos os 98 mil casos.
 - O interpretador foi validado antes contra o QEMU: 195 mil casos, 0 divergências.
@@ -79,7 +81,13 @@ Estado atual: **Fases 0 a 3 concluídas.**
   - cria 10 threads;
   - sobe o sistema de arquivos da Sony (FIOS) e monta o cache;
   - lê o `Sly4.psarc`, com a descompressão que no PS3 roda no SPU (EDGE zlib) feita em código nativo.
-- O próximo passo é o `cellGcm` (gráficos, Fase 5) e o SPU de verdade (Fase 4).
+- Fase 4 (ver [docs/SPU.md](docs/SPU.md)):
+  - o SPU tem decodificador, interpretador e gerador de C++ validados (as 266.842 palavras dos programas SPU iguais ao `objdump`; 925 mil casos do diferencial iguais ao interpretador);
+  - com o firmware, o SPURS real roda em 6 SPUs, quase todo em código compilado, com interrupções e listas de DMA com parada;
+  - os 2.577 blocos que a tarefa EDGE zlib descomprime no SPU durante o boot são idênticos ao inflate nativo, que bate com o `zlib` do Python nos 148.603 blocos do psarc.
+- Fase 5, início: um `cellGcm` mínimo com um RSX que consome o FIFO sem desenhar, mais `cellAudio` e `cellPad` mínimos. O jogo sobe até o vídeo de abertura, com as threads de áudio (SCREAM, Bink) e de física (Havok, BFX) rodando.
+- Fase 5 (ver [docs/GPU.md](docs/GPU.md)): o RSX tem rastreador de estado e um renderizador Vulkan que traduz os *shaders* do jogo direto para SPIR-V; a tela de carregamento sai correta (`--no-window --render --dump-frames pasta` grava os quadros em PNG).
+- O boot passa do vídeo de abertura sem travar e o jogo desenha cenas 3D; do vídeo em diante a imagem ainda sai preta (cópias 2D do RSX feitas na CPU, sem acesso às superfícies do Vulkan). É o próximo passo.
 - O programa abre a janela Vulkan 1.3 na GPU dedicada.
 - Reserva os 4 GiB do espaço de endereços do PS3 e carrega o `EBOOT.elf`: segmentos, TLS, parâmetros do processo e as 251 importações, idênticas às do `eboot_scan.py`.
 - A CI (`.github/workflows/build.yml`) compila o `.exe`, roda os testes num runner Windows e publica os binários como artefato.

@@ -21,6 +21,8 @@ struct EmitOptions {
     std::filesystem::path out_dir;
     size_t functions_per_file = 300;
     std::vector<uint32_t> only;  // emit just these entries (others are reached through rt::call_indirect)
+    // Firmware modules get register_functions_<name>(); the game keeps register_functions().
+    std::string name;
 };
 
 struct EmitStats {

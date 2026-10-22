@@ -132,7 +132,7 @@ Sly4.psarc + Movies (dump) ───┘  lidos em tempo de execução, sem conve
 
 Princípios:
 1. **O código gerado nunca entra no repositório.** O build lê o `EBOOT.elf` de quem compila e gera o C++ localmente. O repositório distribui só o recompilador e o runtime. É o mesmo modelo dos ports por recompilação já existentes.
-2. **Recompilar tudo o que é do jogo, reimplementar só o que é do sistema.** Havok, Bink, SCREAM, EDGE e o motor Ape são código do EBOOT ou dos SPUs e são recompilados. LV2, `cellGcm`, `cellFs`, `cellAudio`, `cellPad` e `cellSpurs` são do firmware e são reimplementados.
+2. **Recompilar tudo o que é do jogo, reimplementar só o que é do sistema.** Havok, Bink, SCREAM, EDGE e o motor Ape são código do EBOOT ou dos SPUs e são recompilados. LV2, `cellGcm`, `cellFs`, `cellAudio` e `cellPad` são do firmware e são reimplementados. A exceção é o `cellSpurs`: o módulo do firmware que o contém roda como está (LLE, Fase 4), porque reimplementá-lo seria mais arriscado do que implementar o LV2 que ele usa.
 3. **O RPCS3 é o oráculo.** Toda dúvida de semântica (syscall, método do RSX, comportamento do SPURS) se resolve comparando com o que o RPCS3 faz. Ele também serve para comparar logs e quadros lado a lado.
 4. **Os assets são lidos como estão.** O jogo lê o PSARC e os `.san` sozinho; as ferramentas Python servem para entender e validar, não para converter.
 
@@ -152,7 +152,7 @@ flowchart TB
     MEM[Memória do convidado<br/>4 GiB, big-endian]
     KRN[Kernel LV2<br/>threads, sync, timers, memória]
     HLE[Módulos HLE<br/>sysPrxForUser, cellFs, cellGame, cellSysutil...]
-    SPURS[cellSpurs HLE<br/>agenda jobs e tarefas]
+    SPURS[cellSpurs: libsre do firmware<br/>recompilada, agenda jobs e tarefas]
     GCM[cellGcm + RSX<br/>FIFO → Vulkan 1.3]
     AUD[cellAudio → WASAPI]
     PAD[cellPad → SDL3 gamepad]
@@ -219,7 +219,7 @@ flowchart TB
 - os jobs soltos no `.rodata`, achados pelos descritores de job que o PPU monta;
 - os plugins do SCREAM, carregados da memória.
 
-**SPURS em HLE.** Não emulamos o kernel SPURS do firmware. Um *pool* de até 6 threads de host (os SPUs que o jogo pode usar) executa os *workloads*: *jobchains* para o EDGE e os jobs do motor, *tasksets* para SCREAM e Havok. São 61 funções importadas, e cada uma precisa ser mapeada para essa agenda.
+**SPURS pelo firmware (LLE).** O plano inicial era reimplementar o SPURS em HLE, com um *pool* de threads de host executando os *workloads*. Na Fase 4 isso foi trocado pelo caminho LLE do RPCS3: o módulo `libsre` do firmware (o SPURS do PPU e o kernel que roda nos SPUs) é carregado, recompilado como o EBOOT e roda como está; o port implementa só o LV2 que ele usa (grupos de threads SPU, eventos, memória). O módulo vem do firmware que o próprio usuário instala e não é versionado ([SPU.md](SPU.md), 4c).
 
 **Atalho opcional.** Jobs conhecidos podem ser trocados por código nativo, identificados pelo hash do binário do job:
 - `edgezlib` → zlib-ng;
@@ -402,13 +402,30 @@ Plano da fase:
 - Tudo o que não existe ainda registra a chamada e devolve `CELL_OK`, para mapear o que o jogo precisa.
 - **Saída:** o jogo roda o `main`, cria as threads, abre o `Sly4.psarc`, lê arquivos (com log comparável ao do RPCS3) e chega ao `cellGcmInit`.
 
-### Fase 4: SPU e SPURS (6–10 semanas)
+### Fase 4: SPU e SPURS (6–10 semanas) — **concluída** (2026-10-22)
+
+Andamento em [SPU.md](SPU.md):
+- **4a, decodificador SPU (concluída):** nas 266.842 palavras dos 10 programas SPU do jogo, o texto é idêntico ao do `spu-elf-objdump` (0 divergências).
+- **4b, interpretador SPU (concluída):** a função de inflate da própria tarefa EDGE zlib, rodando no interpretador, descomprime 2.000 blocos sorteados do psarc idênticos ao inflate nativo (4,4 bilhões de instruções SPU). O que ela não exercita (multiplicações e ponto flutuante) tem testes com valores da ISA.
+- **4c, módulos do firmware (concluída):** a `libsre.prx` do firmware é carregada em `0x0F000000`, relocada e recompilada (384 funções); 64 importações do jogo passam a ir para o SPURS real e 219 continuam em HLE.
+- **4d, threads SPU do LV2 (concluída):** grupos, mailboxes, sinais, eventos e *stops* do LV2. O jogo cria dois grupos do SPURS (6 SPUs) que rodam o kernel SPURS real no interpretador; a tarefa EDGE zlib descomprime o primeiro bloco do psarc com resultado idêntico ao atalho nativo da 3d, e o jogo chega de novo ao `cellGcmInit`.
+- **4e, gerador de C++ para SPU (concluída):** blocos verificados (só rodam quando o local store tem o código de que vieram), vindos de uma cache gravada durante o jogo e dos 10 ELFs: 22.370 blocos. No teste diferencial, 1,36 milhão de casos iguais ao interpretador; o inflate da tarefa EDGE zlib compilado descomprime 2.000 blocos do psarc idênticos ao nativo, 3,3 vezes mais rápido que o interpretador.
+- **4f, saída da fase (concluída):** com um `cellGcm` mínimo (5a), `cellAudio` e `cellPad`, o jogo sobe até o vídeo de abertura. Para o áudio do SCREAM funcionar vieram as interrupções do SPU, as listas de DMA com *stall-and-notify* e uma trava por linha comum ao `stwcx.` do PPU e ao `putllc` do SPU. Em 120 s de boot, os 2.577 blocos que a tarefa EDGE zlib real descomprime no SPU são idênticos ao inflate nativo, que por sua vez dá o mesmo resultado do `zlib` do Python nos 148.603 blocos do psarc (9,01 GiB). As threads de áudio (BRB/SCREAM, Bink) e de física (Havok, BFX) rodam sem travar.
+
+Plano da fase:
 - Recompilador SPU (mesmo emissor, ISA SPU) e `SPUContext` com local store, MFC e canais.
-- `cellSpurs` em HLE: *workloads*, *jobchains*, *tasksets* e eventos.
+- `cellSpurs` pelo firmware (LLE) sobre grupos de threads SPU do LV2.
 - Catálogo de quem usa o quê: EDGE (geometria e zlib), Havok, SCREAM e mp3, Bink.
 - **Saída:** os jobs `edgezlib` descomprimem o conteúdo de uma fase com resultado idêntico ao do `psarc.py`/`san2gltf.py`, e as threads de áudio e física rodam sem travar.
 
-### Fase 5: RSX → Vulkan (8–14 semanas)
+### Fase 5: RSX → Vulkan (8–14 semanas) — **em andamento**
+
+Andamento em [GPU.md](GPU.md):
+- **5a, `cellGcm` mínimo e RSX nulo (concluída):** memória local, mapa de IO, buffer de comandos em fragmentos com o *callback* de contexto, *labels*, *reports* e VBlank; uma thread consome o FIFO (saltos, chamadas, semáforos, *reports*, *flip*) sem desenhar. O jogo passa do `cellGcmInit` e vira quadros na tela de carregamento.
+- **5b, rastreador de estado (concluída):** o RSX virou o módulo `runtime/rsx`: banco de registradores, memória do *vertex program* e das constantes, cópias 2D na CPU e captura de quadros com os nomes dos métodos.
+- **5c–5e, renderizador Vulkan (em andamento):** superfícies como imagens Vulkan, *vertex* e *fragment programs* traduzidos direto para SPIR-V, vértices e texturas convertidos da memória do jogo, *flip* para a janela ou para PNG. A tela de carregamento sai correta. O boot não trava mais (a trava era um `putllc` apagando escritas comuns do PPU), o vídeo de abertura roda a ~60 *flips*/s e o jogo segue desenhando cenas 3D, mas do vídeo em diante a imagem sai preta: falta a coerência entre as cópias 2D e as superfícies do Vulkan.
+
+Plano da fase:
 - `cellGcm` em HLE e consumidor do FIFO com rastreador de estado.
 - *Vertex fetch*, texturas e *render targets*.
 - Tradutor VP/FP → SPIR-V, validado primeiro nos 541 shaders do `Shaders.Zip`.
@@ -417,6 +434,7 @@ Plano da fase:
 - **Saída:** a splash da Sanzaru e o menu principal aparecem corretos.
 
 ### Fase 6: áudio, controle e vídeo (3–5 semanas)
+- Já existe a parte mínima, que a Fase 4 precisou: `cellAudio` com portas e relógio de 48 kHz (sem saída de som) e `cellPad` com um controle parado.
 - `cellAudio` → WASAPI; `cellPad` → SDL3; Bink rodando (recompilado ou, no plano B, FFmpeg).
 - **Saída:** menu com música, navegação pelo controle e a abertura em vídeo.
 

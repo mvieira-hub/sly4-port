@@ -10,8 +10,10 @@
 #include <string>
 #include <thread>
 
+#include "core/host_sleep.h"
 #include "core/log.h"
 #include "kernel/hle.h"
+#include "loader/elf_loader.h"
 #include "kernel/kernel.h"
 
 namespace sly4 {
@@ -24,6 +26,11 @@ constexpr uint32_t kCount = 1024;
 void sys_process_getpid(PPUContext& c, GuestMemory&) { c.gpr[3] = 0x01000500; }
 void sys_process_exit_(PPUContext& c, GuestMemory&) { throw ProcessExit{int32_t(c.gpr[3])}; }
 void sys_process_is_spu_lock_line_reservation_address(PPUContext& c, GuestMemory&) { c.gpr[3] = CELL_OK; }
+// sys_process_get_sdk_version(pid, u32* version): the SDK the game was built with.
+void sys_process_get_sdk_version(PPUContext& c, GuestMemory& m) {
+    m.write<uint32_t>(uint32_t(c.gpr[4]), kernel().image().param.sdk_version);
+    c.gpr[3] = CELL_OK;
+}
 
 // ---------------------------------------------------------------- PPU threads
 void sys_ppu_thread_yield(PPUContext& c, GuestMemory&) {
@@ -57,7 +64,7 @@ void sys_ppu_thread_get_stack_information(PPUContext& c, GuestMemory& m) {
 
 // ---------------------------------------------------------------- time
 void sys_timer_usleep(PPUContext& c, GuestMemory&) {
-    std::this_thread::sleep_for(std::chrono::microseconds(c.gpr[3]));
+    host_sleep_us(c.gpr[3]);
     c.gpr[3] = CELL_OK;
 }
 void sys_timer_sleep(PPUContext& c, GuestMemory&) {
@@ -206,6 +213,7 @@ struct Table {
         impl(1, "sys_process_getpid", sys_process_getpid);
         impl(14, "sys_process_is_spu_lock_line_reservation_address", sys_process_is_spu_lock_line_reservation_address);
         impl(22, "_sys_process_exit", sys_process_exit_);
+        impl(25, "sys_process_get_sdk_version", sys_process_get_sdk_version);
         impl(43, "sys_ppu_thread_yield", sys_ppu_thread_yield);
         impl(44, "sys_ppu_thread_join", sys_ppu_thread_join);
         impl(45, "sys_ppu_thread_detach", sys_ppu_thread_detach);

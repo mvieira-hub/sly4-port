@@ -251,6 +251,31 @@ TEST(vfs_paths_and_files) {
 
 // signal_all must wake every thread that was waiting, even if one of them wakes first
 // and waits again at once (it must not take the signal of the one that has not run yet).
+// Unlocking a mutex someone waits for gives it to that thread: the old owner cannot
+// take it back at once (the Bink sound thread starved the render thread that way).
+TEST(sync_mutex_hands_off_to_waiter) {
+    auto mx = std::make_shared<Mutex>();
+    CHECK_EQ(mx->lock(1, 0), CELL_OK);
+    std::atomic<bool> got{false};
+    std::thread other([&] {
+        CHECK_EQ(mx->lock(2, 0), CELL_OK);
+        got = true;
+        CHECK_EQ(mx->unlock(2), CELL_OK);
+    });
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> g(mx->m);
+            if (!mx->queue.empty()) break;
+        }
+        std::this_thread::yield();
+    }
+    CHECK_EQ(mx->unlock(1), CELL_OK);
+    CHECK_EQ(mx->trylock(1), CELL_EBUSY);  // already thread 2's, even before it runs
+    other.join();
+    CHECK(got.load());
+    CHECK_EQ(mx->trylock(1), CELL_OK);
+}
+
 TEST(sync_cond_signal_all_is_not_stolen) {
     auto mx = std::make_shared<Mutex>();
     Cond cv;

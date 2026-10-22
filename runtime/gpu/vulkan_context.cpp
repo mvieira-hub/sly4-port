@@ -10,6 +10,14 @@
 
 #include "core/log.h"
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
 using namespace sly4::vk;
 
 namespace sly4 {
@@ -83,14 +91,51 @@ bool VulkanContext::init(SDL_Window* window, const VulkanOptions& options) {
     return true;
 }
 
-bool VulkanContext::create_instance() {
-    Uint32 sdl_count = 0;
-    const char* const* sdl_exts = SDL_Vulkan_GetInstanceExtensions(&sdl_count);
-    if (!sdl_exts) {
-        SLY4_ERROR("SDL_Vulkan_GetInstanceExtensions: %s", SDL_GetError());
+bool VulkanContext::init_headless(const VulkanOptions& options) {
+    headless_ = true;
+    options_ = options;
+    const char* missing = nullptr;
+    HMODULE lib = LoadLibraryA("vulkan-1.dll");
+    auto gipa = lib ? reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+                          reinterpret_cast<void*>(GetProcAddress(lib, "vkGetInstanceProcAddr")))
+                    : nullptr;
+    if (!gipa) {
+        SLY4_ERROR("vulkan-1.dll não encontrado (driver da GPU sem Vulkan?)");
         return false;
     }
-    std::vector<const char*> extensions(sdl_exts, sdl_exts + sdl_count);
+    if (!load_global(gipa, &missing)) {
+        SLY4_ERROR("função global do Vulkan ausente: %s", missing);
+        return false;
+    }
+    if (!create_instance()) return false;
+    if (!load_instance(instance_, &missing)) {
+        SLY4_ERROR("função de instância do Vulkan ausente: %s", missing);
+        return false;
+    }
+    if (!pick_physical_device() || !create_device()) return false;
+    if (!load_device(device_, &missing)) {
+        SLY4_ERROR("função de dispositivo do Vulkan ausente: %s", missing);
+        return false;
+    }
+    vkGetDeviceQueue(device_, queue_family_, 0, &queue_);
+    SLY4_INFO("Vulkan sem janela em %s", device_name_.c_str());
+    return true;
+}
+
+bool VulkanContext::create_instance() {
+    std::vector<const char*> extensions;
+    if (!headless_) {
+        Uint32 sdl_count = 0;
+        const char* const* sdl_exts = SDL_Vulkan_GetInstanceExtensions(&sdl_count);
+        if (!sdl_exts) {
+            SLY4_ERROR("SDL_Vulkan_GetInstanceExtensions: %s", SDL_GetError());
+            return false;
+        }
+        extensions.assign(sdl_exts, sdl_exts + sdl_count);
+    } else {
+        // Not used without a window, but the surface entry points are loaded with the rest.
+        extensions = {"VK_KHR_surface", "VK_KHR_win32_surface"};
+    }
 
     std::vector<const char*> layers;
     if (options_.validation) {
@@ -147,8 +192,8 @@ bool VulkanContext::pick_physical_device() {
         vkGetPhysicalDeviceQueueFamilyProperties(dev, &qn, queues.data());
         int family = -1;
         for (uint32_t i = 0; i < qn; ++i) {
-            VkBool32 present = VK_FALSE;
-            vkGetPhysicalDeviceSurfaceSupportKHR(dev, i, surface_, &present);
+            VkBool32 present = headless_ ? VK_TRUE : VK_FALSE;
+            if (!headless_) vkGetPhysicalDeviceSurfaceSupportKHR(dev, i, surface_, &present);
             if ((queues[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && present) {
                 family = static_cast<int>(i);
                 break;
@@ -192,7 +237,7 @@ bool VulkanContext::create_device() {
     ci.pNext = &f13;
     ci.queueCreateInfoCount = 1;
     ci.pQueueCreateInfos = &qci;
-    ci.enabledExtensionCount = 1;
+    ci.enabledExtensionCount = 1;  // also headless: the swapchain entry points are loaded with the rest
     ci.ppEnabledExtensionNames = extensions;
     return check(vkCreateDevice(physical_, &ci, nullptr, &device_), "vkCreateDevice");
 }
@@ -220,7 +265,8 @@ bool VulkanContext::create_swapchain() {
     format_ = formats.empty() ? VkSurfaceFormatKHR{VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR}
                               : formats[0];
     for (const auto& f : formats) {
-        if (f.format == VK_FORMAT_B8G8R8A8_SRGB && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+        // UNORM: the PS3 already outputs gamma-encoded values.
+        if (f.format == VK_FORMAT_B8G8R8A8_UNORM && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
             format_ = f;
             break;
         }
@@ -323,7 +369,8 @@ bool VulkanContext::create_frames() {
     return true;
 }
 
-bool VulkanContext::draw_frame(const std::array<float, 4>& rgba) {
+bool VulkanContext::draw_frame(const std::array<float, 4>& rgba, const Source& source) {
+    if (headless_) return true;
     if (resize_pending_ || !swapchain_ || images_.empty()) {
         int w = 0, h = 0;
         SDL_GetWindowSizeInPixels(window_, &w, &h);
@@ -350,51 +397,63 @@ bool VulkanContext::draw_frame(const std::array<float, 4>& rgba) {
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(f.cmd, &bi);
 
-    VkImageMemoryBarrier2 to_color{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-    to_color.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    to_color.srcAccessMask = 0;
-    to_color.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    to_color.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    to_color.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    to_color.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    to_color.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_color.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_color.image = images_[image];
-    to_color.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    // The swapchain image: cleared, then the source (if any) scaled into it keeping its
+    // aspect ratio. Earlier writes to the source by the renderer were submitted to this
+    // same queue, so a barrier is enough to wait for them.
+    VkImageMemoryBarrier2 barriers[2]{};
+    barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    barriers[0].srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    barriers[0].dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+    barriers[0].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    barriers[0].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barriers[0].srcQueueFamilyIndex = barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[0].image = images_[image];
+    barriers[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    barriers[1] = barriers[0];
+    barriers[1].srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    barriers[1].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+    barriers[1].oldLayout = barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barriers[1].image = source.image;
     VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-    dep.imageMemoryBarrierCount = 1;
-    dep.pImageMemoryBarriers = &to_color;
+    dep.imageMemoryBarrierCount = source.image ? 2 : 1;
+    dep.pImageMemoryBarriers = barriers;
     vkCmdPipelineBarrier2(f.cmd, &dep);
 
-    VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    color.imageView = views_[image];
-    color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    std::memcpy(color.clearValue.color.float32, rgba.data(), sizeof(float) * 4);
-    VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
-    ri.renderArea = {{0, 0}, extent_};
-    ri.layerCount = 1;
-    ri.colorAttachmentCount = 1;
-    ri.pColorAttachments = &color;
-    vkCmdBeginRendering(f.cmd, &ri);
-    // Phase 5: the RSX FIFO translator records its draws here.
-    vkCmdEndRendering(f.cmd);
+    VkClearColorValue clear{};
+    std::memcpy(clear.float32, source.image ? std::array<float, 4>{0, 0, 0, 1}.data() : rgba.data(), sizeof(float) * 4);
+    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdClearColorImage(f.cmd, images_[image], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1, &range);
+    if (source.image && source.width && source.height) {
+        const double sx = double(extent_.width) / source.width, sy = double(extent_.height) / source.height;
+        const double s = std::min(sx, sy);
+        const int32_t w = int32_t(source.width * s), h = int32_t(source.height * s);
+        const int32_t x = (int32_t(extent_.width) - w) / 2, y = (int32_t(extent_.height) - h) / 2;
+        VkImageBlit blit{};
+        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        blit.srcOffsets[1] = {int32_t(source.width), int32_t(source.height), 1};
+        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        blit.dstOffsets[0] = {x, y, 0};
+        blit.dstOffsets[1] = {x + w, y + h, 1};
+        vkCmdBlitImage(f.cmd, source.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, images_[image],
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+    }
 
-    VkImageMemoryBarrier2 to_present = to_color;
-    to_present.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    to_present.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    VkImageMemoryBarrier2 to_present = barriers[0];
+    to_present.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+    to_present.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
     to_present.dstStageMask = VK_PIPELINE_STAGE_2_NONE;
     to_present.dstAccessMask = 0;
-    to_present.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    to_present.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     to_present.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    dep.imageMemoryBarrierCount = 1;
     dep.pImageMemoryBarriers = &to_present;
     vkCmdPipelineBarrier2(f.cmd, &dep);
     vkEndCommandBuffer(f.cmd);
 
     VkSemaphoreSubmitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
     wait.semaphore = f.image_available;
-    wait.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    wait.stageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
     VkSemaphoreSubmitInfo signal{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
     signal.semaphore = render_finished_[image];
     signal.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
@@ -407,15 +466,17 @@ bool VulkanContext::draw_frame(const std::array<float, 4>& rgba) {
     si.pCommandBufferInfos = &cbi;
     si.signalSemaphoreInfoCount = 1;
     si.pSignalSemaphoreInfos = &signal;
-    if (!check(vkQueueSubmit2(queue_, 1, &si, f.in_flight), "vkQueueSubmit2")) return false;
-
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.waitSemaphoreCount = 1;
     pi.pWaitSemaphores = &render_finished_[image];
     pi.swapchainCount = 1;
     pi.pSwapchains = &swapchain_;
     pi.pImageIndices = &image;
-    r = vkQueuePresentKHR(queue_, &pi);
+    {
+        std::lock_guard<std::mutex> lk(queue_lock_);
+        if (!check(vkQueueSubmit2(queue_, 1, &si, f.in_flight), "vkQueueSubmit2")) return false;
+        r = vkQueuePresentKHR(queue_, &pi);
+    }
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) {
         resize_pending_ = true;
     } else if (!check(r, "vkQueuePresentKHR")) {

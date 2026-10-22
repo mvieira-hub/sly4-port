@@ -64,7 +64,19 @@ struct ElfSection {
     bool executable() const { return (flags & 4) && type == 1 && size; }
 };
 
+// A library a PRX module exports: NID -> address of the function's descriptor.
+struct ExportedLibrary {
+    std::string name;
+    std::vector<std::pair<uint32_t, GuestAddr>> functions;
+};
+
 struct LoadedImage {
+    std::string module_name;          // PRX modules only ("cellSpurs_Library"...)
+    std::vector<ExportedLibrary> exports;
+    GuestAddr module_start = 0, module_stop = 0;  // PRX: descriptors of module_start/stop (0 if none)
+    // Function entries known without an .opd section (a PRX's descriptors).
+    std::vector<GuestAddr> function_entries;
+
     GuestAddr entry_descriptor = 0;  // e_entry points to an .opd descriptor {function, toc}
     GuestAddr entry_function = 0;
     GuestAddr toc = 0;               // r2 for the whole executable
@@ -86,5 +98,14 @@ struct LoadedImage {
 // Loads `path` into `mem` (which must be reserved). On failure returns false and
 // sets `error`; segments already committed are left in place.
 bool load_elf(const std::string& path, GuestMemory& mem, LoadedImage& out, std::string& error);
+
+// Reads 0x2C-byte import records (sys_stub) from [start, end) into `out`.
+bool read_import_table(const GuestMemory& mem, GuestAddr start, GuestAddr end, std::vector<ImportedModule>& out,
+                       std::string& error);
+
+// Loads a decrypted PRX module (ELF64, type 0xFFA4) with its segments at `base` +
+// their virtual address, applies its SCE relocations and reads its library info,
+// exports and imports. module_start is the descriptor of the special export 0xBC9A0086.
+bool load_prx(const std::string& path, GuestMemory& mem, GuestAddr base, LoadedImage& out, std::string& error);
 
 }  // namespace sly4

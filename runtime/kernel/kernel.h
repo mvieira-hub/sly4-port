@@ -27,13 +27,13 @@ constexpr uint32_t CELL_EAGAIN = 0x80010001, CELL_EINVAL = 0x80010002, CELL_ENOS
                    CELL_ENOMEM = 0x80010004, CELL_ESRCH = 0x80010005, CELL_ENOENT = 0x80010006,
                    CELL_EDEADLK = 0x80010008, CELL_EPERM = 0x80010009, CELL_EBUSY = 0x8001000A,
                    CELL_ETIMEDOUT = 0x8001000B, CELL_EFAULT = 0x8001000D, CELL_ESTAT = 0x8001000F,
-                   CELL_EALIGN = 0x80010010,
+                   CELL_EALIGN = 0x80010010, CELL_ENOEXEC = 0x80010007, CELL_EIO_ = 0x8001002B,
                    CELL_ECANCELED = 0x80010013, CELL_EEXIST = 0x80010014, CELL_EISCONN = 0x80010015,
                    CELL_ENOTCONN = 0x80010016;
 
 // Guest address map (the same areas RPCS3 uses).
 namespace layout {
-constexpr GuestAddr kMainEnd = 0x10000000;  // main memory: from the end of the image
+constexpr GuestAddr kMainEnd = 0x0F000000;  // main memory: from the end of the image (firmware modules above)
 // sys_memory_allocate: 64 KiB pages at 0x10000000, 1 MiB pages at 0x30000000.
 constexpr GuestAddr kUser64kBase = 0x10000000, kUser64kSize = 0x10000000;
 constexpr GuestAddr kUserBase = 0x30000000, kUserSize = 0x10000000;
@@ -69,6 +69,8 @@ struct PpuThread {
     std::condition_variable cv;
     bool joinable = false, done = false, joined = false;
     uint64_t exit_value = 0;
+
+    std::atomic<uint32_t> host_tid{0};  // Windows thread id running it (--ppu-profile)
 };
 
 // The guest thread running on this host thread (nullptr on host-only threads).
@@ -79,6 +81,11 @@ struct KernelOptions {
     std::string game_dir;  // the dump's PS3_GAME folder (/dev_bdvd/PS3_GAME)
     std::string data_dir;  // where /dev_hdd0 and /dev_hdd1 live
     size_t ring = 0;       // calls printed from the in-memory ring with the summary
+    std::string firmware_dir;  // decrypted firmware modules (libsre.prx...); empty = all HLE
+    bool spu_profile = false;  // samples SPU PCs for the summary
+    std::string ppu_profile;   // name of a PPU thread whose host code is sampled for the summary
+    bool verify_zlib = false;  // checks the SPU's EDGE zlib output against the native inflate
+    std::string spu_cache;     // records the SPU blocks run in the interpreter (docs/SPU.md, 4e)
 };
 
 class Kernel {
@@ -114,6 +121,8 @@ public:
 
     // Called at exit or on timeout: call counts and the boot sequence.
     void print_summary() const;
+    void ppu_profile_start(const std::string& name);
+    void ppu_profile_print() const;
 
     GuestMemory& mem() { return mem_; }
     const LoadedImage& image() const { return img_; }
@@ -137,6 +146,10 @@ private:
     GuestMemory& mem_;
     const LoadedImage& img_;
     std::unique_ptr<GuestAllocator> main_, user_, user64k_, stacks_, mmapper_;
+    std::vector<LoadedImage> modules_;  // firmware modules run as they are (LLE)
+
+    // Calls module_start of every firmware module on the main thread, before the game.
+    void start_modules(PpuThread& t);
     std::atomic<uint64_t> next_thread_id_{0x01000000};
 
     std::mutex tls_lock_;
@@ -146,6 +159,7 @@ private:
     std::atomic<bool> exited_{false};
     std::atomic<int> exit_status_{0};
     size_t ring_lines_ = 0;  // KernelOptions::ring
+    std::string spu_cache_;  // KernelOptions::spu_cache
     std::mutex threads_lock_;
     std::map<uint64_t, std::shared_ptr<PpuThread>> threads_;
 
@@ -174,6 +188,7 @@ void register_syscall(uint32_t n, const char* name, SyscallFn fn);
 void register_sync_syscalls();    // kernel/syscalls_sync.cpp
 void register_memory_syscalls();  // kernel/memory.cpp
 void register_fs_syscalls();      // kernel/hle_cell_fs.cpp
+void register_spu_syscalls();     // kernel/syscalls_spu.cpp
 
 // sys_mmapper memory blocks, also used by the sysPrxForUser wrappers (kernel/memory.cpp).
 uint32_t mmapper_allocate_memory(uint64_t size, uint64_t flags, uint32_t& mem_id);

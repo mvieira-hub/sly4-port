@@ -14,6 +14,7 @@
 #include <deque>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -79,6 +80,10 @@ public:
     // Writes descriptors for every import of `img` into a block taken from `alloc` and
     // points the import slots at them. Logs how many imports have an implementation.
     bool bind(GuestMemory& mem, GuestAllocator& alloc, const LoadedImage& img, const NidNames& names);
+    // Several images (the game and the firmware modules it runs): an import that one of
+    // them exports is linked to that export directly; the rest get HLE thunks.
+    bool bind(GuestMemory& mem, GuestAllocator& alloc, const std::vector<const LoadedImage*>& images,
+              const NidNames& names);
 
     uint32_t thunk_base() const { return thunk_base_; }
     uint32_t thunk_bytes() const { return thunk_count_ * 4; }
@@ -86,6 +91,17 @@ public:
 
     // LR of a thread's entry function: returning there ends the thread.
     uint32_t thread_return() const { return thunk_base_ + 4 * uint32_t(imports_.size()); }
+
+    // Descriptor of a native function the guest can call through a pointer (callbacks
+    // the firmware hands to the game, such as the cellGcm context callback). Valid after
+    // bind(); the same function gets the same descriptor.
+    GuestAddr callback(GuestMemory& mem, const char* name, HleFn fn);
+    // Logs a call to a firmware export that runs as it is (first call, ring, trace).
+    void trace_lle(PPUContext& c, uint32_t target);
+    // Development aid: called with the name of every library call (HLE: "name", LLE:
+    // "module.name") before it runs.
+    using CallHook = void (*)(PPUContext& c, GuestMemory& m, const char* name);
+    void set_call_hook(CallHook h) { call_hook_ = h; }
 
     struct Stat {
         std::string module, name;
@@ -107,7 +123,19 @@ private:
     };
     std::vector<Known> known_;
     std::deque<Import> imports_;
+    struct LleExport {
+        std::string name;  // "module.name"
+        std::atomic<uint64_t> calls{0};
+    };
+    std::unordered_map<uint32_t, LleExport> lle_names_;  // by export entry
+    CallHook call_hook_ = nullptr;
+    GuestMemory* mem_ = nullptr;
     uint32_t thunk_base_ = 0, thunk_count_ = 0;
+    static constexpr uint32_t kCallbacks = 32;
+    std::mutex callbacks_lock_;
+    std::vector<HleFunction> callbacks_;
+    uint32_t callback_first_ = 0;  // thunk index of the first callback
+    GuestAddr callback_desc_ = 0;
 };
 
 // The table used by the running process (set by the kernel).
@@ -124,6 +152,22 @@ HleModule hle_cell_rtc();
 HleModule hle_cell_net_ctl();
 HleModule hle_sys_net();
 HleModule hle_cell_spurs();
+HleModule hle_sys_prx_for_user_spu();   // kernel/syscalls_spu.cpp
+HleModule hle_sys_prx_for_user_libc();  // kernel/hle_libc.cpp
+HleModule hle_cell_gcm_sys();           // kernel/hle_cell_gcm.cpp
+HleModule hle_cell_audio();             // kernel/hle_cell_audio.cpp
+HleModule hle_sys_io();                 // kernel/hle_cell_pad.cpp
+
+// Controller on port 0 as cellPadGetData reports it: digital buttons (CELL_PAD_CTRL_*
+// bits of words 2 and 3), sticks (0x00-0xFF, 0x80 centred) and button pressures.
+struct PadState {
+    uint16_t digital1 = 0, digital2 = 0;
+    uint16_t right_x = 0x80, right_y = 0x80, left_x = 0x80, left_y = 0x80;
+    uint16_t pressure[12] = {};
+};
+void set_pad_state(const PadState& s);
+void audio_summary();                   // audio counters for the end-of-run summary
+void gcm_summary();                     // RSX counters for the end-of-run summary
 
 // A string from the game's PARAM.SFO ("" if missing), e.g. "TITLE_ID".
 std::string param_sfo_string(const char* key);

@@ -29,6 +29,8 @@ const FnEntry* function_table(size_t& count);
 void call_indirect(PPUContext& c, GuestMemory& m, uint32_t target);
 // Interpreter fallback: runs from `entry` until a blr comes back to the current LR.
 void interpret_until_return(PPUContext& c, GuestMemory& m, uint32_t entry);
+// How often code outside the generated table ran in the interpreter (summary).
+void interpreter_stats(uint64_t& calls, uint64_t& steps);
 
 void syscall(PPUContext& c, GuestMemory& m);                               // c.cia: after the sc
 void trap(PPUContext& c, GuestMemory& m);                                  // c.cia: the trap

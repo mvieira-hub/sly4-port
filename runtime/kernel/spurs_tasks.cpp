@@ -1,8 +1,10 @@
 // Native replacements for SPU tasks of the game whose behaviour is known, identified by
 // a hash of their SPU ELF.
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <cstdio>
+#include <cstring>
 #include <thread>
 #include <vector>
 
@@ -87,7 +89,8 @@ void edge_zlib_worker(GuestMemory* mp, std::shared_ptr<SpursQueue> queue) {
         if (flag)
             if (auto f = spurs_event_flag(flag)) f->set(uint16_t(bits));
         if (++done == 1 || done % 1000 == 0)
-            SLY4_INFO("EDGE zlib: %" PRIu64 " blocos descomprimidos (último: %u -> %zu bytes)", done, src_size, out);
+            SLY4_INFO("EDGE zlib: %" PRIu64 " blocos descomprimidos (último: 0x%08X +%u -> 0x%08X +%u de %zu bytes)",
+                      done, src, src_size, dst, deliver, out);
     }
 }
 
@@ -104,6 +107,74 @@ const char* start_native_spurs_task(GuestMemory& m, const SpursTaskInfo& task) {
     }
     SLY4_INFO("SPURS: ELF SPU 0x%08X desconhecido (%u bytes, hash %016" PRIX64 ")", task.elf, size, hash);
     return nullptr;
+}
+
+}  // namespace sly4
+
+// ---------------------------------------------------------------- verification (--verify-zlib)
+// With the firmware's SPURS (LLE) the EDGE zlib task runs on an SPU. Each request the
+// game pushes to the task's LFQueue is inflated here as well; once the thread that
+// pushed it is back from its wait (its next library call after cellSpursEventFlagWait),
+// the bytes the SPU wrote must equal ours.
+namespace sly4 {
+
+namespace {
+
+struct PendingInflate {
+    GuestAddr dst;
+    std::vector<uint8_t> expected;
+};
+thread_local std::vector<PendingInflate> t_pending;
+thread_local bool t_waiting = false;
+std::atomic<uint64_t> g_verified{0}, g_mismatched{0}, g_bytes{0};
+
+void queue_request(GuestMemory& m, GuestAddr e) {
+    const uint32_t src = m.read<uint32_t>(e), dst = m.read<uint32_t>(e + 4), src_size = m.read<uint32_t>(e + 8);
+    const uint32_t deliver = m.read<uint32_t>(e + 12);
+    const uint32_t skip_begin = m.read<uint16_t>(e + 26), skip_end = m.read<uint16_t>(e + 28);
+    const size_t expected = size_t(skip_begin) + deliver + skip_end;
+    if (!src || !dst || !src_size || src_size > 0x100000 || expected > 0x100000) return;
+    std::vector<uint8_t> out(expected);
+    size_t n = 0, used = 0;
+    if (inflate_raw(m.host(src), src_size, out.data(), expected, n, used) != InflateResult::Ok || n != expected) return;
+    t_pending.push_back({dst, std::vector<uint8_t>(out.begin() + skip_begin, out.begin() + skip_begin + deliver)});
+}
+
+void compare_pending(GuestMemory& m) {
+    for (const PendingInflate& p : t_pending) {
+        if (std::memcmp(m.host(p.dst), p.expected.data(), p.expected.size()) == 0) {
+            const uint64_t n = g_verified.fetch_add(1) + 1;
+            g_bytes += p.expected.size();
+            if (n == 1 || n % 1000 == 0)
+                SLY4_INFO("EDGE zlib (SPU): %" PRIu64 " blocos conferidos com o inflate nativo", n);
+        } else {
+            size_t at = 0;
+            while (at < p.expected.size() && m.read<uint8_t>(p.dst + uint32_t(at)) == p.expected[at]) ++at;
+            if (g_mismatched.fetch_add(1) < 10)
+                SLY4_ERROR("EDGE zlib (SPU): bloco em 0x%08X difere do inflate nativo a partir do byte %zu de %zu", p.dst,
+                           at, p.expected.size());
+        }
+    }
+    t_pending.clear();
+}
+
+}  // namespace
+
+void zlib_verify_call(PPUContext& c, GuestMemory& m, const char* name) {
+    if (std::strcmp(name, "cellSpurs._cellSpursLFQueuePushBody") == 0) {
+        queue_request(m, uint32_t(c.gpr[4]));
+    } else if (std::strcmp(name, "cellSpurs.cellSpursEventFlagWait") == 0) {
+        t_waiting = !t_pending.empty();
+    } else if (t_waiting) {
+        t_waiting = false;
+        compare_pending(m);
+    }
+}
+
+void zlib_verify_summary() {
+    if (!g_verified && !g_mismatched) return;
+    SLY4_INFO("EDGE zlib (SPU): %" PRIu64 " blocos iguais ao inflate nativo (%.1f MiB), %" PRIu64 " diferentes",
+              g_verified.load(), double(g_bytes.load()) / 1048576.0, g_mismatched.load());
 }
 
 }  // namespace sly4

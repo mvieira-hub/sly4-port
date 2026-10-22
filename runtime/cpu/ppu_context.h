@@ -36,11 +36,14 @@ struct PPUContext {
     uint32_t vrsave = 0;
     uint32_t cia = 0;  // address of the instruction being executed
 
-    // lwarx/ldarx reservation (emulated with compare-and-swap on the reserved value).
+    // lwarx/ldarx reservation. As on the Cell it covers the whole 128-byte line: the
+    // store-conditional succeeds only if the line still holds what the load saw
+    // (cpu/guest_atomic.h), whoever wrote to it in between.
     bool reserved = false;
     uint32_t reserve_addr = 0;
     uint64_t reserve_value = 0;
     uint8_t reserve_size = 0;
+    alignas(16) uint8_t reserve_line[128] = {};
 
     // Instruction / block budget, decremented only by test builds of the generated code
     // and by the fallback interpreter (rt::interpret_until_return).
