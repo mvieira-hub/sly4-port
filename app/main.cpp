@@ -9,6 +9,7 @@
 //   sly4.exe ... --no-run            loads only, does not start the game
 //   sly4.exe ... --seconds N         stops the game after N seconds and prints the summary
 //   sly4.exe ... --trace             logs every library call and syscall, not just the first
+//   sly4.exe ... --ring N            prints the last N calls (kept in memory) with the summary
 //   sly4.exe ... --data <dir>        where /dev_hdd0 and /dev_hdd1 live (default %LOCALAPPDATA%\sly4-port)
 //   sly4.exe ... --dump-imports f.csv  writes module,nid,name,slot of every import
 //   sly4.exe --nid-names <file>      NID name candidates (default tools\data\ps3_nid_candidates.txt)
@@ -59,6 +60,7 @@ constexpr const char* kDefaultNidNames = "tools/data/ps3_nid_candidates.txt";
 struct Args {
     long frames = 0;  // 0 = until the window is closed
     long seconds = 0;  // 0 = no limit for the game
+    long ring = 0;     // last calls printed with the summary
     std::string game_dir, eboot, nid_names, dump_imports, data_dir;
     bool window = true, run = true, trace = false;
     sly4::VulkanOptions vulkan;
@@ -90,6 +92,8 @@ bool parse_args(int argc, char** argv, Args& out) {
             ok = value(out.data_dir);
         } else if (std::strcmp(argv[i], "--trace") == 0) {
             out.trace = true;
+        } else if (std::strcmp(argv[i], "--ring") == 0 && i + 1 < argc) {
+            out.ring = std::strtol(argv[++i], nullptr, 10);
         } else if (std::strcmp(argv[i], "--seconds") == 0 && i + 1 < argc) {
             out.seconds = std::strtol(argv[++i], nullptr, 10);
         } else if (std::strcmp(argv[i], "--validation") == 0) {
@@ -188,6 +192,7 @@ bool start_game(const Args& args, sly4::GuestMemory& mem, const sly4::LoadedImag
     g_kernel = &kernel;
     sly4::KernelOptions opt;
     opt.trace = args.trace;
+    opt.ring = size_t(args.ring);
     // PS3_GAME is the folder above USRDIR\EBOOT.elf; saves and caches go to %LOCALAPPDATA%.
     const std::filesystem::path eboot = std::filesystem::absolute(args.eboot);
     opt.game_dir = args.game_dir.empty() ? eboot.parent_path().parent_path().string()

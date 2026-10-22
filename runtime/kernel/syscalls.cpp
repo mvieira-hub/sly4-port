@@ -242,6 +242,9 @@ void syscall_dispatch(PPUContext& c, GuestMemory& m) {
     if (PpuThread* th = current_thread()) {
         th->last_call = e && e->name ? e->name : "syscall ?";
         th->last_lr = c.cia - 4;
+        th->last_r3 = c.gpr[3];
+        th->last_r4 = c.gpr[4];
+        call_log().ring(th->name.c_str(), th->last_call.load(), c.gpr[3], c.gpr[4], c.cia - 4);
     }
     CallLog& log = call_log();
     if (log.first_call(0x10000 + uint32_t(std::min<uint64_t>(n, kCount))) || log.trace) {

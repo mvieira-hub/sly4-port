@@ -23,12 +23,23 @@ struct MemoryBlock : KernelObject {
     GuestAddr mapped_at = 0;
 };
 
+// User memory the firmware libraries already hold when the game starts (liblv2 and the
+// loaded PRX modules): the game sees 194 MiB free of 213, as in RPCS3. Their 64 KiB pages
+// sit at the start of the 64 KiB area, so the game's own allocations land where they do
+// there.
+constexpr uint32_t kFirmwareUserMemory = 0x12A0000, kFirmware64kPages = 0xA0000;
+
 std::mutex g_lock;
 uint64_t g_mapped = 0;  // bytes of mmapper blocks, counted against user memory
 
 uint32_t user_memory_used() {
     std::lock_guard<std::mutex> g(g_lock);
-    return kernel().user_memory().used() + uint32_t(g_mapped);
+    return kFirmwareUserMemory + kernel().user_memory().used() + kernel().user_memory_64k().used() - kFirmware64kPages +
+           uint32_t(g_mapped);
+}
+
+GuestAllocator& area_of(uint32_t page) {
+    return page == 0x10000 ? kernel().user_memory_64k() : kernel().user_memory();
 }
 
 // ---------------------------------------------------------------- sys_memory
@@ -43,7 +54,7 @@ void sys_memory_allocate(PPUContext& c, GuestMemory& m) {
         c.gpr[3] = CELL_ENOMEM;
         return;
     }
-    const GuestAddr a = kernel().user_memory().alloc(size, align);
+    const GuestAddr a = area_of(align).alloc(size, align);
     if (!a) {
         c.gpr[3] = CELL_ENOMEM;
         return;
@@ -52,7 +63,8 @@ void sys_memory_allocate(PPUContext& c, GuestMemory& m) {
     c.gpr[3] = CELL_OK;
 }
 void sys_memory_free(PPUContext& c, GuestMemory&) {
-    c.gpr[3] = kernel().user_memory().free(uint32_t(c.gpr[3])) ? CELL_OK : CELL_EINVAL;
+    const uint32_t a = uint32_t(c.gpr[3]);
+    c.gpr[3] = kernel().user_memory().free(a) || kernel().user_memory_64k().free(a) ? CELL_OK : CELL_EINVAL;
 }
 void sys_memory_get_page_attribute(PPUContext& c, GuestMemory& m) {
     const uint32_t addr = uint32_t(c.gpr[3]), out = uint32_t(c.gpr[4]);
@@ -62,7 +74,9 @@ void sys_memory_get_page_attribute(PPUContext& c, GuestMemory& m) {
     }
     m.write<uint64_t>(out, 0x40000);  // SYS_MEMORY_PROT_READ_WRITE
     m.write<uint64_t>(out + 8, 0xF);  // SYS_MEMORY_ACCESS_RIGHT_ANY
-    m.write<uint32_t>(out + 16, kernel().user_memory().contains(addr) ? 0x100000 : 0x1000);
+    m.write<uint32_t>(out + 16, kernel().user_memory().contains(addr)       ? 0x100000
+                                : kernel().user_memory_64k().contains(addr) ? 0x10000
+                                                                            : 0x1000);
     c.gpr[3] = CELL_OK;
 }
 void sys_memory_get_user_memory_size(PPUContext& c, GuestMemory& m) {
@@ -143,6 +157,7 @@ uint32_t mmapper_unmap_memory(GuestAddr addr, uint32_t& mem_id) {
 }
 
 void register_memory_syscalls() {
+    kernel().user_memory_64k().alloc(kFirmware64kPages, 0x10000);  // the firmware's 64 KiB pages
     register_syscall(330, "sys_mmapper_allocate_address", sys_mmapper_allocate_address);
     register_syscall(331, "sys_mmapper_free_address", sys_mmapper_free_address);
     register_syscall(348, "sys_memory_allocate", sys_memory_allocate);

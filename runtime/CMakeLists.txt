@@ -2,6 +2,7 @@
 add_library(sly4_runtime STATIC
     gpu/vk_functions.cpp
     gpu/vulkan_context.cpp
+    core/inflate.cpp
     loader/elf_loader.cpp
     loader/image_report.cpp
     loader/nid.cpp
@@ -29,9 +30,11 @@ add_library(sly4_kernel STATIC
     kernel/hle.cpp
     kernel/hle_cell_fs.cpp
     kernel/hle_cell_game.cpp
+    kernel/hle_cell_spurs.cpp
     kernel/hle_sys_prx_for_user.cpp
     kernel/hle_system.cpp
     kernel/kernel.cpp
+    kernel/spurs_tasks.cpp
     kernel/memory.cpp
     kernel/sync.cpp
     kernel/syscalls.cpp

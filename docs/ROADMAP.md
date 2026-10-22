@@ -388,12 +388,13 @@ Plano original da fase, para referência:
 - **Teste diferencial:** um interpretador PPC mínimo, escrito junto, executa cada instrução com entradas aleatórias, e o resultado é comparado com o código emitido.
 - **Saída:** os 2,8 milhões de instruções geram C++ que compila sem erro, e o diferencial passa para todas as operações usadas.
 
-### Fase 3: kernel e HLE básico, "o jogo boota" (4–6 semanas) — **em andamento**
+### Fase 3: kernel e HLE básico, "o jogo boota" (4–6 semanas) — **concluída** (2026-10-21)
 
 Andamento em [KERNEL.md](KERNEL.md):
 - **3a, partida do processo (concluída):** o EBOOT recompilado roda a partir do ponto de entrada real. As 251 importações estão ligadas a funções nativas, as 71 syscalls têm nome e cada chamada nova é registrada. O jogo inicializa memória, SPURS e `cellGame`, escreve no TTY e para esperando a primeira thread que ainda não existe.
 - **3b, threads, sincronização e memória (concluída):** threads PPU em threads do Windows, os objetos de sincronização do LV2 (lwmutex, mutex, cond, rwlock, semáforo, event flag, filas e portas de evento, timers) e o `sys_mmapper`. O jogo cria 5 threads, sobe o FIOS (o sistema de arquivos da Sony) e faz as primeiras chamadas de arquivo.
 - **3c, arquivos e módulos de sistema (concluída):** VFS, `cellFs` e `sc` 801–818, `cellGame` lendo o `PARAM.SFO`, `cellSysutil`, `cellSysmodule`, `cellRtc` e rede desconectada. O jogo abre o `Sly4.psarc`, lê o índice e monta o cache em `/dev_hdd1`. Depois para esperando a primeira descompressão, que o FIOS entrega a uma tarefa SPU do SPURS.
+- **3d, até o `cellGcmInit` (concluída):** um SPURS mínimo (event flags e LFQueue) e a tarefa SPU de descompressão (EDGE zlib) trocada por código nativo, com um decodificador DEFLATE próprio. O jogo descomprime o psarc, termina o FIOS e chega ao `cellGcmInit`. No caminho apareceu e foi corrigido um sinal "roubado" no `signal_all` das condições. Comparado ao RPCS3 (com o firmware do disco), o TTY sai idêntico linha a linha até o `cellGcmInit`, assim como a sequência de arquivos e os endereços de memória.
 
 Plano da fase:
 - Syscalls: threads, sincronização, timers, memória, TTY e arquivos.

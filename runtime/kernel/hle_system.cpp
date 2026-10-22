@@ -97,9 +97,18 @@ bool resolution_size(uint32_t id, uint16_t& w, uint16_t& h) {
         default: return false;
     }
 }
+// Stereoscopic 3D modes (frame packing: two 720-line frames and a 30-line gap). They are
+// never reported available, but games still ask their size.
+bool resolution_size_3d(uint32_t id, uint16_t& w, uint16_t& h) {
+    static const uint16_t widths[] = {1280, 1024, 960, 800, 640};  // 0x81..0x85
+    if (id < 0x81 || id > 0x85) return false;
+    w = widths[id - 0x81];
+    h = 1470;
+    return true;
+}
 void cellVideoOutGetResolution(PPUContext& c, GuestMemory& m) {
     uint16_t w, h;
-    if (!resolution_size(a32(c, 3), w, h)) {
+    if (!resolution_size(a32(c, 3), w, h) && !resolution_size_3d(a32(c, 3), w, h)) {
         c.gpr[3] = 0x8002B222;  // CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER
         return;
     }

@@ -69,8 +69,12 @@ uint32_t Cond::wait(uint64_t tid, uint64_t timeout_us) {
     mx.count = 0;
     mx.cv.notify_one();
     ++waiters;
-    const bool signalled = wait_for(cv, lk, timeout_us, [&] { return signals > 0; });
-    if (signalled) --signals;
+    const uint64_t ticket = ++issued;
+    bool signalled = wait_for(cv, lk, timeout_us, [&] { return released >= ticket; });
+    if (!signalled) {
+        signalled = released >= ticket;  // released just as the wait timed out
+        if (!signalled) abandoned.insert(ticket);
+    }
     --waiters;
     mx.cv.wait(lk, [&] { return mx.owner == 0; });
     mx.owner = tid;
@@ -80,15 +84,15 @@ uint32_t Cond::wait(uint64_t tid, uint64_t timeout_us) {
 
 uint32_t Cond::signal(bool all) {
     std::lock_guard<std::mutex> lk(mutex->m);
-    if (waiters > signals) {
-        if (all) {
-            signals = waiters;
-            cv.notify_all();
-        } else {
-            ++signals;
-            cv.notify_one();
+    if (all) {
+        released = issued;
+        abandoned.clear();
+    } else {
+        // The oldest ticket still waiting; tickets of timed-out waits are skipped.
+        while (released < issued && abandoned.erase(++released)) {
         }
     }
+    cv.notify_all();  // each waiter checks its own ticket
     return CELL_OK;
 }
 

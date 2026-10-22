@@ -1,6 +1,9 @@
 #include "check.h"
 
+#include "core/inflate.h"
+
 #include <atomic>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <thread>
@@ -244,4 +247,57 @@ TEST(vfs_paths_and_files) {
     CHECK_EQ(fs_unlink("/dev_hdd0/game/TEST/save.dat"), CELL_OK);
     CHECK_EQ(fs_rmdir("/dev_hdd0/game/TEST"), CELL_OK);
     fsys::remove_all(root, ec);
+}
+
+// signal_all must wake every thread that was waiting, even if one of them wakes first
+// and waits again at once (it must not take the signal of the one that has not run yet).
+TEST(sync_cond_signal_all_is_not_stolen) {
+    auto mx = std::make_shared<Mutex>();
+    Cond cv;
+    cv.mutex = mx;
+    std::atomic<uint32_t> b_result{0xFFFFFFFF}, a_second{0xFFFFFFFF};
+    std::thread b([&] {
+        mx->lock(2, 0);
+        b_result = cv.wait(2, 2'000'000);
+        mx->unlock(2);
+    });
+    std::thread a([&] {
+        mx->lock(1, 0);
+        cv.wait(1, 2'000'000);
+        a_second = cv.wait(1, 200'000);  // nobody signals again: must time out
+        mx->unlock(1);
+    });
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> lk(mx->m);
+            if (cv.waiters == 2) break;
+        }
+        std::this_thread::yield();
+    }
+    cv.signal(true);
+    a.join();
+    b.join();
+    CHECK_EQ(b_result.load(), CELL_OK);
+    CHECK_EQ(a_second.load(), CELL_ETIMEDOUT);
+}
+
+// Raw DEFLATE: a stored block, and a fixed-Huffman block with a back reference
+// ("abc" then length 9 at distance 3), encoded by hand from RFC 1951.
+TEST(inflate_raw_blocks) {
+    uint8_t out[32];
+    size_t n = 0, used = 0;
+    const uint8_t stored[] = {0x01, 0x05, 0x00, 0xFA, 0xFF, 'h', 'e', 'l', 'l', 'o'};
+    CHECK(inflate_raw(stored, sizeof(stored), out, sizeof(out), n, used) == InflateResult::Ok);
+    CHECK(n == 5 && std::memcmp(out, "hello", 5) == 0);
+    CHECK_EQ(used, sizeof(stored));
+
+    const uint8_t fixed[] = {0x4B, 0x4C, 0x4A, 0x86, 0x23, 0x00};
+    CHECK(inflate_raw(fixed, sizeof(fixed), out, sizeof(out), n, used) == InflateResult::Ok);
+    CHECK(n == 12 && std::memcmp(out, "abcabcabcabc", 12) == 0);
+    CHECK_EQ(used, sizeof(fixed));
+
+    CHECK(inflate_raw(fixed, sizeof(fixed), out, 11, n, used) == InflateResult::OutputTooSmall);
+    CHECK(inflate_raw(fixed, 4, out, sizeof(out), n, used) == InflateResult::InputTruncated);
+    const uint8_t reserved[] = {0x07};  // BTYPE 3 does not exist
+    CHECK(inflate_raw(reserved, 1, out, sizeof(out), n, used) == InflateResult::BadData);
 }

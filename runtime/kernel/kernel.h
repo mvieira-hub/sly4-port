@@ -33,9 +33,11 @@ constexpr uint32_t CELL_EAGAIN = 0x80010001, CELL_EINVAL = 0x80010002, CELL_ENOS
 
 // Guest address map (the same areas RPCS3 uses).
 namespace layout {
-constexpr GuestAddr kMainEnd = 0x20000000;  // main memory: from the end of the image
-constexpr GuestAddr kUserBase = 0x20000000, kUserSize = 0x10000000;  // sys_memory_allocate
-constexpr GuestAddr kMmapperBase = 0x30000000, kMmapperSize = 0x90000000;  // sys_mmapper ranges
+constexpr GuestAddr kMainEnd = 0x10000000;  // main memory: from the end of the image
+// sys_memory_allocate: 64 KiB pages at 0x10000000, 1 MiB pages at 0x30000000.
+constexpr GuestAddr kUser64kBase = 0x10000000, kUser64kSize = 0x10000000;
+constexpr GuestAddr kUserBase = 0x30000000, kUserSize = 0x10000000;
+constexpr GuestAddr kMmapperBase = 0x40000000, kMmapperSize = 0x80000000;  // sys_mmapper ranges
 constexpr GuestAddr kStackBase = 0xD0000000, kStackSize = 0x10000000;
 }  // namespace layout
 
@@ -60,6 +62,7 @@ struct PpuThread {
     // Last library call or syscall and its caller, for the summary (where a thread waits).
     std::atomic<const char*> last_call{nullptr};
     std::atomic<uint32_t> last_lr{0};
+    std::atomic<uint64_t> last_r3{0}, last_r4{0};
 
     // Exit status for sys_ppu_thread_join.
     std::mutex m;
@@ -75,6 +78,7 @@ struct KernelOptions {
     bool trace = false;  // log every HLE call and syscall, not only the first of each
     std::string game_dir;  // the dump's PS3_GAME folder (/dev_bdvd/PS3_GAME)
     std::string data_dir;  // where /dev_hdd0 and /dev_hdd1 live
+    size_t ring = 0;       // calls printed from the in-memory ring with the summary
 };
 
 class Kernel {
@@ -114,7 +118,8 @@ public:
     GuestMemory& mem() { return mem_; }
     const LoadedImage& image() const { return img_; }
     GuestAllocator& main_memory() { return *main_; }
-    GuestAllocator& user_memory() { return *user_; }
+    GuestAllocator& user_memory() { return *user_; }      // 1 MiB pages
+    GuestAllocator& user_memory_64k() { return *user64k_; }
     GuestAllocator& stacks() { return *stacks_; }
     GuestAllocator& mmapper_area() { return *mmapper_; }
 
@@ -131,7 +136,7 @@ public:
 private:
     GuestMemory& mem_;
     const LoadedImage& img_;
-    std::unique_ptr<GuestAllocator> main_, user_, stacks_, mmapper_;
+    std::unique_ptr<GuestAllocator> main_, user_, user64k_, stacks_, mmapper_;
     std::atomic<uint64_t> next_thread_id_{0x01000000};
 
     std::mutex tls_lock_;
@@ -140,6 +145,7 @@ private:
 
     std::atomic<bool> exited_{false};
     std::atomic<int> exit_status_{0};
+    size_t ring_lines_ = 0;  // KernelOptions::ring
     std::mutex threads_lock_;
     std::map<uint64_t, std::shared_ptr<PpuThread>> threads_;
 

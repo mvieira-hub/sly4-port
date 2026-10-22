@@ -49,10 +49,26 @@ public:
     void record(const std::string& line);
     std::vector<std::string> sequence() const;
 
+    // In-memory ring of the latest calls (thread, name, r3, r4, caller), printed with the
+    // summary: shows the last steps before a hang without slowing the threads down.
+    void ring(const char* thread, const char* name, uint64_t r3, uint64_t r4, uint32_t lr);
+    void print_ring(size_t last) const;
+
 private:
     mutable std::mutex lock_;
     std::unordered_set<uint32_t> seen_;
     std::vector<std::string> sequence_;
+
+    struct RingEntry {
+        const char* thread;
+        const char* name;
+        uint64_t r3, r4;
+        uint32_t lr;
+    };
+    static constexpr size_t kRing = 4096;
+    mutable std::mutex ring_lock_;
+    RingEntry ring_[kRing] = {};
+    size_t ring_next_ = 0;
 };
 CallLog& call_log();
 
@@ -107,6 +123,7 @@ HleModule hle_cell_sysmodule();
 HleModule hle_cell_rtc();
 HleModule hle_cell_net_ctl();
 HleModule hle_sys_net();
+HleModule hle_cell_spurs();
 
 // A string from the game's PARAM.SFO ("" if missing), e.g. "TITLE_ID".
 std::string param_sfo_string(const char* key);

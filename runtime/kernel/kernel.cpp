@@ -52,16 +52,18 @@ Kernel::~Kernel() {
 bool Kernel::init(const NidNames& names, const KernelOptions& opt) {
     const GuestAddr main_base = align_up(img_.image_end, 0x10000);
     main_ = std::make_unique<GuestAllocator>(mem_, main_base, layout::kMainEnd - main_base, "principal");
-    user_ = std::make_unique<GuestAllocator>(mem_, layout::kUserBase, layout::kUserSize, "usuário");
+    user_ = std::make_unique<GuestAllocator>(mem_, layout::kUserBase, layout::kUserSize, "usuário 1 MiB");
+    user64k_ = std::make_unique<GuestAllocator>(mem_, layout::kUser64kBase, layout::kUser64kSize, "usuário 64 KiB");
     stacks_ = std::make_unique<GuestAllocator>(mem_, layout::kStackBase, layout::kStackSize, "pilhas");
     mmapper_ = std::make_unique<GuestAllocator>(mem_, layout::kMmapperBase, layout::kMmapperSize, "mmapper");
 
     call_log().trace = opt.trace;
+    ring_lines_ = opt.ring;
     HleTable& table = hle();
     vfs().setup(path_from_utf8(opt.game_dir), path_from_utf8(opt.data_dir));
     for (const HleModule& mod : {hle_sys_prx_for_user(), hle_sys_fs(), hle_cell_game(), hle_cell_sysutil(),
                                  hle_cell_sysutil_avconf_ext(), hle_cell_sysmodule(), hle_cell_rtc(), hle_cell_net_ctl(),
-                                 hle_sys_net()})
+                                 hle_sys_net(), hle_cell_spurs()})
         table.add(mod);
     if (!table.bind(mem_, *main_, img_, names)) return false;
     register_sync_syscalls();
@@ -352,10 +354,12 @@ void Kernel::print_summary() const {
         SLY4_INFO("threads: %zu", threads_.size());
         for (const auto& [id, t] : threads_) {
             const char* call = t->last_call.load();
-            std::fprintf(stderr, "  0x%08" PRIX64 " %-26s %s última chamada: %s (de 0x%08X)\n", id, t->name.c_str(),
-                         t->done ? "terminada" : "ativa    ", call ? call : "-", t->last_lr.load());
+            std::fprintf(stderr, "  0x%08" PRIX64 " %-26s %s última chamada: %s(0x%" PRIX64 ", 0x%" PRIX64 ") de 0x%08X\n",
+                         id, t->name.c_str(), t->done ? "terminada" : "ativa    ", call ? call : "-", t->last_r3.load(),
+                         t->last_r4.load(), t->last_lr.load());
         }
     }
+    call_log().print_ring(ring_lines_);
     auto hs = hle().stats();
     std::stable_sort(hs.begin(), hs.end(), [](const auto& a, const auto& b) { return a.calls > b.calls; });
     size_t called = 0, missing = 0;

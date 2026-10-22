@@ -70,11 +70,16 @@ Com o código gerado no build, o `sly4.exe` roda o jogo (Fase 3; ver [docs/KERNE
 .\build\mingw-release\sly4.exe --game PS3_GAME --no-window --seconds 20
 ```
 
-Estado atual: **Fases 0, 1 e 2 concluídas; Fase 3 em andamento.**
+Estado atual: **Fases 0 a 3 concluídas.**
 - O EBOOT inteiro vira C++: 24.164 funções que compilam sem avisos.
 - Comparado com o interpretador, o código gerado deu igual em todos os 98 mil casos.
 - O interpretador foi validado antes contra o QEMU: 195 mil casos, 0 divergências.
-- O jogo recompilado já roda do ponto de entrada: inicializa memória e `cellGame` (com o `PARAM.SFO` real), cria 10 threads, sobe o sistema de arquivos da Sony (FIOS), abre o `Sly4.psarc` e monta o cache. Para na primeira descompressão, que o jogo manda para uma tarefa SPU.
+- O jogo recompilado roda do ponto de entrada até o `cellGcmInit`. No caminho ele:
+  - inicializa memória e `cellGame`, com o `PARAM.SFO` real;
+  - cria 10 threads;
+  - sobe o sistema de arquivos da Sony (FIOS) e monta o cache;
+  - lê o `Sly4.psarc`, com a descompressão que no PS3 roda no SPU (EDGE zlib) feita em código nativo.
+- O próximo passo é o `cellGcm` (gráficos, Fase 5) e o SPU de verdade (Fase 4).
 - O programa abre a janela Vulkan 1.3 na GPU dedicada.
 - Reserva os 4 GiB do espaço de endereços do PS3 e carrega o `EBOOT.elf`: segmentos, TLS, parâmetros do processo e as 251 importações, idênticas às do `eboot_scan.py`.
 - A CI (`.github/workflows/build.yml`) compila o `.exe`, roda os testes num runner Windows e publica os binários como artefato.

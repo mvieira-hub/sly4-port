@@ -13,6 +13,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 
 namespace sly4 {
@@ -70,10 +71,15 @@ struct Mutex : KernelObject {
     uint32_t unlock(uint64_t tid);
 };
 
+// Waiters take tickets in arrival order; a signal releases the oldest ticket still
+// waiting and signal_all every ticket issued so far. A thread that wakes and waits again
+// gets a new ticket, so it cannot take a signal meant for a thread that has not run yet.
 struct Cond : KernelObject {
     std::shared_ptr<Mutex> mutex;
     std::condition_variable cv;
-    uint32_t waiters = 0, signals = 0;
+    uint32_t waiters = 0;
+    uint64_t issued = 0, released = 0;  // tickets
+    std::set<uint64_t> abandoned;        // tickets of waits that timed out
 
     // Releases the mutex entirely, waits for a signal, takes the mutex back.
     uint32_t wait(uint64_t tid, uint64_t timeout_us);

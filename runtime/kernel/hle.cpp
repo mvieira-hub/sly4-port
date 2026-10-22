@@ -1,5 +1,6 @@
 #include "kernel/hle.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cstdio>
 
@@ -28,6 +29,21 @@ void CallLog::record(const std::string& line) {
 std::vector<std::string> CallLog::sequence() const {
     std::lock_guard<std::mutex> g(lock_);
     return sequence_;
+}
+
+void CallLog::ring(const char* thread, const char* name, uint64_t r3, uint64_t r4, uint32_t lr) {
+    std::lock_guard<std::mutex> g(ring_lock_);
+    ring_[ring_next_++ % kRing] = {thread, name, r3, r4, lr};
+}
+
+void CallLog::print_ring(size_t last) const {
+    std::lock_guard<std::mutex> g(ring_lock_);
+    const size_t n = std::min({last, ring_next_, kRing});
+    std::fprintf(stderr, "[info] últimas %zu chamadas:\n", n);
+    for (size_t i = ring_next_ - n; i < ring_next_; ++i) {
+        const RingEntry& e = ring_[i % kRing];
+        std::fprintf(stderr, "  {%s} %s(0x%" PRIX64 ", 0x%" PRIX64 ") <- 0x%08X\n", e.thread, e.name, e.r3, e.r4, e.lr);
+    }
 }
 
 CallLog& call_log() {
@@ -95,6 +111,9 @@ void HleTable::call(PPUContext& c, GuestMemory& m, uint32_t target) {
     if (PpuThread* t = current_thread()) {
         t->last_call = im.name.c_str();
         t->last_lr = uint32_t(c.lr) & ~3u;
+        t->last_r3 = c.gpr[3];
+        t->last_r4 = c.gpr[4];
+        call_log().ring(t->name.c_str(), im.name.c_str(), c.gpr[3], c.gpr[4], uint32_t(c.lr) & ~3u);
     }
     CallLog& log = call_log();
     const bool first = log.first_call(i);
@@ -102,8 +121,10 @@ void HleTable::call(PPUContext& c, GuestMemory& m, uint32_t target) {
         char line[320];
         const PpuThread* t = current_thread();
         std::snprintf(line, sizeof(line),
-                      "{%s} %s.%s(0x%" PRIX64 ", 0x%" PRIX64 ", 0x%" PRIX64 ", 0x%" PRIX64 ") <- 0x%08X%s",
+                      "{%s} %s.%s(0x%" PRIX64 ", 0x%" PRIX64 ", 0x%" PRIX64 ", 0x%" PRIX64 ", 0x%" PRIX64 ", 0x%" PRIX64
+                      ") <- 0x%08X%s",
                       t ? t->name.c_str() : "?", im.module.c_str(), im.name.c_str(), c.gpr[3], c.gpr[4], c.gpr[5], c.gpr[6],
+                      c.gpr[7], c.gpr[8],
                       uint32_t(c.lr) & ~3u, im.fn ? "" : "  [sem implementação: CELL_OK]");
         log.record(line);
     }
