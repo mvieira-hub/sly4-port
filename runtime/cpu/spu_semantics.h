@@ -6,11 +6,12 @@
 // c.pc and returns Branch; everything else returns Ok and the caller advances the PC.
 // Channels (rdch/wrch/rchcnt) go through spu_channels.h.
 //
-// Single-precision float follows what the SPU does where it is cheap to do so
-// (denormal inputs and results are zero) and the host otherwise (round to nearest,
-// IEEE infinities), as RPCS3 does by default; frest/frsqest return the exact value and
-// fi passes it through. Double precision is IEEE, as on the SPU. SPU code runs inside a
-// SpuFloatMode (spu_run, spu_run_blocks): the host's own DAZ/FTZ do the denormals.
+// Single-precision float follows the SPU: denormal inputs and results are zero, and
+// there are no infinities or NaNs (exponent 255 is one more binade, overflow saturates;
+// see spu_sem_float.inl). Rounding is the host's (to nearest, not the SPU's truncation),
+// and frest/frsqest return the exact value, which fi passes through. Double precision is
+// IEEE, as on the SPU. SPU code runs inside a SpuFloatMode (spu_run, spu_run_blocks): the
+// host's own DAZ/FTZ do the denormals.
 //
 // Element-wise loops go from the last guest element to the first: that is the host's
 // memory order (registers are reversed), so GCC vectorizes them without reversing the
@@ -115,13 +116,8 @@ private:
     unsigned saved_;
 };
 
-// The SPU has no single-precision NaN either; on the host one comes out of invalid
-// operations, and which input NaN an x86 FMA passes on depends on the operand order the
-// compiler picks. So every NaN result is made the same one, and the interpreter and the
-// generated code agree bit for bit.
-SLY4_SPU_INLINE float fnan(float f) { return f != f ? std::bit_cast<float>(0x7FC00000u) : f; }
-
-// The same in software, for values that do not go through a float operation.
+// Denormals as zero in software, for values that do not go through a float operation
+// (the conversions to and from double).
 SLY4_SPU_INLINE float ftz(float f) {
     // On the bits, without branches, so the 4-lane loops of the float instructions can be
     // vectorized: exponent 0 (denormal or zero) keeps only the sign, NaN becomes the default.
@@ -131,8 +127,9 @@ SLY4_SPU_INLINE float ftz(float f) {
     b = (e == 0x7F800000u && m) ? 0x7FC00000u : b;
     return std::bit_cast<float>(b);
 }
-// Double precision is IEEE on the SPU; NaN results are made the default NaN, for the
-// same reason.
+// Double precision is IEEE on the SPU; NaN results are made the default NaN: which input
+// NaN an x86 FMA passes on depends on the operand order the compiler picks, and the
+// interpreter and the generated code must agree bit for bit.
 SLY4_SPU_INLINE double dnan(double d) { return std::isnan(d) ? std::bit_cast<double>(0x7FF8000000000000ull) : d; }
 
 SLY4_SPU_INLINE u32 branch_target(u32 a) { return a & kSpuLsMask & ~3u; }

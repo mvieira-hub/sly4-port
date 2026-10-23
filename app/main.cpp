@@ -13,6 +13,8 @@
 //   sly4.exe ... --ring N            prints the last N calls (kept in memory) with the summary
 //   sly4.exe ... --spu-cache f.bin   records the SPU blocks run in the interpreter (for sly4_recomp spu-emit)
 //   sly4.exe ... --spu-interp        runs every SPU instruction in the interpreter, even when compiled
+//   sly4.exe ... --dump-spu-ls dir   writes each running SPU's local store and registers there at the end
+//   sly4.exe ... --spu-ls-watch 0xLSA  logs each SPU block after which that local store word changed (debugging)
 //   sly4.exe ... --rsx-timeline      logs the RSX's long waits and flips with absolute times
 //   sly4.exe ... --thread-timeline NAME  logs the calls of PPU thread NAME with absolute times
 //   sly4.exe ... --call-times        time spent inside each HLE call and syscall, per thread
@@ -20,9 +22,11 @@
 //   sly4.exe ... --spu-profile       samples the SPUs' PCs and prints the hottest with the summary
 //   sly4.exe ... --ppu-profile NAME  samples where the PPU thread NAME runs in sly4.exe (resolve with nm)
 //   sly4.exe ... --verify-zlib       checks every block the SPU EDGE zlib task inflates (with --firmware)
-//   sly4.exe ... --rsx-capture N,f.txt  writes the RSX commands of frame N (counted in flips)
+//   sly4.exe ... --rsx-capture N,f.txt[,K]  writes the RSX commands of frame N (counted in flips), or of K frames from N
+//                                    (one file each: f.N.txt, f.N+1.txt...)
 //   sly4.exe ... --render            with --no-window: renders anyway (Vulkan without a window)
-//   sly4.exe ... --press start@30,cross@34  presses controller buttons at those seconds
+//   sly4.exe ... --press start@30,cross@34,lup@60:3  presses controller buttons at those seconds
+//                                    (":3" holds for 3 s; lup/ldown/lleft/lright: left stick)
 //   sly4.exe ... --no-audio          no sound output (the game's audio clock keeps running)
 //   sly4.exe ... --dump-audio f.wav  also writes the mixed sound (48 kHz stereo float) to a WAV
 //
@@ -31,7 +35,7 @@
 //   sly4.exe ... --watch 0xADDR       logs every change of the 128-byte guest line at ADDR (debugging)
 //   sly4.exe ... --watch-line 0xADDR[,0xADDR...]  logs every atomic/DMA write to those lines, with who and what (debugging)
 //   sly4.exe ... --watch-write 0xADDR[,size]  logs every write (plain stores too) to those bytes: thread, LR, host code (debugging)
-//   sly4.exe ... --dump-frames dir[,N]  writes every Nth displayed frame (default 60) as PNG
+//   sly4.exe ... --dump-frames dir[,N[,F]]  writes every Nth displayed frame (default 60) as PNG, from flip F on
 //   sly4.exe ... --data <dir>        where /dev_hdd0 and /dev_hdd1 live (default %LOCALAPPDATA%\sly4-port)
 //   sly4.exe ... --dump-imports f.csv  writes module,nid,name,slot of every import
 //   sly4.exe ... --dump-mem addr,size,f.bin  writes that guest memory to a file when the game stops
@@ -53,6 +57,7 @@
 
 #include "cpu/guest_atomic.h"
 #include "cpu/ppu_rt.h"
+#include "cpu/spu_blocks.h"
 #include "gpu/rsx_vk.h"
 #include "gpu/vulkan_context.h"
 #include "kernel/hle.h"
@@ -106,6 +111,8 @@ struct Args {
     std::string thread_timeline;  // --thread-timeline NAME
     std::string watch_line;   // guest addresses (comma-separated) of 128-byte lines whose every write is logged
     std::string watch_write;  // --watch-write addr[,size]
+    std::string spu_ls_watch;  // --spu-ls-watch lsa
+    std::string dump_spu_ls;   // --dump-spu-ls dir
     std::string game_dir, eboot, nid_names, dump_imports, data_dir, firmware_dir, spu_cache;
     bool window = true, run = true, trace = false, spu_interp = false, spu_profile = false, verify_zlib = false, call_times = false;
     bool render = false;      // render without a window (Vulkan headless)
@@ -155,6 +162,10 @@ bool parse_args(int argc, char** argv, Args& out) {
             ok = value(out.spu_cache);
         } else if (std::strcmp(argv[i], "--spu-interp") == 0) {
             out.spu_interp = true;
+        } else if (std::strcmp(argv[i], "--dump-spu-ls") == 0) {
+            ok = value(out.dump_spu_ls);
+        } else if (std::strcmp(argv[i], "--spu-ls-watch") == 0) {
+            ok = value(out.spu_ls_watch);
         } else if (std::strcmp(argv[i], "--press") == 0) {
             ok = value(out.press);
         } else if (std::strcmp(argv[i], "--ppu-profile") == 0) {
@@ -325,23 +336,30 @@ void start_watch_write(sly4::GuestMemory& mem, const std::string& spec) {
     }).detach();
 }
 
-// --press start@30,cross@34: presses controller buttons at those seconds of the run, each
-// for 250 ms, to get through menus in scripted runs; it adds to the window's controller.
+// --press start@30,cross@34,lup@60:3: presses controller buttons at those seconds of the
+// run, for 250 ms or the given duration, to get through menus and move in scripted runs;
+// presses that overlap are held together, and it adds to the window's controller.
+// lup/ldown/lleft/lright push the left stick all the way.
 bool start_presses(const std::string& spec) {
     struct Button {
         const char* name;
         uint16_t digital1, digital2;
-        int pressure;  // index in PadState::pressure, -1 for none
+        int pressure;    // index in PadState::pressure, -1 for none
+        int stick_axis;  // 0 left x, 1 left y, -1 none
+        uint16_t stick;  // its value when pushed
     };
     static constexpr Button kButtons[] = {
-        {"select", 0x01, 0, -1}, {"l3", 0x02, 0, -1},    {"r3", 0x04, 0, -1},       {"start", 0x08, 0, -1},
-        {"up", 0x10, 0, 2},      {"right", 0x20, 0, 0},  {"down", 0x40, 0, 3},      {"left", 0x80, 0, 1},
-        {"l2", 0, 0x01, 10},     {"r2", 0, 0x02, 11},    {"l1", 0, 0x04, 8},        {"r1", 0, 0x08, 9},
-        {"triangle", 0, 0x10, 4}, {"circle", 0, 0x20, 5}, {"cross", 0, 0x40, 6},    {"square", 0, 0x80, 7},
+        {"select", 0x01, 0, -1, -1, 0},  {"l3", 0x02, 0, -1, -1, 0},     {"r3", 0x04, 0, -1, -1, 0},
+        {"start", 0x08, 0, -1, -1, 0},   {"up", 0x10, 0, 2, -1, 0},      {"right", 0x20, 0, 0, -1, 0},
+        {"down", 0x40, 0, 3, -1, 0},     {"left", 0x80, 0, 1, -1, 0},    {"l2", 0, 0x01, 10, -1, 0},
+        {"r2", 0, 0x02, 11, -1, 0},      {"l1", 0, 0x04, 8, -1, 0},      {"r1", 0, 0x08, 9, -1, 0},
+        {"triangle", 0, 0x10, 4, -1, 0}, {"circle", 0, 0x20, 5, -1, 0},  {"cross", 0, 0x40, 6, -1, 0},
+        {"square", 0, 0x80, 7, -1, 0},   {"lleft", 0, 0, -1, 0, 0x00},   {"lright", 0, 0, -1, 0, 0xFF},
+        {"lup", 0, 0, -1, 1, 0x00},      {"ldown", 0, 0, -1, 1, 0xFF},
     };
     struct Press {
         const Button* button;
-        double at;
+        double at, until;
     };
     std::vector<Press> presses;
     for (size_t i = 0; i < spec.size();) {
@@ -353,29 +371,46 @@ bool start_presses(const std::string& spec) {
         for (const Button& k : kButtons)
             if (at != std::string::npos && item.compare(0, at, k.name) == 0 && std::strlen(k.name) == at) b = &k;
         if (!b) {
-            SLY4_ERROR("--press: botão inválido em '%s' (use nome@segundos)", item.c_str());
+            SLY4_ERROR("--press: botão inválido em '%s' (use nome@segundos ou nome@segundos:duração)", item.c_str());
             return false;
         }
-        presses.push_back({b, std::strtod(item.c_str() + at + 1, nullptr)});
+        char* rest = nullptr;
+        const double t = std::strtod(item.c_str() + at + 1, &rest);
+        const double held = *rest == ':' ? std::strtod(rest + 1, nullptr) : 0.25;
+        presses.push_back({b, t, t + held});
     }
     std::thread([presses] {
         const auto t0 = std::chrono::steady_clock::now();
-        auto wait_until = [&](double s) {
-            while (!game_over() && std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < s)
-                sly4::host_sleep_us(5000);
-        };
-        for (const Press& p : presses) {
-            wait_until(p.at);
-            if (game_over()) return;
-            sly4::PadState s;
-            s.digital1 = p.button->digital1;
-            s.digital2 = p.button->digital2;
-            if (p.button->pressure >= 0) s.pressure[p.button->pressure] = 255;
-            sly4::set_pad_state(s, sly4::PadSource::Script);
-            SLY4_INFO("controle: %s (%.1f s)", p.button->name, p.at);
-            wait_until(p.at + 0.25);
-            sly4::set_pad_state(sly4::PadState{}, sly4::PadSource::Script);
+        std::vector<bool> down(presses.size(), false);
+        size_t finished = 0;
+        while (!game_over() && finished < presses.size()) {
+            const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            bool changed = false;
+            finished = 0;
+            for (size_t i = 0; i < presses.size(); ++i) {
+                const bool d = now >= presses[i].at && now < presses[i].until;
+                finished += now >= presses[i].until;
+                if (d == down[i]) continue;
+                down[i] = d;
+                changed = true;
+                if (d) SLY4_INFO("controle: %s (%.1f s)", presses[i].button->name, presses[i].at);
+            }
+            if (changed) {
+                sly4::PadState s;
+                for (size_t i = 0; i < presses.size(); ++i) {
+                    if (!down[i]) continue;
+                    const Button& b = *presses[i].button;
+                    s.digital1 |= b.digital1;
+                    s.digital2 |= b.digital2;
+                    if (b.pressure >= 0) s.pressure[b.pressure] = 255;
+                    if (b.stick_axis == 0) s.left_x = b.stick;
+                    if (b.stick_axis == 1) s.left_y = b.stick;
+                }
+                sly4::set_pad_state(s, sly4::PadSource::Script);
+            }
+            sly4::host_sleep_us(5000);
         }
+        sly4::set_pad_state(sly4::PadState{}, sly4::PadSource::Script);
     }).detach();
     return true;
 }
@@ -414,6 +449,7 @@ bool start_game(const Args& args, sly4::GuestMemory& mem, const sly4::LoadedImag
     sly4::gen::register_functions();
     sly4::gen::register_firmware_functions();
     if (!args.spu_interp) sly4::gen::register_spu_code();
+    if (!args.spu_ls_watch.empty()) sly4::spu_ls_watch(uint32_t(std::strtoul(args.spu_ls_watch.c_str(), nullptr, 0)));
     static sly4::Kernel kernel(mem, img);
     g_kernel = &kernel;
     g_mem = &mem;
@@ -423,6 +459,7 @@ bool start_game(const Args& args, sly4::GuestMemory& mem, const sly4::LoadedImag
     opt.firmware_dir = args.firmware_dir;
     opt.ring = size_t(args.ring);
     opt.spu_cache = args.spu_cache;
+    opt.dump_spu_ls = args.dump_spu_ls;
     opt.spu_profile = args.spu_profile;
     opt.call_times = args.call_times;
     opt.thread_timeline = args.thread_timeline;
@@ -430,8 +467,13 @@ bool start_game(const Args& args, sly4::GuestMemory& mem, const sly4::LoadedImag
     opt.verify_zlib = args.verify_zlib;
     if (!args.rsx_capture.empty()) {
         const size_t comma = args.rsx_capture.find(',');
-        sly4::rsx::set_capture(uint32_t(std::strtoul(args.rsx_capture.c_str(), nullptr, 10)),
-                               comma == std::string::npos ? "rsx_frame.txt" : args.rsx_capture.substr(comma + 1));
+        std::string file = comma == std::string::npos ? "rsx_frame.txt" : args.rsx_capture.substr(comma + 1);
+        uint32_t count = 1;
+        if (const size_t c2 = file.find(','); c2 != std::string::npos) {
+            count = uint32_t(std::strtoul(file.c_str() + c2 + 1, nullptr, 10));
+            file.resize(c2);
+        }
+        sly4::rsx::set_capture(uint32_t(std::strtoul(args.rsx_capture.c_str(), nullptr, 10)), file, count);
     }
     // PS3_GAME is the folder above USRDIR\EBOOT.elf; saves and caches go to %LOCALAPPDATA%.
     const std::filesystem::path eboot = std::filesystem::absolute(args.eboot);
@@ -461,7 +503,7 @@ int main(int argc, char** argv) {
 #endif
     Args args;
     if (!parse_args(argc, argv, args)) return 2;
-    SLY4_INFO("sly4 %s - port nativo, fase 6 (áudio, controle e vídeo)", "0.0.6");
+    SLY4_INFO("sly4 %s - port nativo, fase 7 (primeira fase jogável)", "0.0.7");
 
     sly4::GuestMemory mem;
     sly4::LoadedImage image;
@@ -504,8 +546,12 @@ int main(int argc, char** argv) {
         if (!args.dump_frames.empty()) {
             const size_t comma = args.dump_frames.find(',');
             ro.dump_dir = args.dump_frames.substr(0, comma);
-            ro.dump_every =
-                comma == std::string::npos ? 60 : uint32_t(std::strtoul(args.dump_frames.c_str() + comma + 1, nullptr, 10));
+            ro.dump_every = 60;
+            if (comma != std::string::npos) {
+                char* end = nullptr;
+                ro.dump_every = uint32_t(std::strtoul(args.dump_frames.c_str() + comma + 1, &end, 10));
+                if (*end == ',') ro.dump_first = uint32_t(std::strtoul(end + 1, nullptr, 10));
+            }
         }
         g_renderer = sly4::rsx::create_vulkan_renderer(gpu, ro);
         if (g_renderer) sly4::rsx::set_backend(g_renderer.get());

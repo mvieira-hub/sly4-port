@@ -18,6 +18,7 @@
 #include "gpu/rsx_shader_util.h"
 #include "gpu/rsx_shaders.h"
 #include "gpu/rsx_texture.h"
+#include "gpu/spirv.h"
 #include "rsx/rsx.h"
 
 namespace sly4::rsx {
@@ -122,6 +123,39 @@ void guest_to_rgba(uint8_t* dst, const uint8_t* src, uint32_t pixels, bool argb)
         v = argb ? (v >> 8) | (v << 24) : __builtin_bswap32(v);
         std::memcpy(dst + 4 * i, &v, 4);
     }
+}
+
+// For clears of some color channels only (Renderer::clear_channels): a triangle over the
+// whole target (gl_VertexIndex 0, 1, 2 at (-1,-1), (3,-1), (-1,3)) and a fragment shader
+// writing 1.0, which the blend factors CONSTANT_COLOR/ZERO turn into the blend constants.
+std::vector<uint32_t> full_target_vs() {
+    spv::Builder b;
+    const spv::Id f = b.t_float(), v4 = b.t_vec4(), i = b.t_int(), bl = b.t_bool();
+    const spv::Id index = b.variable(b.t_pointer(spv::Input, i), spv::Input);
+    b.decorate(index, spv::BuiltIn, {spv::VertexIndex});
+    const spv::Id position = b.variable(b.t_pointer(spv::Output, v4), spv::Output);
+    b.decorate(position, spv::BuiltIn, {spv::Position});
+    const spv::Id fn = b.begin_function(b.t_void(), b.t_function(b.t_void()));
+    const spv::Id n = b.op(spv::OpLoad, i, {index});
+    const spv::Id x = b.op(spv::OpSelect, f, {b.op(spv::OpIEqual, bl, {n, b.c_int(1)}), b.c_float(3), b.c_float(-1)});
+    const spv::Id y = b.op(spv::OpSelect, f, {b.op(spv::OpIEqual, bl, {n, b.c_int(2)}), b.c_float(3), b.c_float(-1)});
+    b.op_void(spv::OpStore, {position, b.op(spv::OpCompositeConstruct, v4, {x, y, b.c_float(0), b.c_float(1)})});
+    b.op_void(spv::OpReturn, {});
+    b.end_function();
+    b.entry_point(spv::Vertex, fn, "main", {index, position});
+    return b.finish();
+}
+std::vector<uint32_t> ones_fs() {
+    spv::Builder b;
+    const spv::Id out = b.variable(b.t_pointer(spv::Output, b.t_vec4()), spv::Output);
+    b.decorate(out, spv::Location, {0});
+    const spv::Id fn = b.begin_function(b.t_void(), b.t_function(b.t_void()));
+    b.op_void(spv::OpStore, {out, b.c_vec4(1, 1, 1, 1)});
+    b.op_void(spv::OpReturn, {});
+    b.end_function();
+    b.entry_point(spv::Fragment, fn, "main", {out});
+    b.execution_mode(fn, spv::OriginUpperLeft);
+    return b.finish();
 }
 
 // Everything a pipeline depends on besides the dynamic state.
@@ -395,6 +429,7 @@ private:
     static uint32_t surface_bytes(const Image& img) { return (img.pitch ? img.pitch : img.width * 4) * img.height; }
     void begin_rendering();
     void end_rendering();
+    void clear_channels(uint32_t mask, const float color[4]);
 
     VkShaderModule module(uint64_t key, const std::vector<uint32_t>& spirv);
     Image* texture(GuestMemory& mem, const Texture& t, uint32_t dims);
@@ -792,20 +827,22 @@ void Renderer::end_rendering() {
 }
 
 // ---------------------------------------------------------------- clear
+// CLEAR_SURFACE: Z 0x01, S 0x02, R 0x10, G 0x20, B 0x40, A 0x80.
 void Renderer::clear(GuestMemory& mem, const State& s, uint32_t mask) {
     if (!bind_targets(mem, s)) return;
     VkClearAttachment att[2];
     uint32_t n = 0;
-    if (color_ && (mask & 0xF0)) {
-        const uint32_t v = s.reg(SetColorClearValue);
+    const uint32_t v = s.reg(SetColorClearValue);
+    const float color[4] = {float((v >> 16) & 0xFF) / 255.0f, float((v >> 8) & 0xFF) / 255.0f, float(v & 0xFF) / 255.0f,
+                            float(v >> 24) / 255.0f};
+    if (color_ && (mask & 0xF0) == 0xF0) {
         VkClearAttachment a{};
         a.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         a.colorAttachment = 0;
-        a.clearValue.color.float32[0] = float((v >> 16) & 0xFF) / 255.0f;
-        a.clearValue.color.float32[1] = float((v >> 8) & 0xFF) / 255.0f;
-        a.clearValue.color.float32[2] = float(v & 0xFF) / 255.0f;
-        a.clearValue.color.float32[3] = float(v >> 24) / 255.0f;
+        std::memcpy(a.clearValue.color.float32, color, sizeof(color));
         att[n++] = a;
+    } else if (color_ && (mask & 0xF0)) {
+        clear_channels(mask & 0xF0, color);
     }
     if (depth_ && (mask & 3)) {
         const uint32_t v = s.reg(SetZstencilClearValue);
@@ -829,6 +866,43 @@ void Renderer::clear(GuestMemory& mem, const State& s, uint32_t mask) {
     rect.rect = {{0, 0}, {target_w_, target_h_}};
     rect.layerCount = 1;
     vkCmdClearAttachments(cmd(), n, att, 1, &rect);
+}
+
+// A clear of some color channels only. The game clears just the alpha of its frame and draws
+// a mask there (how much of the searchlight is seen); clearing every channel turned the
+// frame black. vkCmdClearAttachments has no write mask, so a triangle over the target
+// writes the clear color (the blend constants) through one.
+void Renderer::clear_channels(uint32_t mask, const float color[4]) {
+    constexpr uint64_t kVsKey = 0x5C1EA5000000000Bull, kFsKey = 0x5C1EA5000000000Full;  // not program hashes
+    static const std::vector<uint32_t> vs_code = full_target_vs(), fs_code = ones_fs();
+    const VkShaderModule vs = module(kVsKey, vs_code), fs = module(kFsKey, fs_code);
+    if (!vs || !fs) return;
+    PipelineKey k;
+    std::memset(&k, 0, sizeof(k));
+    k.vs = vs;
+    k.fs = fs;
+    k.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    k.color = color_->format;
+    k.depth = depth_ ? depth_->format : VK_FORMAT_UNDEFINED;
+    k.blend_enable = 1;
+    k.blend_sf = 0x8001 | 0x8001u << 16;  // CONSTANT_COLOR for color and alpha
+    k.blend_df = 0;                       // ZERO
+    k.color_mask = (mask & 0x10 ? 1u << 16 : 0) | (mask & 0x20 ? 1u << 8 : 0) | (mask & 0x40 ? 1u : 0) |
+                   (mask & 0x80 ? 1u << 24 : 0);  // as SET_COLOR_MASK: B bit 0, G 8, R 16, A 24
+    k.cull = VK_CULL_MODE_NONE;
+    k.front_face = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    const VkPipeline p = pipeline(k);
+    if (!p) return;
+    begin_rendering();
+    VkCommandBuffer c = cmd();
+    vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+    const VkViewport viewport{0, 0, float(target_w_), float(target_h_), 0.0f, 1.0f};
+    vkCmdSetViewport(c, 0, 1, &viewport);
+    const VkRect2D scissor{{0, 0}, {target_w_, target_h_}};
+    vkCmdSetScissor(c, 0, 1, &scissor);
+    vkCmdSetBlendConstants(c, color);
+    vkCmdSetStencilReference(c, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
+    vkCmdDraw(c, 3, 1, 0, 0);
 }
 
 void Renderer::invalidate(GuestAddr ea, uint32_t size) {
@@ -1669,6 +1743,18 @@ void Renderer::draw(GuestMemory& mem, const State& s, const DrawCommand& d) {
             const uint32_t raw = load_be<uint32_t>(fp + fpi.constant_offsets[c] + 4 * w);
             fc[c * 4 + w] = (raw << 16) | (raw >> 16);
         }
+    if (capturing()) {  // --rsx-capture: the inline constants, which live in memory, not in methods
+        char buf[48];
+        std::snprintf(buf, sizeof(buf), "  # fp 0x%08X constantes:", fp_ea);
+        std::string line = buf;
+        for (uint32_t c = 0; c < nconst * 4; ++c) {
+            float f;
+            std::memcpy(&f, &fc[c], 4);
+            std::snprintf(buf, sizeof(buf), "%s%g", c % 4 ? " " : " | ", double(f));
+            line += buf;
+        }
+        capture_note(line);
+    }
     float* alpha = reinterpret_cast<float*>(fc + (nconst ? nconst : 1) * 4);
     alpha[0] = float(s.reg(SetAlphaRef) & 0xFF) / 255.0f;
     alpha[1] = alpha[2] = alpha[3] = 0.0f;
@@ -1861,7 +1947,8 @@ void Renderer::flip(GuestMemory& mem, const State&, uint32_t buffer) {
     }
     present_from(src, mem, db);
 
-    const bool dump = !opt_.dump_dir.empty() && opt_.dump_every && flips_ % opt_.dump_every == 0;
+    const bool dump = !opt_.dump_dir.empty() && opt_.dump_every && flips_ >= opt_.dump_first &&
+                      flips_ % opt_.dump_every == 0;
     VkDeviceSize bytes = VkDeviceSize(db.width) * db.height * 4;
     if (dump && ensure_readback(bytes)) {
         VkBufferImageCopy copy{};

@@ -88,6 +88,7 @@ struct KernelOptions {
     std::string ppu_profile;   // name of a PPU thread whose host code is sampled for the summary
     bool verify_zlib = false;  // checks the SPU's EDGE zlib output against the native inflate
     std::string spu_cache;     // records the SPU blocks run in the interpreter (docs/SPU.md, 4e)
+    std::string dump_spu_ls;   // folder for each running SPU's local store and registers at the end
 };
 
 class Kernel {
@@ -162,6 +163,7 @@ private:
     std::atomic<int> exit_status_{0};
     size_t ring_lines_ = 0;  // KernelOptions::ring
     std::string spu_cache_;  // KernelOptions::spu_cache
+    std::string dump_spu_ls_;  // KernelOptions::dump_spu_ls
     std::mutex threads_lock_;
     std::map<uint64_t, std::shared_ptr<PpuThread>> threads_;
 

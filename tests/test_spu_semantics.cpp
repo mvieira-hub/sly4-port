@@ -199,11 +199,30 @@ TEST(spu_single_float) {
     CHECK(s.w(4, 1) == 0xFFFFFFFF && s.w(4, 0) == 0);
     s.rr(Op::fcmgt, 4, 2, 1);
     CHECK(s.w(4, 3) == 0xFFFFFFFF);
-    // A denormal result is zero too (with its sign); a NaN result is the default one.
+    // A denormal result is zero too (with its sign). Exponent 255 is not infinity or NaN
+    // but one more binade: 2^128 * 0 is 0, 1.0 * 0x7FC00007 is itself.
     s.floats(1, 1e-20f, -1e-20f, std::numeric_limits<float>::infinity(), 1.0f);
     s.floats(2, 1e-20f, 1e-20f, 0.0f, std::nanf("7"));
     s.rr(Op::fm, 4, 1, 2);
-    CHECK(s.w(4, 0) == 0 && s.w(4, 1) == 0x80000000u && s.w(4, 2) == 0x7FC00000u && s.w(4, 3) == 0x7FC00000u);
+    CHECK(s.w(4, 0) == 0 && s.w(4, 1) == 0x80000000u && s.w(4, 2) == 0 && s.w(4, 3) == 0x7FC00007u);
+    // Overflow saturates at the largest value instead of becoming infinity.
+    s.words(1, 0x7F7FFFFFu, 0xFF000000u, 0x7F800000u, 0x7FFFFFFFu);  // 3.4e38, -1.7e38, 2^128, max
+    s.words(2, 0x40000000u, 0x41000000u, 0x7F800000u, 0xBF800000u);  // 2, 8, 2^128, -1
+    s.rr(Op::fm, 4, 1, 2);
+    CHECK(s.w(4, 0) == 0x7FFFFFFFu && s.w(4, 1) == 0xFFFFFFFFu && s.w(4, 2) == 0x7FFFFFFFu && s.w(4, 3) == 0xFFFFFFFFu);
+    s.rr(Op::fa, 4, 1, 1);  // 2 * 3.4e38 is exactly the largest value; -2^128 fits; 2^129 does not
+    CHECK(s.w(4, 0) == 0x7FFFFFFFu && s.w(4, 1) == 0xFF800000u && s.w(4, 2) == 0x7FFFFFFFu && s.w(4, 3) == 0x7FFFFFFFu);
+    s.ri8(Op::cflts, 4, 1, 173);  // exponent 255 saturates by its sign
+    CHECK(s.w(4, 1) == 0x80000000u && s.w(4, 2) == 0x7FFFFFFFu);
+    // Comparisons: 0x7FFFFFFF is greater than any other value; +0, -0 and denormals are equal.
+    s.words(1, 0x7FFFFFFFu, 0x80000000u, 0x00000001u, 0xFF800000u);
+    s.words(2, 0x7F7FFFFFu, 0x00000000u, 0x80000000u, 0xBF800000u);
+    s.rr(Op::fcgt, 4, 1, 2);
+    CHECK(s.w(4, 0) == ~0u && s.w(4, 1) == 0 && s.w(4, 2) == 0 && s.w(4, 3) == 0);
+    s.rr(Op::fceq, 4, 1, 2);
+    CHECK(s.w(4, 0) == 0 && s.w(4, 1) == ~0u && s.w(4, 2) == ~0u && s.w(4, 3) == 0);
+    s.rr(Op::fcmgt, 4, 1, 2);
+    CHECK(s.w(4, 0) == ~0u && s.w(4, 1) == 0 && s.w(4, 3) == ~0u);
 
     s.floats(1, 3.7f, 1.5f, 3e9f, -1.0f);
     s.ri8(Op::cflts, 4, 1, 173);  // scale 2^0, truncate, saturate

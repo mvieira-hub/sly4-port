@@ -47,7 +47,11 @@ GuestAddr labels_address();
 // and counters for the end-of-run summary.
 // --rsx-timeline: long waits on jumps to themselves and flips, with absolute times (ms).
 void set_timeline(bool on);
-void set_capture(uint32_t frame, const std::string& path);
+// --rsx-capture: the commands of `count` frames from `frame` on (counted in flips).
+void set_capture(uint32_t frame, const std::string& path, uint32_t count = 1);
+// For the backend: whether a frame is being captured, and a line to add to it.
+bool capturing();
+void capture_note(const std::string& line);
 void summary();
 
 }  // namespace sly4::rsx

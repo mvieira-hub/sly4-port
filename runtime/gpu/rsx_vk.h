@@ -15,6 +15,7 @@ namespace sly4::rsx {
 struct VulkanRendererOptions {
     std::string dump_dir;  // write the front image of every `dump_every` flips here as PNG
     uint32_t dump_every = 0;
+    uint32_t dump_first = 0;  // and only from this flip on
 };
 
 class VulkanRenderer : public Backend {

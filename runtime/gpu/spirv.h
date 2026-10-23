@@ -37,7 +37,7 @@ enum Decoration : uint32_t {
     Block = 2, ArrayStride = 6, BuiltIn = 11, NoPerspective = 13, Flat = 14, Location = 30, Binding = 33,
     DescriptorSet = 34, Offset = 35,
 };
-enum BuiltInKind : uint32_t { Position = 0, PointSize = 1, FragCoord = 15, FrontFacing = 17, FragDepth = 22 };
+enum BuiltInKind : uint32_t { Position = 0, PointSize = 1, FragCoord = 15, FrontFacing = 17, FragDepth = 22, VertexIndex = 42 };
 enum ExecutionModel : uint32_t { Vertex = 0, Fragment = 4 };
 enum ExecutionMode : uint32_t { OriginUpperLeft = 7, DepthReplacing = 12 };
 enum Dim : uint32_t { Dim1D = 0, Dim2D = 1, Dim3D = 2, DimCube = 3 };

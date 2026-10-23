@@ -56,6 +56,10 @@ SpuBlockFn spu_find_block(SPUContext& c);
 // elsewhere). With the SPU cache on, interpreted blocks are recorded.
 SpuStep spu_run_blocks(SPUContext& c, uint64_t max_steps, uint64_t& executed);
 
+// Diagnostic (--spu-ls-watch): logs every block, on any SPU, after which this local store
+// word changed. Slows all SPUs down; set before they start.
+void spu_ls_watch(uint32_t lsa);
+
 // ---------------------------------------------------------------- SPU cache
 struct SpuCachedBlock {
     uint32_t pc = 0;

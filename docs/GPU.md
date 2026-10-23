@@ -140,6 +140,7 @@ O código SPU novo do vídeo e do menu foi gravado na cache SPU e compilado ([SP
 ### O que falta
 
 - **Desempenho:** o menu roda a ~41–47 quadros/s (ver abaixo), acima dos 30 que o jogo mira. Na Fase 6 caiu para ~37–41, porque o pós-processamento que o jogo faz nas SPUs passou a ser emulado (ver FASE6.md, 6d).
+- **Clear parcial (Fase 7):** `CLEAR_SURFACE` com só parte dos canais de cor (o jogo limpa só o alfa da cena) é desenhado com máscara de escrita, porque o `vkCmdClearAttachments` não tem máscara (ver FASE7.md, 7c).
 - MRT, desvios e laços em *fragment programs*, e superfícies de 16 bits e de ponto flutuante na coerência com a memória: nada disso aparece até o menu.
 
 ## Comparação com o RPCS3 (5e)

@@ -72,10 +72,20 @@ struct Span {
     }
 };
 
-// Frame capture (--rsx-capture).
+// Frame capture (--rsx-capture): frames [g_capture_frame, g_capture_end), one file each
+// when there are several ("f.txt" becomes "f.6100.txt"...).
 uint32_t g_capture_frame = UINT32_MAX;
+uint32_t g_capture_end = 0;
+uint32_t g_capture_open = UINT32_MAX;  // the frame g_capture is writing
 std::string g_capture_path;
 FILE* g_capture = nullptr;
+
+std::string capture_file(uint32_t frame) {
+    if (g_capture_end - g_capture_frame <= 1) return g_capture_path;
+    const size_t dot = g_capture_path.rfind('.');
+    const std::string n = "." + std::to_string(frame);
+    return dot == std::string::npos ? g_capture_path + n : g_capture_path.substr(0, dot) + n + g_capture_path.substr(dot);
+}
 
 // ---------------------------------------------------------------- the command processor
 class Processor {
@@ -126,16 +136,18 @@ GuestAddr Processor::dma_address(uint32_t dma, uint32_t offset) {
 uint64_t timestamp_ns() { return guest_system_time() * 1000; }
 
 void Processor::capture(uint32_t reg, uint32_t arg) {
-    if (g_count.flips.load() != g_capture_frame) {
-        if (g_capture) {
-            std::fclose(g_capture);
-            g_capture = nullptr;
-            g_capture_frame = UINT32_MAX;
-            SLY4_INFO("RSX: quadro capturado em %s", g_capture_path.c_str());
-        }
-        return;
+    const uint32_t flip = g_count.flips.load();
+    if (g_capture && flip != g_capture_open) {
+        std::fclose(g_capture);
+        g_capture = nullptr;
+        SLY4_INFO("RSX: quadro capturado em %s", capture_file(g_capture_open).c_str());
+        if (flip >= g_capture_end) g_capture_frame = UINT32_MAX;
     }
-    if (!g_capture) g_capture = std::fopen(g_capture_path.c_str(), "w");
+    if (flip < g_capture_frame || flip >= g_capture_end) return;
+    if (!g_capture) {
+        g_capture = std::fopen(capture_file(flip).c_str(), "w");
+        g_capture_open = flip;
+    }
     if (!g_capture) return;
     uint32_t index;
     const char* name = method_name(reg, index);
@@ -565,8 +577,15 @@ GuestAddr labels_address() { return g_labels; }
 
 void set_timeline(bool on) { g_timeline = on; }
 
-void set_capture(uint32_t frame, const std::string& path) {
+bool capturing() { return g_capture != nullptr; }
+
+void capture_note(const std::string& line) {
+    if (g_capture) std::fprintf(g_capture, "%s\n", line.c_str());
+}
+
+void set_capture(uint32_t frame, const std::string& path, uint32_t count) {
     g_capture_frame = frame;
+    g_capture_end = frame + std::max(count, 1u);
     g_capture_path = path;
 }
 

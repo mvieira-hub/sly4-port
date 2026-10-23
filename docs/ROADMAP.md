@@ -443,10 +443,15 @@ Andamento em [FASE6.md](FASE6.md):
 - **6d, vídeo (concluída):** o Bink (recompilado, como o resto do jogo) decodificava certo. O vídeo saía verde porque o renderizador escrevia uma superfície velha por cima dos planos. Agora as superfícies desenhadas têm a memória vigiada por proteção de página. O pós-processamento das SPUs no menu passou a valer, e o menu roda a ~37–41 quadros/s.
 - **Saída (alcançada):** menu com música, navegação pelo controle e a abertura em vídeo.
 
-### Fase 7: POC, primeira fase jogável (4–8 semanas)
-- Novo jogo → Prólogo em Paris: carregamento da fase, física Havok e IA (`NavGraph`).
-- Correção de bugs pela comparação de logs e quadros com o RPCS3.
-- **Saída:** a primeira fase carrega, renderiza e o Sly anda e pula com o controle.
+### Fase 7: POC, primeira fase jogável (4–8 semanas) — **concluída** (2026-10-23)
+
+Andamento em [FASE7.md](FASE7.md):
+- **7a, novo jogo (concluída):** o save de progresso é criado e a tela de carregamento aparece, como no RPCS3.
+- **7b, carregamento (concluída):** travava numa tarefa de física nas SPUs que percorria um anel de ilhas quebrado. A causa era o ponto flutuante simples da SPU: `0x7FFFFFFF` é o maior número dela, mas para o x86 é um NaN. As semânticas SPU seguem agora o formato estendido (sem infinito nem NaN; saturação).
+- **7c, renderização (concluída):** a cena apagava em trechos. Um `CLEAR_SURFACE` só do alfa limpava os quatro canais, e agora respeita a máscara.
+- **7d, física e IA (concluída):** Havok/BFX nas SPUs, helicópteros e câmera rodam 420 s sem travar; o NavGraph da fase é carregado.
+- **7e, controle (concluída):** o Sly anda, corre, pula e dá pulo duplo (`--press` com duração e analógico; o gamepad e o teclado pelo mesmo caminho).
+- **Saída (alcançada):** a primeira fase carrega, renderiza e o Sly anda e pula com o controle, a ~29 quadros/s.
 
 ### Fase 8: do POC ao jogo completo (contínuo)
 - Todas as fases e minijogos, saves, desempenho (60 FPS estáveis, threads), resolução e *widescreen* acima de 720p.

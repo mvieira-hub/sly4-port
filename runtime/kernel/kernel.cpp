@@ -73,6 +73,7 @@ bool Kernel::init(const NidNames& names, const KernelOptions& opt) {
     call_log().timeline_thread = opt.thread_timeline;
     ring_lines_ = opt.ring;
     spu_cache_ = opt.spu_cache;
+    dump_spu_ls_ = opt.dump_spu_ls;
     if (opt.spu_profile) spu_profile_start();
     if (!opt.ppu_profile.empty()) ppu_profile_start(opt.ppu_profile);
     if (opt.verify_zlib) hle().set_call_hook(zlib_verify_call);
@@ -542,6 +543,16 @@ void Kernel::print_summary() const {
         for (uint32_t a = (pc - 16) & kSpuLsMask; a != ((pc + 20) & kSpuLsMask); a = (a + 4) & kSpuLsMask)
             std::fprintf(stderr, "    %05X%s %s\n", a, a == pc ? " >" : "  ",
                          spu::disasm(spu::decode(s->ctx.ls_u32(a)), a).c_str());
+        // --dump-spu-ls: local store (256 KiB) then the 128 registers (host layout), to disassemble.
+        if (!dump_spu_ls_.empty()) {
+            char path[512];
+            std::snprintf(path, sizeof(path), "%s/spu_%08X.ls", dump_spu_ls_.c_str(), s->id);
+            if (FILE* f = std::fopen(path, "wb")) {
+                std::fwrite(s->ctx.ls, 1, kSpuLsMask + 1, f);
+                std::fwrite(s->ctx.gpr, sizeof(s->ctx.gpr), 1, f);
+                std::fclose(f);
+            }
+        }
     }
     spu_profile_print();
     ppu_profile_print();
