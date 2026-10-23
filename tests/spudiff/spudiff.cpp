@@ -15,6 +15,7 @@
 #include <cstring>
 #include <memory>
 #include <random>
+#include <set>
 #include <string>
 
 #include "core/log.h"
@@ -112,6 +113,7 @@ int blocks(int argc, char** argv) {
     std::mt19937_64 rng(seed);
     Run start, ref, gen;
     size_t compared = 0, equal = 0, different = 0, skipped_blocks = 0, skipped_cases = 0, shown = 0;
+    std::set<uint32_t> shown_blocks;
     for (size_t b = 0; b < count; ++b) {
         const SpuBlockEntry& e = table[b];
         if (!comparable(e)) {
@@ -146,7 +148,7 @@ int blocks(int argc, char** argv) {
             ++compared;
             if (const char* what = diff(ref, gen)) {
                 ++different;
-                if (shown++ < 10) {
+                if (shown_blocks.insert(e.pc).second && shown++ < 40) {  // the first case of each block
                     SLY4_ERROR("bloco 0x%05X (%u bytes), caso %d: %s diferente (interpretador: pc 0x%05X, %" PRIu64
                                " instruções; compilado: pc 0x%05X, %" PRIu64 ")",
                                e.pc, e.size, k, what, ref.c.pc, ref.n, gen.c.pc, gen.n);
@@ -180,6 +182,7 @@ int blocks(int argc, char** argv) {
 
 int main(int argc, char** argv) {
     gen::register_spu_blocks();
+    spusem::SpuFloatMode fp;  // as SPU code runs (spu_run_blocks)
     if (argc > 1 && !std::strcmp(argv[1], "--oracle")) return spu_oracle::cmd(argc, argv);  // parses from argv[2]
     return blocks(argc, argv);
 }

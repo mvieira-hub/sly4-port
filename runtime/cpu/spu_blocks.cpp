@@ -82,22 +82,40 @@ const SpuBlockEntry* spu_block_table(size_t& count) {
     return g_blocks.entries.data();
 }
 
-SpuBlockFn spu_find_block(const SPUContext& c) {
+SpuBlockFn spu_find_block(SPUContext& c) {
+    SPUContext::CachedBlock& b = c.block_cache[(c.pc >> 2) % SPUContext::kBlockCache];
+    if (b.pc == c.pc && c.ls_epoch[b.page0] == b.epoch0 && c.ls_epoch[b.page1] == b.epoch1) {
+        return reinterpret_cast<SpuBlockFn>(b.fn);
+    }
     const BlockTable& t = g_blocks;
     for (uint32_t i = t.head[c.pc / 4]; i; i = t.next[i - 1]) {
         const SpuBlockEntry& e = t.entries[i - 1];
-        if (c.pc + e.size <= kSpuLsSize && std::memcmp(c.ls + c.pc, e.code, e.size) == 0) return e.fn;
+        if (c.pc + e.size <= kSpuLsSize && std::memcmp(c.ls + c.pc, e.code, e.size) == 0) {
+            b.pc = c.pc;
+            b.page0 = c.pc >> 12;
+            b.page1 = (c.pc + e.size - 1) >> 12;
+            b.epoch0 = c.ls_epoch[b.page0];
+            b.epoch1 = c.ls_epoch[b.page1];
+            b.fn = reinterpret_cast<void*>(e.fn);
+            return e.fn;
+        }
     }
     return nullptr;
 }
 
 SpuStep spu_run_blocks(SPUContext& c, uint64_t max_steps, uint64_t& executed) {
+    spusem::SpuFloatMode fp;
     uint64_t n = 0;
     const bool rec = g_recording.load(std::memory_order_relaxed);
     while (n < max_steps) {
         SpuStep st;
         spu_check_interrupt(c);
-        if (SpuBlockFn fn = spu_find_block(c)) {
+        // The block cache's hit here, without a call (spu_find_block was ~8% of a busy SPU).
+        const SPUContext::CachedBlock& b = c.block_cache[(c.pc >> 2) % SPUContext::kBlockCache];
+        SpuBlockFn fn = b.pc == c.pc && c.ls_epoch[b.page0] == b.epoch0 && c.ls_epoch[b.page1] == b.epoch1
+                            ? reinterpret_cast<SpuBlockFn>(b.fn)
+                            : spu_find_block(c);
+        if (fn) {
             st = fn(c, n);
         } else {
             if (rec) record(c.ls, c.pc);

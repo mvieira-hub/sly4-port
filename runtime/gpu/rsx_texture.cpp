@@ -131,21 +131,82 @@ void decode_texel(uint32_t f, const uint8_t* p, uint8_t argb[4]) {
     }
 }
 
+// Where level `l` sits in guest memory: the levels follow each other. Compressed and linear
+// levels keep the row pitch of the texture (or are packed when it has none); swizzled
+// levels are each a swizzled power-of-two image.
+struct LevelLayout {
+    uint32_t width, height, pitch, size;  // pitch: bytes per row (per block row when compressed)
+};
+LevelLayout level_layout(const Texture& t, uint32_t l) {
+    const uint32_t f = t.base_format();
+    LevelLayout g;
+    g.width = std::max(1u, t.width >> l);
+    g.height = std::max(1u, t.height >> l);
+    if (compressed(f)) {
+        const uint32_t row = ((g.width + 3) / 4) * block_bytes(f), rows = (g.height + 3) / 4;
+        g.pitch = t.linear() && t.pitch ? t.pitch : row;
+        g.size = g.pitch * (rows - 1) + row;
+        if (t.linear() && t.pitch) g.size = g.pitch * rows;
+        return g;
+    }
+    const uint32_t bpp = texel_bytes(f);
+    if (t.linear() && t.pitch) {
+        g.pitch = t.pitch;
+        g.size = t.pitch * g.height;
+    } else if (t.linear()) {
+        g.pitch = g.width * bpp;
+        g.size = g.pitch * g.height;
+    } else {
+        g.pitch = 0;
+        g.size = (1u << log2_of(g.width)) * (1u << log2_of(g.height)) * bpp;
+    }
+    return g;
+}
+
 }  // namespace
 
-uint32_t texture_source_size(const Texture& t) {
-    const uint32_t f = t.base_format();
-    if (compressed(f)) return ((t.width + 3) / 4) * ((t.height + 3) / 4) * block_bytes(f);
-    const uint32_t bpp = texel_bytes(f);
-    if (t.linear() && t.pitch) return t.pitch * (t.height ? t.height - 1 : 0) + t.width * bpp;
-    return (1u << log2_of(t.width)) * (1u << log2_of(t.height)) * bpp;
+uint32_t texture_levels(const Texture& t) {
+    uint32_t most = 1;
+    for (uint32_t s = std::max(t.width, t.height); s > 1; s >>= 1) ++most;
+    return std::clamp(t.mipmaps, 1u, std::min(most, 13u));
 }
+
+uint32_t texture_source_size(const Texture& t) {
+    uint32_t size = 0;
+    for (uint32_t l = 0, n = texture_levels(t); l < n; ++l) size += level_layout(t, l).size;
+    return size;
+}
+
+namespace {
+
+// Decodes one uncompressed level into tightly packed RGBA8.
+void decode_level(const uint8_t* src, const Texture& t, uint32_t l, const uint32_t (&src_of)[4],
+                  const uint32_t (&op_of)[4], uint8_t* dst) {
+    const uint32_t f = t.base_format(), bpp = texel_bytes(f);
+    const LevelLayout g = level_layout(t, l);
+    const uint32_t lw = log2_of(g.width), lh = log2_of(g.height);
+    uint8_t argb[4], out[4];
+    for (uint32_t y = 0; y < g.height; ++y)
+        for (uint32_t x = 0; x < g.width; ++x) {
+            const uint8_t* p = g.pitch ? src + size_t(y) * g.pitch + x * bpp : src + size_t(swizzle_index(x, y, lw, lh)) * bpp;
+            decode_texel(f, p, argb);
+            for (int i = 0; i < 4; ++i) out[i] = op_of[i] == 0 ? 0 : op_of[i] == 1 ? 255 : argb[src_of[i]];
+            uint8_t* o = dst + (size_t(y) * g.width + x) * 4;
+            o[0] = out[1];  // R
+            o[1] = out[2];  // G
+            o[2] = out[3];  // B
+            o[3] = out[0];  // A
+        }
+}
+
+}  // namespace
 
 TextureData decode_texture(const uint8_t* src, const Texture& t) {
     TextureData d;
     const uint32_t f = t.base_format();
     d.width = std::max(1u, t.width);
     d.height = std::max(1u, t.height);
+    d.levels = texture_levels(t);
     // The remap: per output channel (A, R, G, B) a source channel and an operation.
     const uint32_t remap = t.control1 & 0xFFFF;
     uint32_t src_of[4], op_of[4];
@@ -156,7 +217,15 @@ TextureData decode_texture(const uint8_t* src, const Texture& t) {
     if (compressed(f)) {
         d.format = f == DXT1 ? VK_FORMAT_BC1_RGBA_UNORM_BLOCK : f == DXT23 ? VK_FORMAT_BC2_UNORM_BLOCK
                                                                          : VK_FORMAT_BC3_UNORM_BLOCK;
-        d.bytes.assign(src, src + texture_source_size(t));
+        // Each level's blocks, rows packed (a linear texture's pitch may pad them).
+        for (uint32_t l = 0, at = 0; l < d.levels; ++l) {
+            const LevelLayout g = level_layout(t, l);
+            const uint32_t row = ((g.width + 3) / 4) * block_bytes(f), rows = (g.height + 3) / 4;
+            d.level_offset.push_back(d.bytes.size());
+            for (uint32_t r = 0; r < rows; ++r)
+                d.bytes.insert(d.bytes.end(), src + at + size_t(r) * g.pitch, src + at + size_t(r) * g.pitch + row);
+            at += g.size;
+        }
         // Channel X of the data is component: A, R, G, B -> a, r, g, b.
         const VkComponentSwizzle from[4] = {VK_COMPONENT_SWIZZLE_A, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G,
                                             VK_COMPONENT_SWIZZLE_B};
@@ -170,27 +239,20 @@ TextureData decode_texture(const uint8_t* src, const Texture& t) {
     }
     const uint32_t bpp = texel_bytes(f);
     if (!bpp) {
+        d.levels = 1;
+        d.level_offset = {0};
         d.bytes.assign(size_t(d.width) * d.height * 4, 0);
         for (size_t i = 0; i < d.bytes.size(); i += 4) d.bytes[i] = d.bytes[i + 2] = d.bytes[i + 3] = 255;
         d.ok = false;
         return d;
     }
-    const bool swizzled = !t.linear();
-    const uint32_t lw = log2_of(d.width), lh = log2_of(d.height);
-    const uint32_t pitch = t.pitch ? t.pitch : d.width * bpp;
-    d.bytes.resize(size_t(d.width) * d.height * 4);
-    uint8_t argb[4], out[4];
-    for (uint32_t y = 0; y < d.height; ++y)
-        for (uint32_t x = 0; x < d.width; ++x) {
-            const uint8_t* p = swizzled ? src + size_t(swizzle_index(x, y, lw, lh)) * bpp : src + size_t(y) * pitch + x * bpp;
-            decode_texel(f, p, argb);
-            for (int i = 0; i < 4; ++i) out[i] = op_of[i] == 0 ? 0 : op_of[i] == 1 ? 255 : argb[src_of[i]];
-            uint8_t* o = &d.bytes[(size_t(y) * d.width + x) * 4];
-            o[0] = out[1];  // R
-            o[1] = out[2];  // G
-            o[2] = out[3];  // B
-            o[3] = out[0];  // A
-        }
+    for (uint32_t l = 0, at = 0; l < d.levels; ++l) {
+        const LevelLayout g = level_layout(t, l);
+        d.level_offset.push_back(d.bytes.size());
+        d.bytes.resize(d.bytes.size() + size_t(g.width) * g.height * 4);
+        decode_level(src + at, t, l, src_of, op_of, d.bytes.data() + d.level_offset.back());
+        at += g.size;
+    }
     d.ok = true;
     return d;
 }

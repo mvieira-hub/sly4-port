@@ -3,9 +3,11 @@
 #include "check.h"
 
 #include <cmath>
+#include <cstring>
 #include <memory>
 
 #include "cpu/spu_interpreter.h"
+#include "cpu/spu_semantics.h"
 #include "spu/spu_decoder.h"
 
 using namespace sly4;
@@ -30,6 +32,7 @@ struct Spu {
                 opc = v;
                 break;
             }
+        spusem::SpuFloatMode fp;  // as SPU code runs (spu_run, spu_run_blocks)
         return spu_execute(c, spu::decode((opc << 21) | fields));
     }
     SpuStep rr(spu::Op op, int t, int a, int b) { return run(op, uint32_t(b) << 14 | uint32_t(a) << 7 | uint32_t(t)); }
@@ -152,6 +155,28 @@ TEST(spu_shufb_selb) {
     s.words(3, 0xFFFF0000, 0, 0, 0);
     s.rrr(Op::selb, 4, 1, 2, 3);  // bits of RB where the mask is set
     CHECK(s.w(4, 0) == 0x10110203 && s.w(4, 1) == 0x04050607);
+
+    // The pshufb form against the byte-by-byte reference: random data and selectors
+    // (every byte value, special ones included).
+    uint64_t x = 0x9E3779B97F4A7C15ull;
+    auto next = [&] {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        return x;
+    };
+    int same = 0;
+    for (int k = 0; k < 20000; ++k) {
+        SpuReg a, b, sel;
+        for (int i = 0; i < 2; ++i) {
+            a.d[i] = next();
+            b.d[i] = next();
+            sel.d[i] = next();
+        }
+        const SpuReg fast = spusem::shufb(a, b, sel), ref = spusem::shufb_bytes(a, b, sel);
+        same += std::memcmp(fast.b, ref.b, 16) == 0;
+    }
+    CHECK_EQ(same, 20000);
 }
 
 TEST(spu_single_float) {
@@ -174,6 +199,11 @@ TEST(spu_single_float) {
     CHECK(s.w(4, 1) == 0xFFFFFFFF && s.w(4, 0) == 0);
     s.rr(Op::fcmgt, 4, 2, 1);
     CHECK(s.w(4, 3) == 0xFFFFFFFF);
+    // A denormal result is zero too (with its sign); a NaN result is the default one.
+    s.floats(1, 1e-20f, -1e-20f, std::numeric_limits<float>::infinity(), 1.0f);
+    s.floats(2, 1e-20f, 1e-20f, 0.0f, std::nanf("7"));
+    s.rr(Op::fm, 4, 1, 2);
+    CHECK(s.w(4, 0) == 0 && s.w(4, 1) == 0x80000000u && s.w(4, 2) == 0x7FC00000u && s.w(4, 3) == 0x7FC00000u);
 
     s.floats(1, 3.7f, 1.5f, 3e9f, -1.0f);
     s.ri8(Op::cflts, 4, 1, 173);  // scale 2^0, truncate, saturate
@@ -210,6 +240,15 @@ TEST(spu_double_float) {
     CHECK(s.d(6, 0) == 1.5 && s.d(6, 1) == -2.0);
     s.rr(Op::frds, 7, 6, 0);
     CHECK(s.f(7, 0) == 1.5f && s.w(7, 1) == 0 && s.f(7, 2) == -2.0f);
+    // Double precision keeps denormals, operands and results.
+    s.c.gpr[1].f64(0) = 1e-300, s.c.gpr[2].f64(0) = 1e-10;
+    s.rr(Op::dfm, 4, 1, 2);
+    CHECK_EQ(s.d(4, 0), 1e-310);
+    s.c.gpr[1].f64(0) = 1e-310, s.c.gpr[2].f64(0) = 1.0;
+    s.rr(Op::dfceq, 4, 1, 3);  // 1e-310 == 0?
+    CHECK_EQ(s.c.gpr[4].u64(0), 0ull);
+    s.ri7(Op::dftsv, 4, 1, 0x02);  // +denormal
+    CHECK_EQ(s.c.gpr[4].u64(0), ~0ull);
     s.c.gpr[8].f64(0) = std::nan("");
     s.c.gpr[8].f64(1) = -0.0;
     s.ri7(Op::dftsv, 9, 8, 0x44);  // NaN or -0

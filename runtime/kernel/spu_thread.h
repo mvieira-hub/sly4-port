@@ -51,6 +51,8 @@ public:
 
     std::atomic<bool> running{false}, stop_requested{false};
     std::atomic<uint64_t> executed{0};  // SPU instructions run (for the summary)
+    std::atomic<uint64_t> waited_ns{0};  // time blocked in channel reads (for the summary)
+    double idle_since = 0;  // --rsx-timeline: steady ms when the current wait began
     uint32_t exit_status = 0;
 
     // SpuIo: mailboxes, signals, events.
@@ -98,6 +100,8 @@ void add_spu_thread(const std::shared_ptr<SpuThread>& t);
 // Development aid (--spu-profile): samples every SPU's PC and prints where they spend
 // their time with the summary.
 void spu_profile_start();
+// --rsx-timeline: SPUs log when they wake up after waiting more than 1 ms.
+void spu_timeline(bool on);
 void spu_profile_print();
 
 }  // namespace sly4

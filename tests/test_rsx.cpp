@@ -1,7 +1,14 @@
 // RSX: state decoding, shader translation and texture decoding (docs/GPU.md, phase 5).
 #include "check.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <map>
+#include <string>
 #include <vector>
 
 #include "core/endian.h"
@@ -30,6 +37,29 @@ TEST(rsx_vertex_program_translates) {
     CHECK(r.ok);
     CHECK(r.spirv.size() > 5);
     CHECK_EQ(r.spirv[0], 0x07230203u);  // SPIR-V magic
+}
+
+// A program with a branch becomes a loop over switch (pc): the loading-screen program with
+// a BRB after its first instruction that skips the second when branch bit 2 is set.
+TEST(rsx_vertex_program_with_branch) {
+    std::vector<uint32_t> program(512 * 4, 0);
+    std::memcpy(program.data(), kLoadingVp, 4 * 4);
+    const uint32_t brb[4] = {0, 0x11u << 27, 0, (3u << 29) | (1u << 28) | (2u << 23) | (0x1Fu << 2)};
+    std::memcpy(program.data() + 4, brb, sizeof(brb));
+    std::memcpy(program.data() + 8, kLoadingVp + 4, 5 * 4 * 4);
+    CHECK_EQ(scan_vertex_program(program.data(), 0).instructions, 7u);
+    const ShaderResult r = translate_vertex_program(program.data(), 0);
+    CHECK(r.ok);
+    bool loop = false, sw = false;
+    for (size_t i = 5; i < r.spirv.size();) {  // instructions: word count << 16 | opcode
+        const uint32_t op = r.spirv[i] & 0xFFFF, n = r.spirv[i] >> 16;
+        loop |= op == 246;  // OpLoopMerge
+        sw |= op == 251;    // OpSwitch
+        if (!n) break;
+        i += n;
+    }
+    CHECK(loop);
+    CHECK(sw);
 }
 
 // Fragment program words are stored big-endian with their halves swapped.
@@ -97,6 +127,38 @@ TEST(rsx_texture_decode) {
     CHECK_EQ(d.bytes[0], 0x10);
 }
 
+// Mipmap levels follow each other: DXT1 8x8 with 4 levels is 32 + 8 + 8 + 8 bytes; a
+// swizzled 4x4 A8R8G8B8 with 3 levels is 64 + 16 + 4.
+TEST(rsx_texture_mipmaps) {
+    Texture t{};
+    t.format = 0x86;  // DXT1
+    t.width = t.height = 8;
+    t.mipmaps = 4;
+    CHECK_EQ(texture_levels(t), 4u);
+    CHECK_EQ(texture_source_size(t), 56u);
+    std::vector<uint8_t> dxt(56);
+    for (size_t i = 0; i < dxt.size(); ++i) dxt[i] = uint8_t(i);
+    TextureData d = decode_texture(dxt.data(), t);
+    CHECK_EQ(d.levels, 4u);
+    CHECK_EQ(d.level_offset[1], 32u);
+    CHECK_EQ(d.bytes[40], 40);  // level 2 starts at byte 40
+    t.mipmaps = 20;              // more than the size allows: down to 1x1
+    CHECK_EQ(texture_levels(t), 4u);
+
+    t.format = 0x85;  // A8R8G8B8, swizzled
+    t.width = t.height = 4;
+    t.mipmaps = 3;
+    t.control1 = 0xAAE4;  // identity remap
+    CHECK_EQ(texture_source_size(t), 84u);
+    std::vector<uint8_t> px(84);
+    for (int i = 0; i < 21; ++i) store_be<uint32_t>(px.data() + 4 * i, 0xFF000000u | uint32_t(i));
+    d = decode_texture(px.data(), t);
+    CHECK_EQ(d.levels, 3u);
+    CHECK_EQ(d.level_offset[1], 64u);      // 4x4 RGBA8 level 0
+    CHECK_EQ(d.bytes[64 + 2], 16);         // level 1 texel (0,0): the 17th word, blue byte
+    CHECK_EQ(d.bytes[d.level_offset[2] + 2], 20);  // level 2, 1x1
+}
+
 TEST(rsx_state_decoders) {
     State s;
     s.set(nv4097::SetSurfaceFormat, 0x090A0148);
@@ -123,4 +185,46 @@ TEST(rsx_state_decoders) {
     CHECK(t.linear());
     CHECK_EQ(t.width, 192u);
     CHECK_EQ(t.height, 104u);
+}
+
+// Every program of the game's Shaders.Zip (the .ucode files tools/cgbin_info.py extracts
+// to work/shaders; path in SLY4_SHADERS) goes through the translators. Skipped without them.
+TEST(rsx_game_shaders_translate) {
+    const char* dir = std::getenv("SLY4_SHADERS");
+    if (!dir || !std::filesystem::is_directory(dir)) SKIP("defina SLY4_SHADERS com a pasta work/shaders");
+    int vps = 0, fps = 0;
+    std::map<std::string, int> errors;  // message -> count
+    for (const auto& e : std::filesystem::directory_iterator(dir)) {
+        const std::string name = e.path().filename().string();
+        const bool vp = name.size() > 10 && name.compare(name.size() - 10, 10, ".vpo.ucode") == 0;
+        const bool fp = name.size() > 10 && name.compare(name.size() - 10, 10, ".fpo.ucode") == 0;
+        if (!vp && !fp) continue;
+        std::ifstream f(e.path(), std::ios::binary);
+        std::vector<uint8_t> code((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        ShaderResult r;
+        if (vp) {
+            ++vps;
+            std::vector<uint32_t> program(512 * 4, 0);
+            for (size_t i = 0; i + 4 <= code.size() && i / 4 < program.size(); i += 4) program[i / 4] = load_be<uint32_t>(&code[i]);
+            r = translate_vertex_program(program.data(), 0);
+        } else {
+            ++fps;
+            const FragmentProgramInfo info = scan_fragment_program(code.data(), uint32_t(code.size()));
+            FragmentProgramKey key;
+            for (uint32_t& d : key.texture_dims) d = 2;
+            r = translate_fragment_program(code.data(), info, key);
+        }
+        if (!r.ok) {
+            if (++errors[r.error] <= 2) std::printf("    %s: %s\n", name.c_str(), r.error.c_str());
+        }
+    }
+    int failed = 0;
+    for (const auto& [msg, n] : errors) {
+        std::printf("    %4d x %s\n", n, msg.c_str());
+        failed += n;
+    }
+    std::printf("    %d VPs, %d FPs, %d sem tradução\n", vps, fps, failed);
+    CHECK_EQ(vps, 326);
+    CHECK_EQ(fps, 215);
+    CHECK_EQ(failed, 0);
 }

@@ -24,11 +24,12 @@ enum Op : uint16_t {
     OpCompositeExtract = 81, OpCompositeInsert = 82, OpImageSampleImplicitLod = 87, OpImageSampleExplicitLod = 88,
     OpImageSampleProjImplicitLod = 91, OpConvertFToS = 110, OpConvertSToF = 111, OpBitcast = 124,
     OpFNegate = 127, OpIAdd = 128, OpFAdd = 129, OpFSub = 131, OpFMul = 133, OpFDiv = 136, OpFMod = 141,
-    OpVectorTimesScalar = 142, OpDot = 148, OpAny = 154, OpAll = 155, OpLogicalOr = 166, OpLogicalAnd = 167,
-    OpLogicalNot = 168, OpSelect = 169, OpIEqual = 170, OpSLessThan = 177, OpFOrdEqual = 180,
-    OpFOrdNotEqual = 182, OpFUnordNotEqual = 183, OpFOrdLessThan = 184, OpFOrdGreaterThan = 186,
-    OpFOrdLessThanEqual = 188, OpFOrdGreaterThanEqual = 190, OpDPdx = 207, OpDPdy = 208, OpSelectionMerge = 247,
-    OpLabel = 248, OpBranch = 249, OpBranchConditional = 250, OpKill = 252, OpReturn = 253,
+    OpISub = 130, OpVectorTimesScalar = 142, OpDot = 148, OpAny = 154, OpAll = 155, OpLogicalOr = 166,
+    OpLogicalAnd = 167, OpLogicalNot = 168, OpSelect = 169, OpIEqual = 170, OpINotEqual = 171, OpSGreaterThan = 173,
+    OpSLessThan = 177, OpFOrdEqual = 180, OpFOrdNotEqual = 182, OpFUnordNotEqual = 183, OpFOrdLessThan = 184,
+    OpFOrdGreaterThan = 186, OpFOrdLessThanEqual = 188, OpFOrdGreaterThanEqual = 190, OpShiftRightLogical = 194,
+    OpBitwiseAnd = 199, OpDPdx = 207, OpDPdy = 208, OpLoopMerge = 246, OpSelectionMerge = 247, OpLabel = 248,
+    OpBranch = 249, OpBranchConditional = 250, OpSwitch = 251, OpKill = 252, OpReturn = 253,
 };
 enum StorageClass : uint32_t { UniformConstant = 0, Input = 1, Uniform = 2, Output = 3, Private = 6, Function = 7 };
 enum Decoration : uint32_t {
@@ -42,7 +43,7 @@ enum Dim : uint32_t { Dim1D = 0, Dim2D = 1, Dim3D = 2, DimCube = 3 };
 enum ImageOperand : uint32_t { Bias = 1, Lod = 2, Grad = 4 };
 enum Glsl : uint32_t {
     Round = 1, Trunc = 3, FAbs = 4, FSign = 6, Floor = 8, Ceil = 9, Fract = 10, Sin = 13, Cos = 14, Pow = 26,
-    Exp2 = 29, Log2 = 30, Sqrt = 31, InverseSqrt = 32, FMin = 37, FMax = 40, FClamp = 43, FMix = 46,
+    Exp2 = 29, Log2 = 30, Sqrt = 31, InverseSqrt = 32, FMin = 37, FMax = 40, FClamp = 43, SClamp = 45, FMix = 46,
     Normalize = 69,
 };
 

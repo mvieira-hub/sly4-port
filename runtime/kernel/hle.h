@@ -10,8 +10,10 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -55,7 +57,24 @@ public:
     void ring(const char* thread, const char* name, uint64_t r3, uint64_t r4, uint32_t lr);
     void print_ring(size_t last) const;
 
+    // --call-times: wall time spent inside each HLE function and syscall, per thread, to
+    // see what threads wait on.
+    bool timing = false;
+    void add_time(const char* thread, const char* name, uint64_t ns);
+    // --thread-timeline NAME: every call of that thread with the absolute time; repeated
+    // calls from the same site (polling loops) are folded into one line.
+    std::string timeline_thread;
+    void timeline(const char* thread, const char* what, std::chrono::steady_clock::time_point t0);
+    void print_times() const;
+
 private:
+    struct Timed {
+        uint64_t calls = 0, ns = 0;
+    };
+    mutable std::mutex time_lock_;
+    std::map<std::pair<std::string, std::string>, Timed> times_;
+    std::chrono::steady_clock::time_point time_start_ = std::chrono::steady_clock::now();
+
     mutable std::mutex lock_;
     std::unordered_set<uint32_t> seen_;
     std::vector<std::string> sequence_;

@@ -1,6 +1,7 @@
 #include "cpu/guest_atomic.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 
@@ -122,7 +123,9 @@ void debug_line_log(GuestMemory& mem, GuestAddr line, const uint8_t* before, con
         if (a != b) n += std::snprintf(changes + n, sizeof(changes) - size_t(n), " +%02X:%08X->%08X", 4 * w, a, b);
     }
     changes[n] = 0;
-    SLY4_INFO("linha 0x%08X: %s (pc 0x%05X)%s", line, who, pc, n ? changes : " sem mudança");
+    // Absolute steady-clock milliseconds: the same clock as the RSX's --rsx-timeline.
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    SLY4_INFO("%10.3f ms linha 0x%08X: %s (pc 0x%05X)%s", ms, line, who, pc, n ? changes : " sem mudança");
 }
 
 }  // namespace sly4

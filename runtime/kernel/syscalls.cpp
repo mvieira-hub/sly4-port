@@ -265,10 +265,19 @@ void syscall_dispatch(PPUContext& c, GuestMemory& m) {
                       e && e->fn ? "" : "  [sem implementação: CELL_OK]");
         log.record(line);
     }
+    const auto t0 = log.timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (e && e->fn)
         e->fn(c, m);
     else
         c.gpr[3] = CELL_OK;
+    if (log.timing) {
+        const PpuThread* th = current_thread();
+        char where[96];  // per call site: the same syscall polls different things
+        std::snprintf(where, sizeof(where), "%s@%08X", e && e->name ? e->name : "syscall ?", c.cia - 4);
+        log.timeline(th ? th->name.c_str() : "?", where, t0);
+        log.add_time(th ? th->name.c_str() : "?", where,
+                     uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()));
+    }
 }
 
 std::vector<SyscallStat> syscall_stats() {

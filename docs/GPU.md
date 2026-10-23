@@ -6,9 +6,11 @@ O RSX é a GPU do PS3. O jogo não fala com ela diretamente. Ele monta *command 
 |---|---|
 | 5a. `cellGcm` mínimo e "RSX nulo": o FIFO é consumido sem desenhar, para o jogo seguir | **Concluída** (2026-10-22) |
 | 5b. Rastreador de estado do RSX (registradores dos métodos NV4097) e módulo `runtime/rsx` | **Concluída** (2026-10-22) |
-| 5c. *Vertex fetch*, texturas e *render targets* em Vulkan | Em andamento: o básico funciona (tela de carregamento) |
-| 5d. Tradutor de *shaders* VP/FP → SPIR-V | Em andamento: sem desvios nem laços |
-| 5e. *Flip* para a *swapchain* e comparação com o RPCS3 | Em andamento: *flip* e quadros em PNG funcionam |
+| 5c. *Vertex fetch*, texturas e *render targets* em Vulkan | **Concluída para o menu** (2026-10-22): superfícies coerentes com a memória, cópias 2D na GPU, *mipmaps*, *culling* |
+| 5d. Tradutor de *shaders* VP/FP → SPIR-V | **Concluída para os 541 programas do jogo** (2026-10-22): desvios de VP; nenhum FP usa desvios ou laços |
+| 5e. *Flip* para a *swapchain* e comparação com o RPCS3 | Janela e PNG funcionam; falta a comparação quadro a quadro com o RPCS3 |
+
+**Saída da fase:** a splash da Sanzaru, a tela de título e o menu principal aparecem corretos (conferidos pelos PNGs). Falta só a comparação com o RPCS3 para fechar a 5e.
 
 ## 5a. cellGcm mínimo e RSX nulo
 
@@ -63,22 +65,49 @@ Código em `runtime/gpu` (`rsx_vk.cpp`, `rsx_vp.cpp`, `rsx_fp.cpp`, `spirv.cpp`,
 - **Vertex program (NV40):** quatro palavras por instrução, com a operação vetorial e a escalar executadas juntas. A soma usa `src0 + src2` e as escalares usam `src2.x`. Há escrita mascarada e condicional pelos códigos de condição, saturação e registradores de endereço para constantes indexadas.
   - O formato dos campos foi conferido contra o *vertex program* real do jogo.
   - A transformação de *viewport* do RSX (escala e deslocamento) é feita no próprio *shader*, e o *viewport* do Vulkan cobre a superfície inteira.
+  - **Desvios** (BRA, BRI, BRB, CAL, CLI, CLB, RET), como no RPCS3: um programa que os tenha vira um laço sobre `switch (pc)`, com um `case` por instrução.
+    - Cada desvio escolhe o próximo `pc` com `OpSelect`: pelos códigos de condição, ou, em BRB/CLB, pelo bit `SET_TRANSFORM_BRANCH_BITS` (que vai no *uniform buffer*).
+    - CAL/CLB empilham o retorno numa pilha de 8 níveis, e RET desempilha ou termina o programa.
+    - Um contador encerra laços sem fim.
+    - Sem desvios, o programa continua linear.
 - **Fragment program (NV40):** palavras com as metades trocadas e constantes *inline* depois da instrução que as usa.
   - Essas constantes são lidas da memória a cada *draw*, porque o jogo as remenda no lugar, e vão num *uniform buffer*; o código traduzido é guardado pelo *hash* das instruções sem as constantes.
-  - Cobre registradores R e H, códigos de condição, execução condicional, escala, saturação, texturas 2D/3D/cubo, KIL e o *alpha test* do RSX.
-  - Ainda não traduz desvios nem laços; um programa que os use é deixado de lado, com aviso.
+  - Cobre registradores R e H, códigos de condição, execução condicional, escala, saturação, texturas 2D/3D/cubo, KIL, FENCT/FENCB e o *alpha test* do RSX.
+  - Não traduz desvios nem laços, mas nenhum FP do jogo os usa.
+- **Os 541 programas do jogo** (`Shaders.Zip`, extraídos por `tools/cgbin_info.py` para `work/shaders`) passam todos pelos tradutores: o teste `rsx_game_shaders_translate`, com `SLY4_SHADERS=work\shaders`, dá **326 VPs e 215 FPs, nenhum sem tradução**.
 
 **Vértices.** Cada atributo é convertido para float4 na CPU, a partir dos formatos do RSX (float, half, inteiros normalizados, *bytes*, CMP), e um atributo sem *array* usa o valor constante. Os índices de 16 e 32 bits viram 32 bits. Os primitivos que o Vulkan não tem (quads, *line loop*) viram listas de índices.
 
-**Texturas.** Os formatos de 8, 16 e 32 bits são decodificados na CPU (linear ou *swizzled*), com o *remap* do registrador CONTROL1, para RGBA8. DXT1/3/5 vão direto como BC1/2/3, com o *remap* no *swizzle* da *view*. Uma textura é reenviada quando o *hash* dos seus bytes muda. Por enquanto só o nível 0.
+**Texturas.** Os formatos de 8, 16 e 32 bits são decodificados na CPU (linear ou *swizzled*), com o *remap* do registrador CONTROL1, para RGBA8. DXT1/3/5 vão direto como BC1/2/3, com o *remap* no *swizzle* da *view*.
+- **Mipmaps:** todos os níveis que o formato declara, um depois do outro na memória. DXT e lineares mantêm o *pitch*; as *swizzled* têm cada nível com seu próprio *swizzle*. O *sampler* usa o filtro de *mipmap* do registrador FILTER.
+- **Detecção de mudança:** uma textura é reenviada quando o *hash* dos seus bytes muda. O *hash* é feito no máximo uma vez por quadro, de 8 em 8 bytes; as escritas do próprio RSX na memória o refazem. Antes, o FNV byte a byte a cada *draw* era 40% da thread do RSX no menu.
 
-**Estado fixo.** *Blend*, máscara de cor, profundidade e *stencil* entram na chave do *pipeline*. *Viewport*, *scissor*, cor de *blend* e referência de *stencil* são dinâmicos. O *culling* fica desligado até a orientação das faces ser conferida.
+**Superfícies e memória (coerência).** O que a GPU desenha e o que a CPU escreve ficam coerentes nos dois sentidos:
+- uma superfície desenhada fica marcada `gpu_dirty`. Antes de o RSX ler ou sobrescrever aquela memória com a CPU (cópias 2D), ela é lida de volta (`flush`, só para os formatos de 32 bits);
+- uma superfície em que a CPU escreveu fica `cpu_dirty` e é reenviada antes de a GPU usá-la de novo (como alvo, textura ou no *flip*).
+- **Cópias escaladas NV3089 na GPU:** quando a origem é uma superfície, a cópia vira um `vkCmdBlitImage`, sem passar pela memória.
+  - A superfície pode conter o endereço em vez de começar nele: o NV3089 copia faixas de no máximo 1024 colunas.
+  - Um destino na memória principal ganha uma superfície-sombra. O jogo guarda o *display buffer* em `0x31E00000` e o copia de volta a cada quadro.
+  - Sem isso, do vídeo em diante a imagem saía toda preta: as cópias liam memória que nunca recebia o que a GPU desenhara.
+- Uma textura menor que a superfície no mesmo endereço amostra só o retângulo dela (uma cópia), não a superfície inteira.
 
-***Flip* (5e).** No *flip*, a superfície do *display buffer* (ou, se nada foi desenhado ali, a memória que a CPU deixou) é copiada para uma imagem "da frente". A janela mostra essa imagem escalada, mantendo a proporção. A *swapchain* agora é UNORM, porque o PS3 já entrega valores com gama.
+**Estado fixo.** *Blend*, máscara de cor, profundidade, *stencil* e *culling* entram na chave do *pipeline*. *Viewport*, *scissor*, cor de *blend* e referência de *stencil* são dinâmicos.
+- **Culling:** SET_CULL_FACE e SET_FRONT_FACE, sem espelhar a orientação. Conferido nos dois sentidos: com a orientação invertida, a van e o logo da tela de título saem do avesso.
+
+***Flip* (5e).** No *flip*, a superfície do *display buffer* é copiada para uma imagem "da frente" (se nada foi desenhado ali, usa a memória que a CPU deixou). A janela mostra essa imagem escalada, mantendo a proporção. A *swapchain* é UNORM, porque o PS3 já entrega valores com gama.
+
+**Salto para si mesmo no FIFO.** A `libgcm` faz o RSX "esperar" saltando para o próprio endereço até o PPU reescrever aquela palavra. A thread do RSX girava nesse salto a toda velocidade: eram bilhões de "comandos" e um núcleo do host ocupado. Agora ela espera 20 µs por volta, e o resumo conta essas esperas à parte.
 
 **Sem janela.** `sly4.exe ... --no-window --render` renderiza com o Vulkan sem janela, e `--dump-frames pasta,N` grava um PNG a cada N quadros (`core/png.h`). Foi assim que a primeira imagem foi conferida: a tela de carregamento com a máscara do Sly, correta, com todos os 547 *draws* dos primeiros 40 s desenhados, 6 programas traduzidos e 4 *pipelines*.
 
-**Testes** (`test_rsx.cpp`): a tradução do *vertex program* real do jogo, um *fragment program* com constante *inline*, a decodificação de textura (linear, *swizzled* e *remap*) e os decodificadores de estado.
+**Com janela.** O caminho com janela também foi conferido: *swapchain* 1280×720 em FIFO, o jogo rodando sem erro. A janela não abria por um `||` no lugar de `|` nos *flags* do `SDL_CreateWindow`.
+
+**Testes** (`test_rsx.cpp`):
+- a tradução do *vertex program* real do jogo e de um com desvio (laço com `switch`);
+- um *fragment program* com constante *inline*;
+- a decodificação de textura (linear, *swizzled*, *remap*) e o *layout* dos *mipmaps*;
+- os decodificadores de estado;
+- com `SLY4_SHADERS`, os 541 *shaders* do jogo.
 
 ## O boot até o vídeo e depois dele
 
@@ -89,11 +118,68 @@ Três correções levaram o jogo do carregamento ao vídeo de abertura e além:
 
 Também: o tradutor de *fragment program* aceita FENCT/FENCB (barreiras, sem cálculo), o que reduziu os *draws* descartados de 42.915 para 750.
 
-Em 120 s, o jogo passa do vídeo da Sanzaru e desenha cenas 3D: 336 mil *draws*, 306 milhões de vértices, 39 programas traduzidos.
+## Até o menu principal
+
+Com a coerência entre superfícies e memória, o jogo mostra, em ordem:
+1. a tela de carregamento;
+2. "Sony Computer Entertainment presents";
+3. o vídeo da Sanzaru (os três macacos e o logo);
+4. a tela de título com a van em 3D e "Press START button";
+5. o **menu principal** (New Game, Load Game, Cross-Save, Options, Extras).
+
+Para passar do título sem janela, `--press start@40,start@42` aperta botões do controle em segundos dados da execução, cada aperto por 250 ms. É um roteiro de teste; a entrada de verdade é a Fase 6.
+
+```powershell
+.\build\mingw-release\sly4.exe --game PS3_GAME --no-window --render --dump-frames work\frames,120 --seconds 100 --press start@40,start@42 --firmware work\firmware
+```
+
+No menu: nenhum *draw* descartado, 41 programas e 39 *pipelines*.
+
+O código SPU novo do vídeo e do menu foi gravado na cache SPU e compilado ([SPU.md](SPU.md), 4e). Eram 15.430 blocos que rodavam no interpretador; agora são 45.674 blocos compilados.
 
 ### O que falta
 
-- **Do vídeo em diante a imagem sai preta.** A hipótese mais forte: a imagem final chega ao *display buffer* por cópias escaladas NV3089, quase uma por *flip*. Essas cópias rodam na CPU e leem a origem da memória do convidado, mas a origem é uma superfície desenhada no Vulkan, que nunca volta para a memória. Falta tornar as cópias 2D coerentes com o cache de superfícies (fazer a cópia na GPU quando a origem for uma superfície, ou ler a superfície de volta antes).
-- O FIFO do RSX conta bilhões de "comandos" num quadro: algum laço (provavelmente a espera de um semáforo) conta voltas como comandos. Conferir.
-- *Vertex programs* com desvios (operação escalar 0x11, BRB) e os desvios e laços nos *fragment programs*; *mipmaps*, MRT, *culling* e a comparação quadro a quadro com o RPCS3.
-- A apresentação na janela foi escrita, mas só o caminho sem janela foi conferido (pelos PNGs).
+- **Desempenho:** o menu roda a ~41–47 quadros/s (ver abaixo), acima dos 30 que o jogo mira.
+- A comparação quadro a quadro com o RPCS3 (5e).
+- MRT, desvios e laços em *fragment programs*, e superfícies de 16 bits e de ponto flutuante na coerência com a memória: nada disso aparece até o menu.
+
+## Desempenho do menu: de ~2 para ~41–47 quadros/s
+
+O critério foi medir antes de mexer. As ferramentas desta etapa:
+- `--call-times`: tempo dentro de cada chamada HLE e de sistema, por thread e por local de chamada;
+- `--ppu-profile NOME`: amostragem de onde uma thread roda no `sly4.exe`, também para `RSX` e `SPU1`–`SPU6`, com a parte fora do executável separada por DLL;
+- `--rsx-timeline`: as esperas longas do RSX, os *labels* e os *flips*, com o mesmo relógio absoluto do `--watch-line`, e cada SPU que acordou depois de mais de 1 ms parada;
+- `--thread-timeline NOME`: as chamadas da thread PPU `NOME` com tempo absoluto (as de mesmo local em sequência viram uma linha);
+- no resumo: o tempo da thread do RSX por categoria, os saltos para si mais esperados e o tempo de cada SPU esperando em canais.
+
+O caminho de um quadro no menu:
+1. o `main_thread` lança *jobs* SPU (geometria EDGE e outros) e espera por eles com `usleep(300)` em laço;
+2. os *jobs* escrevem comandos do RSX e desfazem os saltos para si em que o RSX espera;
+3. o RSX escreve o *label* 0x40, que o `main_thread` espera para começar o próximo quadro.
+
+O que limitava, em ordem:
+
+| Medida | Antes | Depois |
+|---|---|---|
+| *Hash* de texturas a cada *draw* (FNV byte a byte, 40% do RSX) | uma vez por quadro, 8 bytes por vez | ~2 → ~8 quadros/s, junto com as cópias 2D na GPU |
+| Leitura da GPU para a memória a cada cópia NV3089 (2 por quadro) | cópia na GPU, com superfície-sombra na memória principal | (idem) |
+| Espera pela GPU em cada liberação de semáforo (~23 por quadro) | sem espera: os dados já foram copiados no *draw* | — |
+| `sys_timer_usleep` acordando 0,2–0,3 ms atrasado | espera curta termina com *spin* até o prazo | — |
+| **Semânticas SPU fora de linha** nos blocos gerados (44% de um SPU) | `always_inline` | inflate 7,3 → 6,5 s |
+| `shufb` byte a byte, *load*/*store* de quadword byte a byte, `ftz` com desvios | `pshufb` (SSE4.1), duas inversões de 64 bits, `ftz` sem desvios | inflate 6,5 → 3,9 s; **menu ~8,6 → ~23 quadros/s** |
+| `memcmp` do código de cada bloco SPU a cada entrada (~10% de um SPU) | cache de blocos por SPU, validado por épocas das páginas de 4 KiB do *local store* | menu ~23 → ~26–28 quadros/s, com os demais desta linha |
+| DMA com `memcpy` (o RSX via às vezes um comando de salto escrito pela metade) | `dma_copy` com *stores* alinhados de 16 bytes; o RSX tenta de novo um salto inválido | (correção) |
+| Filtro de denormais e NaN em cada operando e resultado de `fm`/`fma` (~25 instruções x86 cada) | DAZ/FTZ do MXCSR em volta do código SPU (`SpuFloatMode`); só o NaN do resultado é normalizado; precisão dupla continua IEEE (`IeeeDoubles`) | **menu ~26–28 → ~41–47 quadros/s**, com os três abaixo |
+| Laços elemento a elemento na ordem do convidado: o GCC invertia as *lanes* antes e depois de cada `ori`, `ai`, `fm`... | laços do último elemento ao primeiro (a ordem da memória do host) | (idem) |
+| Lógica de 128 bits (`and`, `selb`...) e deslocamentos por bytes (`shlqbyi`, `rotqby`...) em pares de registradores inteiros | SSE, e `pshufb` com máscaras de uma tabela | (idem) |
+| *Load*/*store* de quadword com duas inversões de 64 bits; busca do bloco seguinte numa chamada | um `pshufb`; acerto do cache de blocos sem chamada | (idem) |
+
+Dois cuidados que vieram junto:
+- **Memória da compilação.** Com o *inline* forçado, cada arquivo de blocos SPU precisa de alguns GiB para compilar. Um *pool* do Ninja limita esses arquivos a 4 por vez (`CMakeLists.txt`); o *build* completo leva ~30 min.
+- **Aliasing.** Com tudo *inline*, o diferencial SPU achou 123 casos errados. A causa: o `SpuReg` é uma *union* lida e escrita por referências a membros de tipos diferentes (`u32()`/`f32()`), e com *strict aliasing* o GCC supôs que não se sobrepunham. Um `fnms` lia um registrador de antes do `iohl` que o completava. O projeto agora compila com `-fno-strict-aliasing`, e o diferencial voltou a dar 700.328 casos iguais.
+
+Mais dois cuidados desta última rodada:
+- **`x * 1.0` some.** Quando o `1.0` (ou `-1.0`) vem de um `ilhu` do mesmo bloco, o GCC troca a multiplicação por `x` (ou `-x`), e um operando denormal passa sem virar zero. O diferencial pegou 25 casos. `-fsignaling-nans` proíbe essa troca, nos blocos gerados e no interpretador.
+- **Onde o modo vale.** `spu_run`, `spu_run_blocks`, o `sly4_spudiff`, o oráculo e os testes das semânticas ligam o `SpuFloatMode`. O diferencial (700 mil casos, com registradores aleatórios, cheios de denormais e NaN) e o oráculo continuam iguais.
+
+Como estava antes desta rodada (~26–28 quadros/s), cada SPU passava ~45% do tempo parada esperando. O quadro era limitado pela cadeia de *jobs*, um depois do outro, e não pela soma do trabalho. Por isso acelerar cada instrução SPU encurtou o quadro quase na mesma proporção.

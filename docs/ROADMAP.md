@@ -418,12 +418,12 @@ Plano da fase:
 - Catálogo de quem usa o quê: EDGE (geometria e zlib), Havok, SCREAM e mp3, Bink.
 - **Saída:** os jobs `edgezlib` descomprimem o conteúdo de uma fase com resultado idêntico ao do `psarc.py`/`san2gltf.py`, e as threads de áudio e física rodam sem travar.
 
-### Fase 5: RSX → Vulkan (8–14 semanas) — **em andamento**
+### Fase 5: RSX → Vulkan (8–14 semanas) — **saída alcançada; falta a comparação com o RPCS3**
 
 Andamento em [GPU.md](GPU.md):
 - **5a, `cellGcm` mínimo e RSX nulo (concluída):** memória local, mapa de IO, buffer de comandos em fragmentos com o *callback* de contexto, *labels*, *reports* e VBlank; uma thread consome o FIFO (saltos, chamadas, semáforos, *reports*, *flip*) sem desenhar. O jogo passa do `cellGcmInit` e vira quadros na tela de carregamento.
 - **5b, rastreador de estado (concluída):** o RSX virou o módulo `runtime/rsx`: banco de registradores, memória do *vertex program* e das constantes, cópias 2D na CPU e captura de quadros com os nomes dos métodos.
-- **5c–5e, renderizador Vulkan (em andamento):** superfícies como imagens Vulkan, *vertex* e *fragment programs* traduzidos direto para SPIR-V, vértices e texturas convertidos da memória do jogo, *flip* para a janela ou para PNG. A tela de carregamento sai correta. O boot não trava mais (a trava era um `putllc` apagando escritas comuns do PPU), o vídeo de abertura roda a ~60 *flips*/s e o jogo segue desenhando cenas 3D, mas do vídeo em diante a imagem sai preta: falta a coerência entre as cópias 2D e as superfícies do Vulkan.
+- **5c–5e, renderizador Vulkan (menu alcançado, 2026-10-22):** superfícies como imagens Vulkan coerentes com a memória (leitura de volta antes das cópias 2D da CPU, reenvio do que a CPU escreveu, cópias NV3089 na GPU), *vertex* e *fragment programs* traduzidos direto para SPIR-V (os 541 do jogo traduzem, com desvios de VP), *mipmaps*, *culling* e *flip* para a janela ou para PNG. O jogo mostra, corretos, a tela de carregamento, a splash da Sanzaru, a tela de título e o menu principal (com `--press start@40,start@42`). O menu roda a ~41–47 quadros/s (era ~2; ver GPU.md, "Desempenho do menu"). Falta a comparação com o RPCS3.
 
 Plano da fase:
 - `cellGcm` em HLE e consumidor do FIFO com rastreador de estado.

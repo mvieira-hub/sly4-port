@@ -41,6 +41,10 @@ struct Insn {
     uint32_t sca_dst_tmp() const { return (d3 >> 7) & 0x3F; }
     bool vec_mask(int i) const { return (d3 >> (16 - i)) & 1; }  // x bit 16 ... w bit 13
     bool sca_mask(int i) const { return (d3 >> (20 - i)) & 1; }  // x bit 20 ... w bit 17
+    // Branches: target instruction (absolute in the program memory), BRB/CLB bit and sense.
+    uint32_t branch_target() const { return (((d0 >> 23) & 1) << 9) | ((d2 & 0x3F) << 3) | (d3 >> 29); }
+    uint32_t branch_index() const { return (d3 >> 23) & 0x1F; }
+    bool brb_cond_true() const { return (d3 >> 28) & 1; }
     // Sources (17 bits each).
     uint32_t src(int i) const {
         switch (i) {
@@ -64,6 +68,13 @@ Insn fetch(const uint32_t* program, uint32_t i) {
     const uint32_t* p = program + 4 * (i % kVpSlots);
     return {p[0], p[1], p[2], p[3]};
 }
+
+bool is_branch(uint32_t sop) {
+    return sop == S_BRA || sop == S_BRI || sop == S_CAL || sop == S_CLI || sop == S_RET || sop == S_BRB ||
+           sop == S_CLB;
+}
+
+constexpr uint32_t kCallDepth = 8;
 
 }  // namespace
 
@@ -171,10 +182,23 @@ ShaderResult translate_vertex_program(const uint32_t* program, uint32_t start) {
         return val;
     };
 
+    // The instructions, from start to the one with the end flag; whether any branches.
+    uint32_t last = start;
+    bool branches = false;
     for (uint32_t i = start; i < start + kVpSlots; ++i) {
+        const Insn in = fetch(program, i);
+        branches |= is_branch(in.sca_op());
+        last = i;
+        if (in.end()) break;
+    }
+
+    // One instruction: computes and writes its results. Returns false (with r.error) for
+    // what is not translated. Branch operations only produce `taken` (their condition).
+    auto emit = [&](uint32_t i, Id& taken) -> bool {
         const Insn in = fetch(program, i);
         const uint32_t vop = in.vec_op(), sop = in.sca_op();
         Id vres = 0, sres = 0;
+        taken = 0;
         auto s0 = [&] { return source(in, 0); };
         auto s1 = [&] { return source(in, 1); };
         auto s2 = [&] { return source(in, 2); };
@@ -214,11 +238,31 @@ ShaderResult translate_vertex_program(const uint32_t* program, uint32_t start) {
                 char e[64];
                 std::snprintf(e, sizeof(e), "VP: operação vetorial 0x%X sem tradução (instrução %u)", vop, i - start);
                 r.error = e;
-                return r;
+                return false;
             }
         }
         switch (sop) {
             case S_NOP: break;
+            case S_BRA: case S_BRI: case S_CAL: case S_CLI: case S_RET: {
+                // Taken when any selected condition-code component passes (TR: always).
+                if (in.cond() == 7) {
+                    taken = b.c_bool(true);
+                } else {
+                    const Id c = b.op(spv::OpLoad, v.v4, {cc[in.cond_reg()]});
+                    taken = b.op(spv::OpAny, v.bl, {v.cond_test(in.cond(), v.swizzle(c, in.cond_swz(0), in.cond_swz(1),
+                                                                                      in.cond_swz(2), in.cond_swz(3)))});
+                }
+                break;
+            }
+            case S_BRB: case S_CLB: {  // on bit branch_index of SET_TRANSFORM_BRANCH_BITS
+                const Id u32 = b.t_uint();
+                const Id target = b.op(spv::OpLoad, v.v4, {b.op(spv::OpAccessChain, pu4, {ubo, b.c_int(3)})});
+                const Id bits = b.op(spv::OpBitcast, u32, {v.comp(target, 2)});
+                const Id bit = b.op(spv::OpBitwiseAnd, u32,
+                                    {b.op(spv::OpShiftRightLogical, u32, {bits, b.c_uint(in.branch_index())}), b.c_uint(1)});
+                taken = b.op(in.brb_cond_true() ? spv::OpINotEqual : spv::OpIEqual, v.bl, {bit, b.c_uint(0)});
+                break;
+            }
             case S_MOV: sres = v.comp(s2(), 0); break;
             case S_RCP: sres = v.fdiv(b.c_float(1), v.comp(s2(), 0)); break;
             case S_RCC: {
@@ -259,7 +303,7 @@ ShaderResult translate_vertex_program(const uint32_t* program, uint32_t start) {
                 char e[64];
                 std::snprintf(e, sizeof(e), "VP: operação escalar 0x%X sem tradução (instrução %u)", sop, i - start);
                 r.error = e;
-                return r;
+                return false;
             }
         }
         // Scalar results are replicated (EXP/LOG/LIT already give a vector).
@@ -294,7 +338,92 @@ ShaderResult translate_vertex_program(const uint32_t* program, uint32_t start) {
             if (in.sca_dst_tmp() != 0x3F) write(temps[in.sca_dst_tmp()], svec, m[0], m[1], m[2], m[3]);
             if (!in.vec_result() && in.dst() != 0x1F) write(outs[in.dst() & 15], svec, m[0], m[1], m[2], m[3]);
         }
-        if (in.end()) break;
+        return true;
+    };
+
+    if (!branches) {
+        for (uint32_t i = start; i <= last; ++i) {
+            Id taken;
+            if (!emit(i, taken)) return r;
+        }
+    } else {
+        // Arbitrary jumps, as RPCS3 does: a loop over switch (pc), one case per instruction.
+        // Branches pick the next pc with OpSelect; CAL/CLB push the return address on a small
+        // stack, RET pops it (or ends the program when it is empty).
+        const Id pint = b.t_pointer(spv::Function, v.i32), pbool = b.t_pointer(spv::Function, v.bl);
+        const Id stack_t = b.t_array(v.i32, kCallDepth);
+        const Id pc = b.local(pint), done = b.local(pbool), sp = b.local(pint), guard = b.local(pint);
+        const Id stack = b.local(b.t_pointer(spv::Function, stack_t));
+        b.op_void(spv::OpStore, {pc, b.c_int(int32_t(start))});
+        b.op_void(spv::OpStore, {done, b.c_bool(false)});
+        b.op_void(spv::OpStore, {sp, b.c_int(0)});
+        b.op_void(spv::OpStore, {guard, b.c_int(0)});
+        const Id header = b.fresh_id(), body = b.fresh_id(), cont = b.fresh_id(), merge = b.fresh_id(),
+                 sw_merge = b.fresh_id(), dflt = b.fresh_id();
+        std::vector<Id> cases;
+        for (uint32_t i = start; i <= last; ++i) cases.push_back(b.fresh_id());
+        b.op_void(spv::OpBranch, {header});
+        b.op_void(spv::OpLabel, {header});
+        b.op_void(spv::OpLoopMerge, {merge, cont, 0});
+        b.op_void(spv::OpBranch, {body});
+        b.op_void(spv::OpLabel, {body});
+        const Id pcv = b.op(spv::OpLoad, v.i32, {pc});
+        b.op_void(spv::OpSelectionMerge, {sw_merge, 0});
+        std::vector<uint32_t> sw{pcv, dflt};
+        for (uint32_t i = start; i <= last; ++i) {
+            sw.push_back(i);
+            sw.push_back(cases[i - start]);
+        }
+        b.op_void(spv::OpSwitch, sw);
+        auto stack_slot = [&](Id index) {
+            const Id clamped = b.ext(v.i32, spv::SClamp, {index, b.c_int(0), b.c_int(int32_t(kCallDepth) - 1)});
+            return b.op(spv::OpAccessChain, pint, {stack, clamped});
+        };
+        for (uint32_t i = start; i <= last; ++i) {
+            b.op_void(spv::OpLabel, {cases[i - start]});
+            Id taken;
+            if (!emit(i, taken)) return r;
+            const Insn in = fetch(program, i);
+            const uint32_t sop = in.sca_op();
+            const Id next = b.c_int(int32_t(i + 1)), target = b.c_int(int32_t(in.branch_target()));
+            Id new_pc = next;
+            if (taken && sop == S_RET) {
+                const Id spv_ = b.op(spv::OpLoad, v.i32, {sp});
+                const Id empty = b.op(spv::OpIEqual, v.bl, {spv_, b.c_int(0)});
+                const Id top = b.op(spv::OpISub, v.i32, {spv_, b.c_int(1)});
+                const Id ret = b.op(spv::OpLoad, v.i32, {stack_slot(top)});
+                const Id ends = b.op(spv::OpLogicalAnd, v.bl, {taken, empty});
+                const Id pops = b.op(spv::OpLogicalAnd, v.bl, {taken, b.op(spv::OpLogicalNot, v.bl, {empty})});
+                b.op_void(spv::OpStore, {sp, b.op(spv::OpSelect, v.i32, {pops, top, spv_})});
+                b.op_void(spv::OpStore, {done, b.op(spv::OpLogicalOr, v.bl, {b.op(spv::OpLoad, v.bl, {done}), ends})});
+                new_pc = b.op(spv::OpSelect, v.i32, {pops, ret, next});
+            } else if (taken && (sop == S_CAL || sop == S_CLI || sop == S_CLB)) {
+                const Id spv_ = b.op(spv::OpLoad, v.i32, {sp});
+                const Id slot = stack_slot(spv_);
+                const Id old = b.op(spv::OpLoad, v.i32, {slot});
+                b.op_void(spv::OpStore, {slot, b.op(spv::OpSelect, v.i32, {taken, next, old})});
+                b.op_void(spv::OpStore,
+                          {sp, b.op(spv::OpSelect, v.i32, {taken, b.op(spv::OpIAdd, v.i32, {spv_, b.c_int(1)}), spv_})});
+                new_pc = b.op(spv::OpSelect, v.i32, {taken, target, next});
+            } else if (taken) {  // BRA, BRI, BRB
+                new_pc = b.op(spv::OpSelect, v.i32, {taken, target, next});
+            }
+            b.op_void(spv::OpStore, {pc, new_pc});
+            if (in.end()) b.op_void(spv::OpStore, {done, b.c_bool(true)});
+            b.op_void(spv::OpBranch, {sw_merge});
+        }
+        b.op_void(spv::OpLabel, {dflt});  // jumped outside the program: stop
+        b.op_void(spv::OpStore, {done, b.c_bool(true)});
+        b.op_void(spv::OpBranch, {sw_merge});
+        b.op_void(spv::OpLabel, {sw_merge});
+        b.op_void(spv::OpBranch, {cont});
+        b.op_void(spv::OpLabel, {cont});
+        const Id g = b.op(spv::OpIAdd, v.i32, {b.op(spv::OpLoad, v.i32, {guard}), b.c_int(1)});
+        b.op_void(spv::OpStore, {guard, g});
+        const Id stop = b.op(spv::OpLogicalOr, v.bl, {b.op(spv::OpLoad, v.bl, {done}),
+                                                      b.op(spv::OpSGreaterThan, v.bl, {g, b.c_int(65536)})});
+        b.op_void(spv::OpBranchConditional, {stop, merge, header});
+        b.op_void(spv::OpLabel, {merge});
     }
 
     // Outputs. The RSX viewport transform (window = clip * scale + offset * w, in pixels,

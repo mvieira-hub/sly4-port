@@ -3,11 +3,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
 #include <iterator>
 #include <map>
+#include <vector>
 #include <thread>
 
 #include "core/host_sleep.h"
@@ -49,9 +51,26 @@ GuestMemory* g_mem = nullptr;
 GuestAddr g_control = 0, g_labels = 0;
 
 struct Counters {
-    std::atomic<uint64_t> commands{0}, flips{0}, draws{0}, vertices{0}, clears{0}, copies{0}, blits{0};
+    std::atomic<uint64_t> commands{0}, flips{0}, draws{0}, vertices{0}, clears{0}, copies{0}, blits{0}, self_jumps{0};
+    // Where the RSX thread spends its time (ns), for the summary.
+    std::atomic<uint64_t> t_idle{0}, t_self{0}, t_acquire{0}, t_draw{0}, t_flip{0}, t_clear{0}, t_blit{0};
 };
 Counters g_count;
+bool g_timeline = false;  // --rsx-timeline: log long waits and flips with the absolute time
+double steady_ms() {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+std::map<uint32_t, uint64_t> g_self_jump_at;  // RSX thread only
+
+// Adds the time of its scope to a counter.
+struct Span {
+    std::atomic<uint64_t>& acc;
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    ~Span() {
+        acc.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()),
+                      std::memory_order_relaxed);
+    }
+};
 
 // Frame capture (--rsx-capture).
 uint32_t g_capture_frame = UINT32_MAX;
@@ -157,18 +176,27 @@ void Processor::method(uint32_t reg, uint32_t arg, uint32_t index) {
         case nv406e::SetReference: m_.write<uint32_t>(g_control + 8, arg); break;
         case nv406e::SemaphoreAcquire:
             // Waits for the PPU (or a release earlier in the FIFO) to write the value.
-            if (GuestAddr a = dma_address(s_.reg(nv406e::SemaphoreContext), s_.reg(nv406e::SemaphoreOffset)))
+            if (GuestAddr a = dma_address(s_.reg(nv406e::SemaphoreContext), s_.reg(nv406e::SemaphoreOffset))) {
+                Span sp{g_count.t_acquire};
+                const double t0 = g_timeline ? steady_ms() : 0;
                 for (int i = 0; m_.read<uint32_t>(a) != arg && !kernel().exited(); ++i) host_sleep_us(i < 100 ? 10 : 500);
+                if (g_timeline && steady_ms() - t0 > 1.0)
+                    SLY4_INFO("%10.3f ms RSX: esperou %.2f ms no semáforo 0x%08X = 0x%X", steady_ms(), steady_ms() - t0, a, arg);
+            }
             break;
+        // Releases need no wait for the GPU: what the guest may reuse after them (vertices,
+        // indices, textures, constants) was already copied when the draws were recorded, and
+        // surfaces reach guest memory only through flush. Waiting here (about 23 times per
+        // frame in the menu) stalled the GPU and this thread in turn.
         case nv406e::SemaphoreRelease:
-            if (g_backend) g_backend->sync(m_);
             if (GuestAddr a = dma_address(s_.reg(nv406e::SemaphoreContext), s_.reg(nv406e::SemaphoreOffset)))
                 m_.write<uint32_t>(a, arg);
             break;
         case BackEndWriteSemaphoreRelease:
-            if (g_backend) g_backend->sync(m_);
-            if (GuestAddr a = dma_address(s_.reg(SetContextDmaSemaphore), s_.reg(SetSemaphoreOffset)))
+            if (GuestAddr a = dma_address(s_.reg(SetContextDmaSemaphore), s_.reg(SetSemaphoreOffset))) {
                 m_.write<uint32_t>(a, (arg & 0xFF00FF00) | ((arg & 0xFF) << 16) | ((arg >> 16) & 0xFF));
+                if (g_timeline) SLY4_INFO("%10.3f ms RSX: label em 0x%08X = 0x%X", steady_ms(), a, m_.read<uint32_t>(a));
+            }
             break;
         case TextureReadSemaphoreRelease:
             if (GuestAddr a = dma_address(s_.reg(SetContextDmaSemaphore), s_.reg(SetSemaphoreOffset)))
@@ -184,7 +212,10 @@ void Processor::method(uint32_t reg, uint32_t arg, uint32_t index) {
             break;
         case ClearSurface:
             g_count.clears.fetch_add(1, std::memory_order_relaxed);
-            if (g_backend) g_backend->clear(m_, s_, arg);
+            if (g_backend) {
+                Span sp{g_count.t_clear};
+                g_backend->clear(m_, s_, arg);
+            }
             break;
         case SetBeginEnd:
             if (arg) {
@@ -215,10 +246,18 @@ void Processor::method(uint32_t reg, uint32_t arg, uint32_t index) {
             break;
         case nv0039::BufferNotify: copy_buffer(); break;
         case nv3089::ImageInOffset: break;
-        case nv3089::ImageIn: scaled_blit(); break;
+        case nv3089::ImageIn: {
+            Span sp{g_count.t_blit};
+            scaled_blit();
+            break;
+        }
         case GcmFlipCommand: {
             const uint64_t n = g_count.flips.fetch_add(1) + 1;
-            if (g_backend) g_backend->flip(m_, s_, arg);
+            if (g_timeline) SLY4_INFO("%10.3f ms RSX: flip %" PRIu64, steady_ms(), n);
+            if (g_backend) {
+                Span sp{g_count.t_flip};
+                g_backend->flip(m_, s_, arg);
+            }
             if (n == 1 || n % 600 == 0) SLY4_INFO("RSX: %" PRIu64 " flips (buffer %u)", n, arg);
             break;
         }
@@ -236,7 +275,10 @@ void Processor::end_draw() {
     g_count.draws.fetch_add(1, std::memory_order_relaxed);
     g_count.vertices.fetch_add(draw_.kind == DrawCommand::Kind::Inline ? draw_.inline_data.size() : draw_.vertex_count(),
                                std::memory_order_relaxed);
-    if (g_backend) g_backend->draw(m_, s_, draw_);
+    if (g_backend) {
+        Span sp{g_count.t_draw};
+        g_backend->draw(m_, s_, draw_);
+    }
 }
 
 // SET_VERTEX_DATA{1,2,3,4}F_M and 4UB_M: the constant value of attribute i.
@@ -286,7 +328,10 @@ void Processor::copy_buffer() {
     const uint32_t len = s_.reg(LineLengthIn), lines = s_.reg(LineCount);
     const int32_t pitch_in = int32_t(s_.reg(PitchIn)), pitch_out = int32_t(s_.reg(PitchOut));
     if (!in || !out || !len || !lines) return;
-    if (g_backend) g_backend->sync(m_);
+    if (g_backend) {
+        g_backend->flush(m_, in, lines > 1 ? uint32_t((lines - 1) * uint32_t(pitch_in)) + len : len);
+        g_backend->flush(m_, out, lines > 1 ? uint32_t((lines - 1) * uint32_t(pitch_out)) + len : len);
+    }
     for (uint32_t l = 0; l < lines; ++l)
         std::memmove(m_.host(out + uint32_t(int32_t(l) * pitch_out)), m_.host(in + uint32_t(int32_t(l) * pitch_in)), len);
     if (g_backend) g_backend->invalidate(out, lines > 1 ? uint32_t((lines - 1) * uint32_t(pitch_out)) + len : len);
@@ -304,6 +349,7 @@ void Processor::image_from_cpu(uint32_t index, uint32_t arg) {
     const GuestAddr dst = dma_address(s_.reg(nv3062::SetContextDmaImageDestin), s_.reg(nv3062::SetOffsetDestin));
     if (!dst) return;
     const GuestAddr a = dst + y * pitch + x * bpp;
+    if (g_backend) g_backend->flush(m_, a, 4);
     if (bpp == 4) {
         m_.write<uint32_t>(a, arg);
     } else {
@@ -337,7 +383,25 @@ void Processor::scaled_blit() {
                       s_.reg(nv3062::SetColorFormat), out_w, out_h);
         return;
     }
-    if (g_backend) g_backend->sync(m_);
+    if (g_backend && src_bpp == 4) {
+        ScaledCopy c;
+        c.src = src;
+        c.dst = dst;
+        c.src_pitch = src_pitch;
+        c.dst_pitch = dst_pitch;
+        c.src_w = std::min(in_w, uint32_t((uint64_t(out_w) * dsdx + 0xFFFFF) >> 20));
+        c.src_h = std::min(in_h, uint32_t((uint64_t(out_h) * dtdy + 0xFFFFF) >> 20));
+        c.dst_x = out_x;
+        c.dst_y = out_y;
+        c.dst_w = out_w;
+        c.dst_h = out_h;
+        c.linear = ((in_fmt >> 24) & 0xFF) == 1;  // interpolator: 0 zero-order hold, 1 first-order
+        if (c.src_w && c.src_h && g_backend->scaled_copy(m_, c)) return;
+    }
+    if (g_backend) {
+        g_backend->flush(m_, src, in_h * src_pitch);
+        g_backend->flush(m_, dst + out_y * dst_pitch, out_h * dst_pitch);
+    }
     for (uint32_t y = 0; y < out_h; ++y) {
         const uint32_t sy = std::min(in_h ? in_h - 1 : 0, uint32_t((uint64_t(y) * dtdy) >> 20));
         for (uint32_t x = 0; x < out_w; ++x) {
@@ -351,25 +415,53 @@ void Processor::scaled_blit() {
 
 // Runs the FIFO from get to put, as long as the game keeps moving put.
 void Processor::run() {
+    uint32_t idle = 0;  // consecutive polls with nothing to do
+    double waiting_since = 0;  // steady ms when the current jump-to-itself wait began
+    uint32_t bad_jump_retries = 0;  // re-reads of a jump to an unmapped offset
     while (!kernel().exited()) {
         uint32_t get = m_.read<uint32_t>(g_control + 4);
         const uint32_t put = m_.read<uint32_t>(g_control);
-        if (get == put) {
-            host_sleep_us(200);
+        if (get == put) {  // idle: poll often at first, the PPU usually sends more soon
+            Span sp{g_count.t_idle};
+            host_sleep_us(idle < 200 ? 20 : 1000);
+            ++idle;
             continue;
         }
+        idle = 0;
         uint32_t ea;
         if (!io_to_ea(get, ea)) {
             SLY4_ERROR("RSX: FIFO em offset 0x%08X sem mapeamento de IO; parando", get);
             return;
         }
         const uint32_t cmd = m_.read<uint32_t>(ea);
-        g_count.commands.fetch_add(1, std::memory_order_relaxed);
         uint32_t next = get + 4;
-        if ((cmd & kOldJumpMask) == kOldJump) {
-            next = cmd & 0x1FFFFFFC;
-        } else if ((cmd & 3) == kNewJump) {
-            next = cmd & ~3u;
+        if ((cmd & kOldJumpMask) == kOldJump || (cmd & 3) == kNewJump) {
+            next = (cmd & kOldJumpMask) == kOldJump ? cmd & 0x1FFFFFFC : cmd & ~3u;
+            uint32_t target;
+            if (!io_to_ea(next, target) && bad_jump_retries < 50) {  // read while being rewritten? look again
+                ++bad_jump_retries;
+                host_sleep_us(20);
+                continue;
+            }
+            bad_jump_retries = 0;
+            if (next == get) {  // a jump to itself: the PPU will rewrite it, wait instead of spinning
+                g_count.self_jumps.fetch_add(1, std::memory_order_relaxed);
+                ++g_self_jump_at[ea];  // where (guest address): who rewrites it, see --watch-line
+                if (!waiting_since) waiting_since = steady_ms();
+                Span sp{g_count.t_self};
+                host_sleep_us(20);
+                continue;
+            }
+            if (waiting_since && g_timeline) {
+                const double now = steady_ms();
+                if (now - waiting_since > 1.0)
+                    SLY4_INFO("%10.3f ms RSX: esperou %.2f ms no salto para si em 0x%08X", now, now - waiting_since, ea);
+            }
+            waiting_since = 0;
+        }
+        g_count.commands.fetch_add(1, std::memory_order_relaxed);
+        if ((cmd & kOldJumpMask) == kOldJump || (cmd & 3) == kNewJump) {
+            // next set above
         } else if ((cmd & 3) == kCall) {
             call_return_ = get + 4;
             in_call_ = true;
@@ -462,6 +554,7 @@ void start(GuestMemory& mem, GuestAddr control, GuestAddr labels) {
     g_control = control;
     g_labels = labels;
     std::thread([&mem] {
+        name_host_thread("RSX");
         Processor p(mem);
         p.run();
     }).detach();
@@ -469,6 +562,8 @@ void start(GuestMemory& mem, GuestAddr control, GuestAddr labels) {
 
 GuestAddr control_address() { return g_control; }
 GuestAddr labels_address() { return g_labels; }
+
+void set_timeline(bool on) { g_timeline = on; }
 
 void set_capture(uint32_t frame, const std::string& path) {
     g_capture_frame = frame;
@@ -479,9 +574,19 @@ void summary() {
     if (!g_control) return;
     const uint64_t flips = g_count.flips.load();
     SLY4_INFO("RSX: %" PRIu64 " comandos, %" PRIu64 " flips, %" PRIu64 " draws (%" PRIu64 " vértices), %" PRIu64
-              " clears, %" PRIu64 " cópias, %" PRIu64 " cópias escaladas",
+              " clears, %" PRIu64 " cópias, %" PRIu64 " cópias escaladas; %" PRIu64 " esperas em salto para si",
               g_count.commands.load(), flips, g_count.draws.load(), g_count.vertices.load(), g_count.clears.load(),
-              g_count.copies.load(), g_count.blits.load());
+              g_count.copies.load(), g_count.blits.load(), g_count.self_jumps.load());
+    std::vector<std::pair<uint64_t, uint32_t>> jumps;
+    for (const auto& [ea, n] : g_self_jump_at) jumps.push_back({n, ea});
+    std::sort(jumps.rbegin(), jumps.rend());
+    for (size_t i = 0; i < jumps.size() && i < 5; ++i)
+        SLY4_INFO("RSX: %" PRIu64 " esperas no salto para si em 0x%08X", jumps[i].first, jumps[i].second);
+    auto sec = [](const std::atomic<uint64_t>& n) { return double(n.load()) * 1e-9; };
+    SLY4_INFO("RSX, tempo da thread: ocioso %.1f s, salto para si %.1f s, semáforo %.1f s, draws %.1f s, clears %.1f s, "
+              "cópias escaladas %.1f s, flips %.1f s",
+              sec(g_count.t_idle), sec(g_count.t_self), sec(g_count.t_acquire), sec(g_count.t_draw), sec(g_count.t_clear),
+              sec(g_count.t_blit), sec(g_count.t_flip));
 }
 
 }  // namespace sly4::rsx

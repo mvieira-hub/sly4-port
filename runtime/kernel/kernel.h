@@ -83,6 +83,8 @@ struct KernelOptions {
     size_t ring = 0;       // calls printed from the in-memory ring with the summary
     std::string firmware_dir;  // decrypted firmware modules (libsre.prx...); empty = all HLE
     bool spu_profile = false;  // samples SPU PCs for the summary
+    bool call_times = false;   // time spent inside each call, per thread, for the summary
+    std::string thread_timeline;  // --thread-timeline: that thread's calls with absolute times
     std::string ppu_profile;   // name of a PPU thread whose host code is sampled for the summary
     bool verify_zlib = false;  // checks the SPU's EDGE zlib output against the native inflate
     std::string spu_cache;     // records the SPU blocks run in the interpreter (docs/SPU.md, 4e)
@@ -173,6 +175,8 @@ public:
 };
 
 Kernel& kernel();  // the running process (set by the Kernel constructor)
+// Names the calling host thread for --ppu-profile (threads that are not PPU threads: RSX).
+void name_host_thread(const std::string& name);
 
 // System time in microseconds since the process started (sys_time_get_system_time,
 // timer expiries).

@@ -45,6 +45,8 @@ GuestAddr labels_address();
 
 // Development aids: the commands of frame `frame` (counted in flips) written to `path`,
 // and counters for the end-of-run summary.
+// --rsx-timeline: long waits on jumps to themselves and flips, with absolute times (ms).
+void set_timeline(bool on);
 void set_capture(uint32_t frame, const std::string& path);
 void summary();
 

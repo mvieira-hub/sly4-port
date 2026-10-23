@@ -1,6 +1,7 @@
 #include "cpu/spu_channels.h"
 
 #include <algorithm>
+#include <emmintrin.h>
 #include <chrono>
 #include <cstring>
 #include <cstdio>
@@ -38,6 +39,25 @@ const char* spu_who(const SPUContext& c, const char* op, char (&buf)[96]) {
     return buf;
 }
 
+// A DMA copy in naturally aligned units, as the MFC moves data: another thread polling a
+// word in the destination never sees it half written. memcpy may copy byte by byte (rep
+// movsb); the RSX, polling a jump the SPU rewrites, read a torn one and jumped to garbage.
+void dma_copy(uint8_t* dst, const uint8_t* src, uint32_t size) {
+    const uintptr_t align = reinterpret_cast<uintptr_t>(dst) | reinterpret_cast<uintptr_t>(src) | size;
+    if (!(align & 15)) {
+        for (uint32_t i = 0; i < size; i += 16)
+            _mm_store_si128(reinterpret_cast<__m128i*>(dst + i), _mm_load_si128(reinterpret_cast<const __m128i*>(src + i)));
+    } else if (size == 8 && !(align & 7)) {
+        __atomic_store_n(reinterpret_cast<uint64_t*>(dst), *reinterpret_cast<const uint64_t*>(src), __ATOMIC_RELAXED);
+    } else if (size == 4 && !(align & 3)) {
+        __atomic_store_n(reinterpret_cast<uint32_t*>(dst), *reinterpret_cast<const uint32_t*>(src), __ATOMIC_RELAXED);
+    } else if (size == 2 && !(align & 1)) {
+        __atomic_store_n(reinterpret_cast<uint16_t*>(dst), *reinterpret_cast<const uint16_t*>(src), __ATOMIC_RELAXED);
+    } else {
+        std::memcpy(dst, src, size);
+    }
+}
+
 void transfer(SPUContext& c, bool put, uint32_t lsa, uint32_t ea, uint32_t size) {
     lsa &= kSpuLsMask;
     if (lsa + size > kSpuLsSize) size = kSpuLsSize - lsa;  // never past the local store
@@ -57,10 +77,12 @@ void transfer(SPUContext& c, bool put, uint32_t lsa, uint32_t ea, uint32_t size)
         for (int i = 0; i < n; ++i) debug_line_log(*c.mem, lines[i], before[i], who, c.pc);
         return;
     }
-    if (put)
-        std::memcpy(main, c.ls + lsa, size);
-    else
-        std::memcpy(c.ls + lsa, main, size);
+    if (put) {
+        dma_copy(main, c.ls + lsa, size);
+    } else {
+        dma_copy(c.ls + lsa, main, size);
+        c.ls_written(lsa, size);
+    }
 }
 
 // Runs a DMA list from where it is. The list (8-byte elements: stall-and-notify flag in
@@ -108,6 +130,7 @@ SpuChannelResult spu_mfc_command(SPUContext& c, uint32_t cmd) {
             std::lock_guard<std::mutex> g(guest_line_lock(line));
             std::memcpy(c.reserve_data, c.mem->host(line), 128);
             std::memcpy(c.ls + (lsa & kSpuLsMask & ~127u), c.reserve_data, 128);
+            c.ls_written(lsa & ~127u, 128);
             c.reserved = true;
             c.reserve_ea = line;
             __atomic_store_n(&c.llr_lost, 0u, __ATOMIC_RELEASE);

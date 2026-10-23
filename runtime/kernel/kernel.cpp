@@ -69,6 +69,8 @@ bool Kernel::init(const NidNames& names, const KernelOptions& opt) {
     mmapper_ = std::make_unique<GuestAllocator>(mem_, layout::kMmapperBase, layout::kMmapperSize, "mmapper");
 
     call_log().trace = opt.trace;
+    call_log().timing = opt.call_times || !opt.thread_timeline.empty();
+    call_log().timeline_thread = opt.thread_timeline;
     ring_lines_ = opt.ring;
     spu_cache_ = opt.spu_cache;
     if (opt.spu_profile) spu_profile_start();
@@ -423,7 +425,13 @@ namespace {
 std::mutex g_prof_lock;
 std::map<uint64_t, uint32_t> g_prof_hits;
 uint64_t g_prof_samples = 0;
+std::map<std::string, uint32_t> g_host_threads;  // name_host_thread (under g_prof_lock)
 }  // namespace
+
+void name_host_thread(const std::string& name) {
+    std::lock_guard<std::mutex> g(g_prof_lock);
+    g_host_threads[name] = GetCurrentThreadId();
+}
 
 void Kernel::ppu_profile_start(const std::string& name) {
     std::thread([this, name] {
@@ -436,6 +444,10 @@ void Kernel::ppu_profile_start(const std::string& name) {
                 std::lock_guard<std::mutex> g(threads_lock_);
                 for (const auto& [id, t] : threads_)
                     if (t->name == name && t->host_tid) tid = t->host_tid;
+                if (!tid) {
+                    std::lock_guard<std::mutex> p(g_prof_lock);
+                    if (auto it = g_host_threads.find(name); it != g_host_threads.end()) tid = it->second;
+                }
                 if (tid) h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, tid);
                 if (!h) continue;
             }
@@ -459,8 +471,25 @@ void Kernel::ppu_profile_print() const {
     std::vector<std::pair<uint32_t, uint64_t>> top;
     for (const auto& [rva, n] : g_prof_hits) top.push_back({n, rva});
     std::sort(top.rbegin(), top.rend());
+    // Samples outside sly4.exe, by module (waits and locks in ntdll, memcpy in msvcrt...).
+    const uint64_t base = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+    std::map<std::string, uint64_t> modules;
+    for (const auto& [rva, n] : g_prof_hits) {
+        HMODULE mod = nullptr;
+        char name[MAX_PATH] = "?";
+        if (rva >= 0x10000000 &&
+            GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCSTR>(base + rva), &mod))
+            GetModuleFileNameA(mod, name, sizeof(name));
+        if (rva >= 0x10000000) {
+            const char* slash = std::strrchr(name, '\\');
+            modules[slash ? slash + 1 : name] += n;
+        }
+    }
+    for (const auto& [name, n] : modules)
+        SLY4_INFO("perfil PPU: %.1f%% em %s", 100.0 * double(n) / double(g_prof_samples), name.c_str());
     SLY4_INFO("perfil PPU: %" PRIu64 " amostras; endereços (RVA no sly4.exe) mais frequentes:", g_prof_samples);
-    for (size_t i = 0; i < top.size() && i < 40; ++i)
+    for (size_t i = 0; i < top.size() && i < 400; ++i)
         std::fprintf(stderr, "  0x%08" PRIX64 " %6u (%.1f%%)\n", top[i].second, top[i].first,
                      100.0 * top[i].first / double(g_prof_samples));
 }
@@ -492,9 +521,9 @@ void Kernel::print_summary() const {
     rt::interpreter_stats(icalls, isteps);
     if (icalls) SLY4_INFO("PPU: %" PRIu64 " entradas no interpretador, %" PRIu64 " instruções interpretadas", icalls, isteps);
     for (const auto& s : spu_threads())
-        std::fprintf(stderr, "  SPU 0x%08X grupo %08X[%u] %-10s %12" PRIu64 " instruÃ§Ãµes, pc 0x%05X\n", s->id,
-                     s->group ? s->group->id : 0, s->index, s->running ? "rodando" : "parada", s->executed.load(),
-                     s->ctx.pc);
+        std::fprintf(stderr, "  SPU 0x%08X grupo %08X[%u] %-10s %12" PRIu64 " instruÃ§Ãµes, pc 0x%05X, %.1f s esperando canais\n",
+                     s->id, s->group ? s->group->id : 0, s->index, s->running ? "rodando" : "parada", s->executed.load(),
+                     s->ctx.pc, double(s->waited_ns.load()) * 1e-9);
     // Where each SPU is: a few instructions around its PC.
     for (const auto& s : spu_threads()) {
         if (!s->running) continue;
@@ -528,6 +557,7 @@ void Kernel::print_summary() const {
             SLY4_ERROR("cache SPU: nÃ£o foi possÃ­vel gravar %s", spu_cache_.c_str());
     }
     call_log().print_ring(ring_lines_);
+    call_log().print_times();
     auto hs = hle().stats();
     std::stable_sort(hs.begin(), hs.end(), [](const auto& a, const auto& b) { return a.calls > b.calls; });
     size_t called = 0, missing = 0;

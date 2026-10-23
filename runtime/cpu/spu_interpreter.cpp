@@ -21,6 +21,7 @@ SpuStep spu_execute(SPUContext& c, const Insn& in) {
 SpuStep spu_step(SPUContext& c) { return spu_execute(c, spu::decode(c.ls_u32(c.pc))); }
 
 SpuStep spu_run(SPUContext& c, uint64_t max_steps, uint64_t& executed) {
+    spusem::SpuFloatMode fp;
     for (uint64_t n = 0; n < max_steps; ++n) {
         const SpuStep st = spu_step(c);
         if (st == SpuStep::Branch) spu_check_interrupt(c);

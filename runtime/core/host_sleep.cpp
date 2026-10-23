@@ -23,7 +23,8 @@ struct Timer {
 };
 }  // namespace
 
-void host_sleep_us(uint64_t us) {
+namespace {
+void timer_wait(uint64_t us) {
     thread_local Timer t;
     if (!t.h) {  // Windows before 10 1803: millisecond sleeps
         Sleep(DWORD((us + 999) / 1000));
@@ -33,6 +34,21 @@ void host_sleep_us(uint64_t us) {
     due.QuadPart = -int64_t(us * 10);  // relative, 100 ns units
     SetWaitableTimer(t.h, &due, 0, nullptr, nullptr, FALSE);
     WaitForSingleObject(t.h, INFINITE);
+}
+}  // namespace
+
+// The high-resolution timer still wakes up 0.2-0.3 ms late; games poll with short sleeps
+// (usleep(300) in a loop, 131 thousand times in 2 minutes of the menu), so short sleeps
+// end with a brief spin to the deadline instead.
+void host_sleep_us(uint64_t us) {
+    constexpr uint64_t kSpinUs = 250, kPreciseUpTo = 2000;
+    if (us > kPreciseUpTo) {
+        timer_wait(us);
+        return;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(us);
+    if (us > kSpinUs) timer_wait(us - kSpinUs);
+    while (std::chrono::steady_clock::now() < deadline) SwitchToThread();
 }
 
 void host_sleep_until(std::chrono::steady_clock::time_point deadline) {

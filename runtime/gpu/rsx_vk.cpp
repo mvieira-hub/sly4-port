@@ -28,6 +28,8 @@ using namespace nv4097;
 constexpr VkDeviceSize kRingSize = 96ull << 20;
 constexpr uint32_t kMaxSets = 4096;
 constexpr uint32_t kTextureUnits = 16;
+// Whether the RSX winding is mirrored in Vulkan's framebuffer coordinates (see draw()).
+constexpr bool kMirroredWinding = false;
 
 bool ok(VkResult r, const char* what) {
     if (r == VK_SUCCESS) return true;
@@ -41,11 +43,54 @@ struct Image {
     VkImageView view = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_UNDEFINED;
     VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
-    uint32_t width = 0, height = 0, layers = 1;
+    uint32_t width = 0, height = 0, layers = 1, levels = 1;
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
     uint64_t hash = 0;          // textures: hash of the guest bytes uploaded
-    bool cpu_dirty = false;     // surfaces: guest memory written behind the GPU's back
+    uint64_t hashed_flip = ~0ull;  // textures: the frame the bytes were last hashed in
+    GuestAddr src = 0;
+    uint32_t src_size = 0;      // textures: the guest bytes they come from
+    // Surfaces: where the up-to-date copy is. gpu_dirty: drawn since guest memory was last
+    // written from it; cpu_dirty: guest memory written behind the GPU's back (2D copies).
+    bool cpu_dirty = false, gpu_dirty = false;
+    uint32_t pitch = 0, guest_format = 0;  // color surfaces: bytes per line, SET_SURFACE_FORMAT color
 };
+
+// Texture change detection: 8 bytes at a time (FNV-1a byte by byte was 40% of the RSX
+// thread in the menu, with every texture hashed again on every draw).
+uint64_t hash_bytes(const uint8_t* p, size_t n) {
+    // Four independent lanes of 8 bytes per round (in the style of xxHash), so the
+    // multiplies overlap; then the tail.
+    constexpr uint64_t k1 = 0x9E3779B185EBCA87ull, k2 = 0xC2B2AE3D27D4EB4Full;
+    uint64_t acc[4] = {k1 ^ n, k2, n * k1, ~k2};
+    size_t i = 0;
+    for (; i + 32 <= n; i += 32)
+        for (int l = 0; l < 4; ++l) {
+            uint64_t v;
+            std::memcpy(&v, p + i + 8 * l, 8);
+            acc[l] = (acc[l] + v * k2);
+            acc[l] = ((acc[l] << 31) | (acc[l] >> 33)) * k1;
+        }
+    uint64_t h = acc[0] ^ (acc[1] * k1) ^ (acc[2] * k2) ^ ((acc[3] << 17) | (acc[3] >> 47));
+    for (; i + 8 <= n; i += 8) {
+        uint64_t v;
+        std::memcpy(&v, p + i, 8);
+        h = (h ^ v) * 0xFF51AFD7ED558CCDull;
+        h ^= h >> 29;
+    }
+    for (; i < n; ++i) h = (h ^ p[i]) * 0x100000001B3ull;
+    return h ^ (h >> 31);
+}
+
+// Byte offsets of R, G, B and A in a pixel of a 32-bit color surface in guest memory, or
+// false for the formats that are not kept in sync with memory (16-bit, float, B8, G8B8).
+bool surface_byte_order(uint32_t format, uint32_t (&o)[4]) {
+    static constexpr uint32_t argb[4] = {1, 2, 3, 0}, abgr[4] = {3, 2, 1, 0};
+    switch (format) {
+        case 4: case 5: case 8: std::memcpy(o, argb, sizeof(o)); return true;     // X8R8G8B8, A8R8G8B8
+        case 14: case 15: case 16: std::memcpy(o, abgr, sizeof(o)); return true;  // X8B8G8R8, A8B8G8R8
+        default: return false;
+    }
+}
 
 // Everything a pipeline depends on besides the dynamic state.
 struct PipelineKey {
@@ -57,6 +102,7 @@ struct PipelineKey {
     uint32_t depth_test, depth_write, depth_func;
     uint32_t stencil[8];
     uint32_t restart;
+    uint32_t cull, front_face;  // VkCullModeFlags, VkFrontFace
     bool operator==(const PipelineKey& o) const { return std::memcmp(this, &o, sizeof(*this)) == 0; }
 };
 struct PipelineKeyHash {
@@ -142,6 +188,35 @@ uint32_t attribute_bytes(const VertexArray& a) {
     }
 }
 
+void convert_attribute(const VertexArray& a, const uint8_t* p, float out[4]);
+
+// Big-endian floats with N components, a whole array: the most common attribute, and the
+// per-vertex switch of convert_attribute was 10% of the RSX thread in the menu.
+template <uint32_t N>
+void convert_floats(const uint8_t* p, uint32_t stride, uint32_t count, float* out) {
+    for (uint32_t v = 0; v < count; ++v, p += stride, out += 4) {
+        for (uint32_t i = 0; i < N; ++i) {
+            const uint32_t b = load_be<uint32_t>(p + 4 * i);
+            std::memcpy(&out[i], &b, 4);
+        }
+        for (uint32_t i = N; i < 4; ++i) out[i] = i == 3 ? 1.0f : 0.0f;
+    }
+}
+
+// count vertices of one attribute array (stride bytes apart) to float4.
+void convert_array(const VertexArray& a, const uint8_t* p, uint32_t stride, uint32_t count, float* out) {
+    if (a.type == VertexType::F) {
+        switch (std::min(a.size, 4u)) {
+            case 1: return convert_floats<1>(p, stride, count, out);
+            case 2: return convert_floats<2>(p, stride, count, out);
+            case 3: return convert_floats<3>(p, stride, count, out);
+            case 4: return convert_floats<4>(p, stride, count, out);
+            default: break;
+        }
+    }
+    for (uint32_t v = 0; v < count; ++v) convert_attribute(a, p + size_t(v) * stride, out + 4 * v);
+}
+
 // One attribute of one vertex to float4 (missing components 0, 0, 0, 1).
 void convert_attribute(const VertexArray& a, const uint8_t* p, float out[4]) {
     out[0] = out[1] = out[2] = 0.0f;
@@ -191,6 +266,9 @@ public:
     void draw(GuestMemory& mem, const State& s, const DrawCommand& d) override;
     void flip(GuestMemory& mem, const State& s, uint32_t buffer) override;
     void sync(GuestMemory&) override { submit_and_wait(); }
+    void flush(GuestMemory& mem, GuestAddr ea, uint32_t size) override;
+    bool scaled_copy(GuestMemory& mem, const ScaledCopy& c) override;
+    Image* surface_holding(GuestAddr ea, uint32_t pitch, uint32_t& x, uint32_t& y, GuestAddr& base);
     void invalidate(GuestAddr ea, uint32_t size) override;
     VulkanContext::Source front() override {
         std::lock_guard<std::mutex> lk(front_lock_);
@@ -247,14 +325,14 @@ private:
     uint64_t flips_ = 0;
 
     // Counters.
-    uint64_t draws_ = 0, skipped_ = 0, texture_uploads_ = 0, pipelines_built_ = 0;
+    uint64_t draws_ = 0, skipped_ = 0, texture_uploads_ = 0, pipelines_built_ = 0, flushes_ = 0, gpu_copies_ = 0, hashed_bytes_ = 0, converted_vertices_ = 0;
 
     uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want);
     bool make_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer& b, VkDeviceMemory& m, uint8_t** map);
     std::unique_ptr<Image> make_image(uint32_t w, uint32_t h, VkFormat f, VkImageUsageFlags usage,
                                       VkImageAspectFlags aspect, const VkComponentMapping& swizzle = {},
                                       VkImageViewType view_type = VK_IMAGE_VIEW_TYPE_2D, uint32_t depth = 1,
-                                      uint32_t layers = 1);
+                                      uint32_t layers = 1, uint32_t levels = 1);
     void destroy(Image& img);
 
     VkCommandBuffer cmd();
@@ -262,7 +340,11 @@ private:
     void transition(Image& img, VkImageLayout layout);
     VkDeviceSize ring_alloc(VkDeviceSize size, VkDeviceSize align = 16);
 
-    bool bind_targets(const State& s);
+    bool bind_targets(GuestMemory& mem, const State& s);
+    bool ensure_readback(VkDeviceSize bytes);
+    // Guest memory -> a color surface written by the CPU (cpu_dirty).
+    void upload_surface(GuestMemory& mem, GuestAddr ea, Image& img);
+    static uint32_t surface_bytes(const Image& img) { return (img.pitch ? img.pitch : img.width * 4) * img.height; }
     void begin_rendering();
     void end_rendering();
 
@@ -322,18 +404,20 @@ bool Renderer::make_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer
 
 std::unique_ptr<Image> Renderer::make_image(uint32_t w, uint32_t h, VkFormat f, VkImageUsageFlags usage,
                                             VkImageAspectFlags aspect, const VkComponentMapping& swizzle,
-                                            VkImageViewType view_type, uint32_t depth, uint32_t layers) {
+                                            VkImageViewType view_type, uint32_t depth, uint32_t layers,
+                                            uint32_t levels) {
     auto img = std::make_unique<Image>();
     img->format = f;
     img->aspect = aspect;
     img->width = w;
     img->height = h;
     img->layers = layers;
+    img->levels = levels;
     VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ci.imageType = view_type == VK_IMAGE_VIEW_TYPE_3D ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
     ci.format = f;
     ci.extent = {w, h, depth};
-    ci.mipLevels = 1;
+    ci.mipLevels = levels;
     ci.arrayLayers = layers;
     ci.samples = VK_SAMPLE_COUNT_1_BIT;
     ci.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -354,7 +438,7 @@ std::unique_ptr<Image> Renderer::make_image(uint32_t w, uint32_t h, VkFormat f, 
     vi.viewType = view_type;
     vi.format = f;
     vi.components = swizzle;
-    vi.subresourceRange = {aspect, 0, 1, 0, layers};
+    vi.subresourceRange = {aspect, 0, levels, 0, layers};
     if (!ok(vkCreateImageView(dev_, &vi, nullptr, &img->view), "vkCreateImageView")) return nullptr;
     return img;
 }
@@ -485,7 +569,7 @@ void Renderer::transition(Image& img, VkImageLayout layout) {
     b.newLayout = layout;
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = img.image;
-    b.subresourceRange = {img.aspect, 0, 1, 0, img.layers};
+    b.subresourceRange = {img.aspect, 0, img.levels, 0, img.layers};
     VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     dep.imageMemoryBarrierCount = 1;
     dep.pImageMemoryBarriers = &b;
@@ -516,7 +600,7 @@ VkFormat surface_color_format(uint32_t f) {
     }
 }
 
-bool Renderer::bind_targets(const State& s) {
+bool Renderer::bind_targets(GuestMemory& mem, const State& s) {
     const Surface sf = s.surface();
     const uint32_t w = sf.x + sf.width, h = sf.y + sf.height;
     if (!w || !h || w > 4096 || h > 4096) return false;
@@ -549,6 +633,11 @@ bool Renderer::bind_targets(const State& s) {
                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                              VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                          VK_IMAGE_ASPECT_COLOR_BIT);
+        if (color) {
+            color->pitch = sf.color_pitch[index];
+            color->guest_format = sf.color_format;
+            if (color->cpu_dirty) upload_surface(mem, ea, *color);
+        }
     }
     if (sf.depth_format) {
         const GuestAddr ea = location_address(sf.depth_location, sf.depth_offset);
@@ -569,6 +658,7 @@ bool Renderer::bind_targets(const State& s) {
 
 void Renderer::begin_rendering() {
     if (rendering_) return;
+    if (color_) color_->gpu_dirty = true;
     if (color_) transition(*color_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     if (depth_) transition(*depth_, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
     VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
@@ -599,8 +689,8 @@ void Renderer::end_rendering() {
 }
 
 // ---------------------------------------------------------------- clear
-void Renderer::clear(GuestMemory&, const State& s, uint32_t mask) {
-    if (!bind_targets(s)) return;
+void Renderer::clear(GuestMemory& mem, const State& s, uint32_t mask) {
+    if (!bind_targets(mem, s)) return;
     VkClearAttachment att[2];
     uint32_t n = 0;
     if (color_ && (mask & 0xF0)) {
@@ -635,10 +725,134 @@ void Renderer::clear(GuestMemory&, const State& s, uint32_t mask) {
 }
 
 void Renderer::invalidate(GuestAddr ea, uint32_t size) {
-    for (auto& [addr, img] : surfaces_) {
-        const uint32_t bytes = img->width * img->height * 4;
-        if (ea < addr + bytes && addr < ea + size) img->cpu_dirty = true;
+    for (auto& [addr, img] : surfaces_)
+        if (!(img->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && ea < addr + surface_bytes(*img) && addr < ea + size)
+            img->cpu_dirty = true;
+    for (auto& [key, img] : textures_)
+        if (img && ea < img->src + img->src_size && img->src < ea + size) img->hashed_flip = ~0ull;
+}
+
+bool Renderer::ensure_readback(VkDeviceSize bytes) {
+    if (readback_size_ >= bytes) return true;
+    if (readback_) {
+        submit_and_wait();
+        vkDestroyBuffer(dev_, readback_, nullptr);
+        vkFreeMemory(dev_, readback_memory_, nullptr);
+        readback_ = VK_NULL_HANDLE;
+        readback_size_ = 0;
     }
+    if (!make_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, readback_, readback_memory_, &readback_map_)) return false;
+    readback_size_ = bytes;
+    return true;
+}
+
+// Color surfaces the GPU drew in [ea, ea + size) are read back into guest memory.
+void Renderer::flush(GuestMemory& mem, GuestAddr ea, uint32_t size) {
+    for (auto& [addr, ptr] : surfaces_) {
+        Image& img = *ptr;
+        if (!img.gpu_dirty || !(ea < addr + surface_bytes(img) && addr < ea + size)) continue;
+        img.gpu_dirty = false;
+        ++flushes_;
+        uint32_t o[4];
+        if (!surface_byte_order(img.guest_format, o) || img.format != VK_FORMAT_R8G8B8A8_UNORM ||
+            img.pitch < img.width * 4)
+            continue;
+        end_rendering();
+        if (!ensure_readback(VkDeviceSize(img.width) * img.height * 4)) return;
+        transition(img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {img.width, img.height, 1};
+        vkCmdCopyImageToBuffer(cmd(), img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback_, 1, &copy);
+        submit_and_wait();
+        for (uint32_t y = 0; y < img.height; ++y) {
+            const uint8_t* q = readback_map_ + size_t(y) * img.width * 4;
+            uint8_t* p = mem.host(addr + y * img.pitch);
+            for (uint32_t x = 0; x < img.width; ++x, q += 4, p += 4)
+                for (int c = 0; c < 4; ++c) p[o[c]] = q[c];
+        }
+    }
+}
+
+// The color surface holding ea, laid out with this pitch; x, y: where ea falls in it.
+Image* Renderer::surface_holding(GuestAddr ea, uint32_t pitch, uint32_t& x, uint32_t& y, GuestAddr& base) {
+    for (auto& [addr, img] : surfaces_) {
+        if ((img->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) || img->pitch != pitch || ea < addr || ea >= addr + surface_bytes(*img))
+            continue;
+        const uint32_t off = ea - addr;
+        if (off % 4) continue;
+        x = off % pitch / 4;
+        y = off / pitch;
+        base = addr;
+        return img.get();
+    }
+    return nullptr;
+}
+
+// NV3089 between color surfaces of the same format: a blit, without leaving the GPU. A
+// destination that is no surface yet (the game saves the display buffer in main memory
+// and copies it back later) gets one, a shadow of that memory filled from it first.
+bool Renderer::scaled_copy(GuestMemory& mem, const ScaledCopy& c) {
+    uint32_t sx, sy, dx, dy;
+    GuestAddr sbase, dbase;
+    Image* s = surface_holding(c.src, c.src_pitch, sx, sy, sbase);
+    if (!s || s->format != VK_FORMAT_R8G8B8A8_UNORM || sx + c.src_w > s->width || sy + c.src_h > s->height) return false;
+    Image* d = surface_holding(c.dst, c.dst_pitch, dx, dy, dbase);
+    if (!d) {
+        if (c.dst_pitch % 4 || c.dst_pitch / 4 > 4096 || c.dst_y + c.dst_h > 4096 || surfaces_.count(c.dst)) return false;
+        auto img = make_image(c.dst_pitch / 4, c.dst_y + c.dst_h, s->format,
+                              VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                              VK_IMAGE_ASPECT_COLOR_BIT);
+        if (!img) return false;
+        img->pitch = c.dst_pitch;
+        img->guest_format = s->guest_format;
+        img->cpu_dirty = true;  // its pixels come from memory before the copy lands
+        d = img.get();
+        dbase = c.dst;
+        dx = dy = 0;
+        surfaces_[c.dst] = std::move(img);
+    }
+    if (d == s || d->format != s->format || dx + c.dst_x + c.dst_w > d->width || dy + c.dst_y + c.dst_h > d->height)
+        return false;
+    if (s->cpu_dirty) upload_surface(mem, sbase, *s);
+    if (d->cpu_dirty) upload_surface(mem, dbase, *d);
+    end_rendering();
+    transition(*s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    transition(*d, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkImageBlit blit{};
+    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.srcOffsets[0] = {int32_t(sx), int32_t(sy), 0};
+    blit.srcOffsets[1] = {int32_t(sx + c.src_w), int32_t(sy + c.src_h), 1};
+    blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.dstOffsets[0] = {int32_t(dx + c.dst_x), int32_t(dy + c.dst_y), 0};
+    blit.dstOffsets[1] = {int32_t(dx + c.dst_x + c.dst_w), int32_t(dy + c.dst_y + c.dst_h), 1};
+    vkCmdBlitImage(cmd(), s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, d->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                   &blit, c.linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+    d->gpu_dirty = true;
+    ++gpu_copies_;
+    return true;
+}
+
+void Renderer::upload_surface(GuestMemory& mem, GuestAddr ea, Image& img) {
+    img.cpu_dirty = false;
+    uint32_t o[4];
+    if (!surface_byte_order(img.guest_format, o) || img.format != VK_FORMAT_R8G8B8A8_UNORM || img.pitch < img.width * 4)
+        return;
+    end_rendering();
+    const VkDeviceSize at = ring_alloc(VkDeviceSize(img.width) * img.height * 4, 16);
+    for (uint32_t y = 0; y < img.height; ++y) {
+        const uint8_t* p = mem.host(ea + y * img.pitch);
+        uint8_t* q = ring_map_ + at + size_t(y) * img.width * 4;
+        for (uint32_t x = 0; x < img.width; ++x, q += 4, p += 4)
+            for (int c = 0; c < 4; ++c) q[c] = p[o[c]];
+    }
+    transition(img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkBufferImageCopy copy{};
+    copy.bufferOffset = at;
+    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.imageExtent = {img.width, img.height, 1};
+    vkCmdCopyBufferToImage(cmd(), ring_, img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
 }
 
 // ---------------------------------------------------------------- programs and textures
@@ -659,12 +873,14 @@ VkSampler Renderer::sampler(const Texture& t) {
     VkSamplerCreateInfo ci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     const uint32_t mag = (t.filter >> 24) & 7, min = (t.filter >> 16) & 7;
     ci.magFilter = mag == 1 ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
+    // MIN: 1 NEAREST, 2 LINEAR, 3 NEAREST_MIPMAP_NEAREST, 4 LINEAR_MIPMAP_NEAREST,
+    // 5 NEAREST_MIPMAP_LINEAR, 6 LINEAR_MIPMAP_LINEAR; the first two sample level 0 only.
     ci.minFilter = (min == 1 || min == 3 || min == 5) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
-    ci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    ci.mipmapMode = min >= 5 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
     ci.addressModeU = address_mode(t.address & 0xF);
     ci.addressModeV = address_mode((t.address >> 8) & 0xF);
     ci.addressModeW = address_mode((t.address >> 16) & 0xF);
-    ci.maxLod = 0.0f;
+    ci.maxLod = min >= 3 ? VK_LOD_CLAMP_NONE : 0.0f;
     ci.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
     VkSampler s = VK_NULL_HANDLE;
     ok(vkCreateSampler(dev_, &ci, nullptr, &s), "vkCreateSampler");
@@ -676,42 +892,79 @@ Image* Renderer::texture(GuestMemory& mem, const Texture& t, uint32_t dims) {
     if (!t.enabled() || !t.width || !t.height || dims != 2) return nullptr;
     const GuestAddr ea = location_address(t.location, t.offset);
     if (!ea) return nullptr;
-    // A texture that is a surface we rendered: sample the surface itself.
+    const TextureKey key{ea, t.format, t.width, t.height, t.pitch, t.control1 & 0xFFFF, t.dimension};
+    // A texture that is a surface we rendered: sample the surface itself, or, when the
+    // texture is a smaller rectangle at its start (a 704x396 image in a 1280x720 target),
+    // a copy of that rectangle; sampling the whole surface would shrink the picture.
     if (auto it = surfaces_.find(ea); it != surfaces_.end() && !(it->second->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) {
         Image* img = it->second.get();
-        if (img != color_) {
-            if (img->layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
-                end_rendering();
-                transition(*img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        if (img != color_ && t.width <= img->width && t.height <= img->height) {
+            if (img->cpu_dirty) upload_surface(mem, ea, *img);
+            if (t.width == img->width && t.height == img->height) {
+                if (img->layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+                    end_rendering();
+                    transition(*img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                }
+                return img;
             }
-            return img;
+            auto& part = textures_[key];
+            if (!part || part->format != img->format || part->width != t.width || part->height != t.height) {
+                if (part) retired_.push_back(std::move(part));
+                part = make_image(t.width, t.height, img->format,
+                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+                if (!part) return nullptr;
+            }
+            end_rendering();
+            transition(*img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            transition(*part, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            VkImageCopy region{};
+            region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            region.extent = {t.width, t.height, 1};
+            vkCmdCopyImage(cmd(), img->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, part->image,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+            transition(*part, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            part->hash = 0;  // a copy of the surface, not of memory: taken again on every use
+            return part.get();
         }
     }
-    const TextureKey key{ea, t.format, t.width, t.height, t.pitch, t.control1 & 0xFFFF, t.dimension};
     const uint32_t size = texture_source_size(t);
     if (!size || size > 64u << 20) return nullptr;
-    const uint64_t hash = fnv1a64(mem.host(ea), size);
+    flush(mem, ea, size);  // a surface drawn at another address or size, read as plain memory
     auto& slot = textures_[key];
-    if (slot && slot->hash == hash) return slot.get();
+    // Hashed once per frame: the CPU rarely rewrites a texture in the middle of one, and the
+    // RSX's own writes clear hashed_flip (invalidate).
+    if (slot && slot->hashed_flip == flips_) return slot.get();
+    const uint64_t hash = hash_bytes(mem.host(ea), size);
+    hashed_bytes_ += size;
+    if (slot && slot->hash == hash) {
+        slot->hashed_flip = flips_;
+        return slot.get();
+    }
     const TextureData data = decode_texture(mem.host(ea), t);
-    if (!slot || slot->format != data.format) {
+    if (!slot || slot->format != data.format || slot->levels != data.levels) {
         if (slot) retired_.push_back(std::move(slot));
         slot = make_image(data.width, data.height, data.format,
                           VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT,
-                          data.swizzle);
+                          data.swizzle, VK_IMAGE_VIEW_TYPE_2D, 1, 1, data.levels);
         if (!slot) return nullptr;
     }
     end_rendering();
     const VkDeviceSize at = ring_alloc(data.bytes.size(), 16);
     std::memcpy(ring_map_ + at, data.bytes.data(), data.bytes.size());
     transition(*slot, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    VkBufferImageCopy copy{};
-    copy.bufferOffset = at;
-    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copy.imageExtent = {data.width, data.height, 1};
-    vkCmdCopyBufferToImage(cmd(), ring_, slot->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    VkBufferImageCopy copies[16]{};
+    for (uint32_t l = 0; l < data.levels; ++l) {
+        copies[l].bufferOffset = at + data.level_offset[l];
+        copies[l].imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, 0, 1};
+        copies[l].imageExtent = {std::max(1u, data.width >> l), std::max(1u, data.height >> l), 1};
+    }
+    vkCmdCopyBufferToImage(cmd(), ring_, slot->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, data.levels, copies);
     transition(*slot, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     slot->hash = hash;
+    slot->hashed_flip = flips_;
+    slot->src = ea;
+    slot->src_size = size;
     ++texture_uploads_;
     return slot.get();
 }
@@ -745,8 +998,8 @@ VkPipeline Renderer::pipeline(const PipelineKey& k) {
     vp.scissorCount = 1;
     VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     rs.polygonMode = VK_POLYGON_MODE_FILL;
-    rs.cullMode = VK_CULL_MODE_NONE;
-    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.cullMode = k.cull;
+    rs.frontFace = VkFrontFace(k.front_face);
     rs.lineWidth = 1.0f;
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
@@ -815,7 +1068,7 @@ VkPipeline Renderer::pipeline(const PipelineKey& k) {
 void Renderer::draw(GuestMemory& mem, const State& s, const DrawCommand& d) {
     ++draws_;
     auto skip = [&] { ++skipped_; };
-    if (!bind_targets(s)) return skip();
+    if (!bind_targets(mem, s)) return skip();
 
     // Vertex program.
     const uint32_t vp_start = s.vertex_program_start();
@@ -967,8 +1220,8 @@ void Renderer::draw(GuestMemory& mem, const State& s, const DrawCommand& d) {
             const VkDeviceSize at = ring_alloc(VkDeviceSize(count) * 16, 16);
             auto* out = reinterpret_cast<float*>(ring_map_ + at);
             const uint32_t stride = a.stride;
-            for (uint32_t v = 0; v < count; ++v)
-                convert_attribute(a, mem.host(base + (first + v) * stride), out + 4 * v);
+            convert_array(a, mem.host(base + first * stride), stride, count, out);
+            converted_vertices_ += count;
             vbufs[nbind] = ring_;
             voffs[nbind++] = at;
         } else {
@@ -1025,7 +1278,9 @@ void Renderer::draw(GuestMemory& mem, const State& s, const DrawCommand& d) {
     }
     extra[8] = float(target_w_);
     extra[9] = float(target_h_);
-    extra[10] = extra[11] = 0.0f;
+    const uint32_t branch_bits = s.reg(SetTransformBranchBits);  // read as bits by BRB/CLB
+    std::memcpy(&extra[10], &branch_bits, 4);
+    extra[11] = 0.0f;
     const uint32_t nconst = uint32_t(fpi.constant_offsets.size());
     const VkDeviceSize fs_size = VkDeviceSize((nconst ? nconst : 1) + 1) * 16;
     const VkDeviceSize fs_at = ring_alloc(fs_size, 256);
@@ -1074,6 +1329,18 @@ void Renderer::draw(GuestMemory& mem, const State& s, const DrawCommand& d) {
         k.stencil[6] = s.reg(SetStencilOpZpass);
     }
     k.restart = indexed;
+    if (s.reg(SetCullFaceEnable) & 1) {
+        switch (s.reg(SetCullFace)) {
+            case 0x404: k.cull = VK_CULL_MODE_FRONT_BIT; break;           // GL_FRONT
+            case 0x405: k.cull = VK_CULL_MODE_BACK_BIT; break;            // GL_BACK
+            case 0x408: k.cull = VK_CULL_MODE_FRONT_AND_BACK; break;      // GL_FRONT_AND_BACK
+            default: break;
+        }
+    }
+    // SET_FRONT_FACE: 0x900 GL_CW, 0x901 GL_CCW, in window coordinates with y up (GL). Our
+    // window y grows downwards (the VP's viewport transform), which mirrors the winding.
+    k.front_face = (s.reg(SetFrontFace) == 0x900) != kMirroredWinding ? VK_FRONT_FACE_CLOCKWISE
+                                                                      : VK_FRONT_FACE_COUNTER_CLOCKWISE;
     const VkPipeline p = pipeline(k);
     if (!p) return skip();
 
@@ -1204,29 +1471,22 @@ void Renderer::flip(GuestMemory& mem, const State&, uint32_t buffer) {
     const DisplayBuffer db = display_buffer(buffer);
     if (!db.width || !db.height) return;
     Image* src = nullptr;
-    if (auto it = surfaces_.find(kLocalBase + db.offset); it != surfaces_.end() && !it->second->cpu_dirty)
+    if (auto it = surfaces_.find(kLocalBase + db.offset); it != surfaces_.end()) {
         src = it->second.get();
+        if (src->cpu_dirty) upload_surface(mem, it->first, *src);
+    }
     present_from(src, mem, db);
 
     const bool dump = !opt_.dump_dir.empty() && opt_.dump_every && flips_ % opt_.dump_every == 0;
     VkDeviceSize bytes = VkDeviceSize(db.width) * db.height * 4;
-    if (dump) {
-        if (readback_size_ < bytes) {
-            if (readback_) {
-                submit_and_wait();
-                vkDestroyBuffer(dev_, readback_, nullptr);
-                vkFreeMemory(dev_, readback_memory_, nullptr);
-            }
-            make_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, readback_, readback_memory_, &readback_map_);
-            readback_size_ = bytes;
-        }
+    if (dump && ensure_readback(bytes)) {
         VkBufferImageCopy copy{};
         copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         copy.imageExtent = {db.width, db.height, 1};
         vkCmdCopyImageToBuffer(cmd(), front_source_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback_, 1, &copy);
     }
     submit_and_wait();
-    if (dump) {
+    if (dump && readback_size_ >= bytes) {
         std::error_code ec;
         std::filesystem::create_directories(opt_.dump_dir, ec);
         char name[64];
@@ -1239,8 +1499,9 @@ void Renderer::flip(GuestMemory& mem, const State&, uint32_t buffer) {
 
 void Renderer::summary() {
     SLY4_INFO("RSX/Vulkan: %" PRIu64 " draws (%" PRIu64 " não desenhados), %zu pipelines, %zu programas, %" PRIu64
-              " texturas enviadas, %zu superfícies",
-              draws_, skipped_, pipelines_.size(), modules_.size(), texture_uploads_, surfaces_.size());
+              " texturas enviadas, %zu superfícies, %" PRIu64 " leituras da GPU, %" PRIu64 " cópias na GPU; %.1f GiB de texturas conferidas, %" PRIu64 " vértices convertidos",
+              draws_, skipped_, pipelines_.size(), modules_.size(), texture_uploads_, surfaces_.size(), flushes_, gpu_copies_,
+              double(hashed_bytes_) / double(1u << 30), converted_vertices_);
 }
 
 }  // namespace

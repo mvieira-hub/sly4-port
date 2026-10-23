@@ -213,6 +213,7 @@ void sys_spu_thread_write_ls(PPUContext& c, GuestMemory&) {
         case 8: store_be<uint64_t>(p, c.gpr[5]); break;
         default: c.gpr[3] = CELL_EINVAL; return;
     }
+    t->ctx.ls_written(lsa, type);  // compiled blocks there must be checked again
     c.gpr[3] = CELL_OK;
 }
 void sys_spu_thread_read_ls(PPUContext& c, GuestMemory& m) {

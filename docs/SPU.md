@@ -199,6 +199,10 @@ O `sly4_spudiff.exe` (construído junto com os blocos) faz duas coisas:
 
 No jogo, com a `libsre` e os blocos compilados, só 1 bloco novo passou pelo interpretador até o `cellGcmInit`, e o bloco descomprimido pela tarefa EDGE zlib sai idêntico ao do atalho nativo.
 
+**Até o menu (Fase 5).** O vídeo do Bink, a tela de título e o menu trazem muito código SPU novo, como os *jobs* de geometria EDGE do 3D. Foram 15.430 blocos que rodavam no interpretador. Eles foram gravados com `--spu-cache` numa execução que passa pelo menu (`--press start@45,start@47`) e compilados:
+- **45.674 blocos, 2,75 milhões de instruções**, em 116 arquivos (5 minutos de compilação);
+- o diferencial deu **700.328 casos, todos iguais** (16 por bloco; 1.852 blocos deixados de lado por DMA ou decrementador).
+
 ## 4f. Saída da fase
 
 O critério pede o conteúdo descomprimido igual ao das ferramentas Python e as threads de áudio e física rodando. Para o jogo chegar lá foi preciso:
@@ -267,7 +271,22 @@ O vídeo do Bink ainda não avança, e o áudio sai em silêncio: o próximo tra
 | `--verify-zlib` | confere cada descompressão do SPU com o inflate nativo |
 | `--dump-mem endereço,tamanho,arquivo` | grava memória do convidado ao parar |
 | `--watch-line end[,end...]` | registra cada escrita atômica ou DMA em até 32 linhas de 128 bytes: quem escreveu (thread PPU e LR, ou SPU, tarefa SPURS e `$0`) e as palavras que mudaram |
-| `--ppu-profile NOME` | amostra onde a thread PPU `NOME` roda no `sly4.exe`; os endereços se resolvem com `nm`, porque as funções geradas têm o endereço do convidado no nome |
+| `--ppu-profile NOME` | amostra onde a thread `NOME` (PPU, `RSX` ou `SPU1`–`SPU6`) roda no `sly4.exe`, e por DLL fora dele; os endereços se resolvem com `nm`, porque as funções geradas têm o endereço do convidado no nome |
+| `--call-times` | tempo dentro de cada chamada HLE e de sistema, por thread e por local de chamada |
+| `--rsx-timeline` | as esperas longas do RSX, os *labels* e os *flips*, com tempo absoluto, e as SPUs que acordaram depois de mais de 1 ms paradas |
+| `--thread-timeline NOME` | as chamadas da thread PPU `NOME`, com tempo absoluto |
+
+**Desempenho das semânticas** (Fase 5; ver [GPU.md](GPU.md), "Desempenho do menu"):
+- As semânticas são `always_inline` nos blocos gerados.
+- `shufb` usa `pshufb` (com o laço original como referência e um teste que compara os dois).
+- Os *loads*/*stores* de quadword são um `pshufb` (a inversão dos 16 bytes).
+- Os denormais da precisão simples são zerados pelo próprio host: DAZ/FTZ do MXCSR, ligados em volta do código SPU (`SpuFloatMode`, em `spu_run` e `spu_run_blocks`). Só o NaN do resultado é normalizado. A precisão dupla desliga os dois (`IeeeDoubles`) e continua IEEE. Os blocos e o interpretador compilam com `-fsignaling-nans`, que impede o GCC de trocar `x * 1.0` por `x`.
+- Os laços elemento a elemento vão do último elemento ao primeiro, a ordem da memória do host, e o GCC os vetoriza sem inverter as *lanes*.
+- A lógica de 128 bits usa SSE, e os deslocamentos e rotações por bytes usam `pshufb` com máscaras de uma tabela.
+- Um bloco já achado fica num cache por SPU (`block_cache`), validado pelas épocas das páginas de 4 KiB do *local store*. Cada escrita (*store* SPU, DMA, `getllar`, kernel) avança a época da página. O acerto é testado no próprio laço, sem chamada.
+- O DMA copia com *stores* alinhados de 16 bytes (`dma_copy`), para que outra thread nunca leia um comando pela metade.
+- O oráculo do inflate caiu de 7,3 s para 3,9 s, com o diferencial e o oráculo iguais. O menu foi de ~8,6 para ~41–47 quadros/s.
+- O projeto compila com `-fno-strict-aliasing`: com o *inline*, o *aliasing* entre os membros da *union* `SpuReg` gerou 123 casos errados.
 
 Além disso:
 - O resumo mostra as instruções em volta do PC de cada SPU, e o LR e a cadeia de retornos da pilha de cada thread PPU.

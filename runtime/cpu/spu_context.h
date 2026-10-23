@@ -10,6 +10,8 @@
 #include <cstring>
 #include <memory>
 
+#include <immintrin.h>
+
 #include "memory/guest_memory.h"
 
 namespace sly4 {
@@ -90,15 +92,64 @@ struct SPUContext {
     StalledList stalled[32];
     uint32_t list_stall_stat = 0;  // MFC_RdListStallStat
 
+    // Compiled blocks run only when local store holds the code they came from. Checking that
+    // with a memcmp on every entry cost ~10% of a busy SPU, so each 4 KiB page of local
+    // store has an epoch, bumped by every write to it (SPU stores, DMA gets, getllar, the
+    // kernel), and a block found to match is trusted until an epoch of its pages moves.
+    static constexpr uint32_t kLsPages = kSpuLsSize / 4096;
+    uint32_t ls_epoch[kLsPages] = {};
+    struct CachedBlock {
+        uint32_t pc = ~0u;
+        uint32_t page0 = 0, page1 = 0, epoch0 = 0, epoch1 = 0;
+        void* fn = nullptr;  // SpuBlockFn (spu_blocks.h)
+    };
+    static constexpr uint32_t kBlockCache = 4096;
+    CachedBlock block_cache[kBlockCache];
+
+    void ls_written(uint32_t lsa, uint32_t size) {
+        if (!size) return;
+        const uint32_t first = (lsa & kSpuLsMask) >> 12, last = ((lsa + size - 1) & kSpuLsMask) >> 12;
+        for (uint32_t p = first;; p = (p + 1) % kLsPages) {
+            ++ls_epoch[p];
+            if (p == last) break;
+        }
+    }
+    // Local store changed by means that do not say where (tests, loaders): forget everything.
+    void ls_rewritten() {
+        for (uint32_t& e : ls_epoch) ++e;
+    }
+
     uint32_t ls_u32(uint32_t a) const { return load_be<uint32_t>(ls + (a & kSpuLsMask)); }
+    // The register keeps the quadword's bytes reversed: one pshufb (two 64-bit byte swaps
+    // without SSSE3).
     void read_quad(uint32_t a, SpuReg& r) const {
         const uint8_t* p = ls + (a & kSpuLsMask & ~0xFu);
-        for (int i = 0; i < 16; ++i) r.b[15 - i] = p[i];
+#ifdef __SSSE3__
+        const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(r.b), _mm_shuffle_epi8(v, reverse_bytes()));
+#else
+        uint64_t hi, lo;
+        std::memcpy(&hi, p, 8);
+        std::memcpy(&lo, p + 8, 8);
+        r.d[1] = __builtin_bswap64(hi);
+        r.d[0] = __builtin_bswap64(lo);
+#endif
     }
     void write_quad(uint32_t a, const SpuReg& r) {
+        ++ls_epoch[(a & kSpuLsMask) >> 12];
         uint8_t* p = ls + (a & kSpuLsMask & ~0xFu);
-        for (int i = 0; i < 16; ++i) p[i] = r.b[15 - i];
+#ifdef __SSSE3__
+        const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(r.b));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(p), _mm_shuffle_epi8(v, reverse_bytes()));
+#else
+        const uint64_t hi = __builtin_bswap64(r.d[1]), lo = __builtin_bswap64(r.d[0]);
+        std::memcpy(p, &hi, 8);
+        std::memcpy(p + 8, &lo, 8);
+#endif
     }
+#ifdef __SSSE3__
+    static __m128i reverse_bytes() { return _mm_set_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15); }
+#endif
 };
 
 // Local store with the alignment SIMD loads like (one per SPU).

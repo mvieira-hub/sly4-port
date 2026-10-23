@@ -83,6 +83,7 @@ uint32_t crc32(const uint8_t* p, size_t n) {
 }  // namespace
 
 int cmd(int argc, char** argv) {
+    spusem::SpuFloatMode fp;  // as SPU code runs (spu_run, spu_run_blocks)
     std::string elf_path, psarc_path;
     int count = 200;
     uint64_t seed = 1;

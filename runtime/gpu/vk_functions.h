@@ -95,6 +95,7 @@ namespace sly4::vk {
     X(vkCmdCopyBufferToImage)        \
     X(vkCmdCopyImageToBuffer)        \
     X(vkCmdBlitImage)                \
+    X(vkCmdCopyImage)                \
     X(vkCmdClearColorImage)          \
     X(vkCmdClearDepthStencilImage)   \
     X(vkCmdClearAttachments)         \

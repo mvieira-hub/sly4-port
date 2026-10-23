@@ -34,7 +34,8 @@ target_link_libraries(sly4_cpu PUBLIC sly4_runtime sly4_ppu)
 # FP results depend on the rounding mode set at run time and on IEEE flags. -mfma makes
 # std::fma/fmaf the hardware fused multiply-add (MinGW's library versions round twice,
 # which breaks fmadd/vmaddfp by one ulp); x86 CPUs have had FMA3 since 2013.
-target_compile_options(sly4_cpu PRIVATE -frounding-math -fno-fast-math -ffp-contract=off -mfma)
+# -fsignaling-nans keeps x * 1.0 a multiply, as in the generated SPU code (CMakeLists.txt).
+target_compile_options(sly4_cpu PRIVATE -frounding-math -fno-fast-math -ffp-contract=off -fsignaling-nans -mfma)
 
 # LV2 kernel and HLE firmware libraries (phase 3).
 add_library(sly4_kernel STATIC

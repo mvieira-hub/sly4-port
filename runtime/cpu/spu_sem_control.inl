@@ -6,7 +6,7 @@ namespace sly4::spusem {
 // ---------------------------------------------------------------- branches
 #define SPU_BRANCH(name, ...)                                    \
     template <>                                                  \
-    inline SpuStep op<Op::name>(SPUContext & c, Insn in) {       \
+    SLY4_SPU_INLINE SpuStep op<Op::name>(SPUContext & c, Insn in) {       \
         [[maybe_unused]] const u32 rel = branch_target(c.pc + u32(in.i16() * 4)); \
         [[maybe_unused]] const u32 abs = branch_target(u32(in.i16() * 4)); \
         [[maybe_unused]] const u32 ind = branch_target(c.gpr[in.ra()].pref()); \
@@ -20,7 +20,7 @@ SPU_BRANCH(brsl, set_link(c, in.rt()); c.pc = rel; return SpuStep::Branch)
 SPU_BRANCH(brasl, set_link(c, in.rt()); c.pc = abs; return SpuStep::Branch)
 // Indirect branches that are taken also apply their E (enable interrupts) and D
 // (disable) flags.
-inline SpuStep take_ind(SPUContext& c, Insn in, u32 target) {
+SLY4_SPU_INLINE SpuStep take_ind(SPUContext& c, Insn in, u32 target) {
     if (in.fb() & 0x10) c.irq = true;
     if (in.fb() & 0x20) c.irq = false;
     c.pc = target;
@@ -55,13 +55,13 @@ SPU_SEM(hbrr, (void)0)
 
 // stop: the 14-bit signal goes to whoever runs the SPU (thread group, SPURS...).
 template <>
-inline SpuStep op<Op::stop>(SPUContext& c, Insn in) {
+SLY4_SPU_INLINE SpuStep op<Op::stop>(SPUContext& c, Insn in) {
     c.stop_code = in.u14();
     c.pc += 4;
     return SpuStep::Stop;
 }
 template <>
-inline SpuStep op<Op::stopd>(SPUContext& c, Insn) {
+SLY4_SPU_INLINE SpuStep op<Op::stopd>(SPUContext& c, Insn) {
     c.stop_code = 0x3FFF;  // debug stop
     c.pc += 4;
     return SpuStep::Stop;
@@ -69,7 +69,7 @@ inline SpuStep op<Op::stopd>(SPUContext& c, Insn) {
 
 // ---------------------------------------------------------------- channels and SPRs
 template <>
-inline SpuStep op<Op::rdch>(SPUContext& c, Insn in) {
+SLY4_SPU_INLINE SpuStep op<Op::rdch>(SPUContext& c, Insn in) {
     u32 v = 0;
     switch (spu_read_channel(c, in.ra(), v)) {
         case SpuChannelResult::Ok: break;
@@ -82,14 +82,14 @@ inline SpuStep op<Op::rdch>(SPUContext& c, Insn in) {
     return SpuStep::Ok;
 }
 template <>
-inline SpuStep op<Op::rchcnt>(SPUContext& c, Insn in) {
+SLY4_SPU_INLINE SpuStep op<Op::rchcnt>(SPUContext& c, Insn in) {
     SpuReg r{};
     r.u32(0) = spu_channel_count(c, in.ra());
     c.gpr[in.rt()] = r;
     return SpuStep::Ok;
 }
 template <>
-inline SpuStep op<Op::wrch>(SPUContext& c, Insn in) {
+SLY4_SPU_INLINE SpuStep op<Op::wrch>(SPUContext& c, Insn in) {
     switch (spu_write_channel(c, in.ra(), c.gpr[in.rt()].pref())) {
         case SpuChannelResult::Ok: return SpuStep::Ok;
         case SpuChannelResult::Wait: return SpuStep::Wait;

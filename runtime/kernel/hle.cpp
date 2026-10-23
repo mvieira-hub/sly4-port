@@ -1,6 +1,7 @@
 #include "kernel/hle.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <map>
 #include <cstdio>
@@ -44,6 +45,58 @@ void CallLog::print_ring(size_t last) const {
     for (size_t i = ring_next_ - n; i < ring_next_; ++i) {
         const RingEntry& e = ring_[i % kRing];
         std::fprintf(stderr, "  {%s} %s(0x%" PRIX64 ", 0x%" PRIX64 ") <- 0x%08X\n", e.thread, e.name, e.r3, e.r4, e.lr);
+    }
+}
+
+void CallLog::add_time(const char* thread, const char* name, uint64_t ns) {
+    std::lock_guard<std::mutex> g(time_lock_);
+    Timed& t = times_[{thread, name}];
+    ++t.calls;
+    t.ns += ns;
+}
+
+void CallLog::timeline(const char* thread, const char* what, std::chrono::steady_clock::time_point t0) {
+    if (timeline_thread.empty() || timeline_thread != thread) return;
+    struct Run {
+        std::string what;
+        double start = 0, end = 0;
+        uint64_t n = 0;
+    };
+    thread_local Run run;
+    auto ms = [](std::chrono::steady_clock::time_point t) {
+        return std::chrono::duration<double, std::milli>(t.time_since_epoch()).count();
+    };
+    const double start = ms(t0), end = ms(std::chrono::steady_clock::now());
+    if (run.n && run.what == what && start - run.end < 1.0) {  // the same call again: a loop
+        run.end = end;
+        ++run.n;
+        return;
+    }
+    if (run.n)
+        SLY4_INFO("%10.3f ms {%s} %s x%llu, %.2f ms", run.start, thread, run.what.c_str(), (unsigned long long)run.n,
+                  run.end - run.start);
+    run = Run{what, start, end, 1};
+}
+
+void CallLog::print_times() const {
+    std::lock_guard<std::mutex> g(time_lock_);
+    if (times_.empty()) return;
+    const double wall =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - time_start_).count();
+    // Per thread: total time inside calls, then the calls that took the most.
+    std::map<std::string, std::vector<std::pair<uint64_t, std::string>>> by_thread;
+    std::map<std::string, uint64_t> total;
+    for (const auto& [key, t] : times_) {
+        by_thread[key.first].push_back({t.ns, key.second + " (" + std::to_string(t.calls) + "x)"});
+        total[key.first] += t.ns;
+    }
+    std::fprintf(stderr, "[info] tempo dentro das chamadas (%.1f s de execução):\n", wall);
+    for (auto& [thread, v] : by_thread) {
+        std::sort(v.rbegin(), v.rend());
+        std::fprintf(stderr, "  %-26s %6.1f%% em chamadas:", thread.c_str(), 100.0 * double(total[thread]) * 1e-9 / wall);
+        for (size_t i = 0; i < v.size() && i < 4; ++i)
+            std::fprintf(stderr, " %s %.1f%%;", v[i].second.c_str(), 100.0 * double(v[i].first) * 1e-9 / wall);
+        std::fprintf(stderr, "\n");
     }
 }
 
@@ -163,10 +216,17 @@ void HleTable::call(PPUContext& c, GuestMemory& m, uint32_t target) {
         log.record(line);
     }
     if (call_hook_) call_hook_(c, m, im.name.c_str());
+    const auto t0 = log.timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (im.fn)
         im.fn(c, m);
     else
         c.gpr[3] = 0;
+    if (log.timing) {
+        const PpuThread* t = current_thread();
+        log.timeline(t ? t->name.c_str() : "?", im.name.c_str(), t0);
+        log.add_time(t ? t->name.c_str() : "?", im.name.c_str(),
+                     uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()));
+    }
 }
 
 // A call into a firmware module (rt::set_lle_trace): logged like an HLE call.

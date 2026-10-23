@@ -11,6 +11,7 @@
 #include "core/endian.h"
 #include "cpu/guest_atomic.h"
 #include "cpu/ppu_rt.h"
+#include "cpu/spu_blocks.h"
 #include "cpu/spu_channels.h"
 #include "cpu/spu_interpreter.h"
 #include "kernel/spu_thread.h"
@@ -106,6 +107,30 @@ TEST(spu_putllc_keeps_other_stores) {
     store_be<uint16_t>(now + 0x22, 2);
     guest_store_line_changes(memory, old, now);
     CHECK_EQ(load_be<uint32_t>(memory + 0x20), 0x00070002u);
+}
+
+// A compiled block found to match is trusted until its local-store page is written: by an
+// SPU store or a DMA get (epochs), after which it is compared again.
+SpuStep test_block_fn(SPUContext&, uint64_t&) { return SpuStep::Ok; }
+
+TEST(spu_block_cache_follows_local_store_writes) {
+    static const uint8_t code[8] = {0x40, 0x80, 0x00, 0x03, 0x40, 0x80, 0x00, 0x84};  // il $3,0; il $4,1
+    static const SpuBlockEntry entry{0x3F000, 8, code, test_block_fn};
+    spu_register_blocks(&entry, 1);
+    auto ls = std::make_unique<SpuLocalStore>();
+    SPUContext c;
+    c.ls = ls->data;
+    std::memcpy(ls->data + 0x3F000, code, 8);
+    c.ls_rewritten();
+    c.pc = 0x3F000;
+    CHECK(spu_find_block(c) == test_block_fn);
+    CHECK(spu_find_block(c) == test_block_fn);  // from the cache
+    SpuReg r{};  // an SPU store over the code: the block no longer matches
+    c.write_quad(0x3F000, r);
+    CHECK(spu_find_block(c) == nullptr);
+    std::memcpy(ls->data + 0x3F000, code, 8);  // back, as a DMA get would put it
+    c.ls_written(0x3F000, 8);
+    CHECK(spu_find_block(c) == test_block_fn);
 }
 
 // Firmware modules register their own generated function table next to the game's.

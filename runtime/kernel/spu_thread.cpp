@@ -87,8 +87,30 @@ uint32_t SpuThread::pending_events() {
 }
 
 // ---------------------------------------------------------------- SPU channels
+// Channel reads that waited: how many were woken up by a notification and how many only
+// found their event after the 1 ms timeout (a write nobody announced), for the summary.
+bool g_spu_timeline = false;
+double steady_ms_now() {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+void spu_timeline(bool on) { g_spu_timeline = on; }
+std::atomic<uint64_t> g_waits_woken{0}, g_waits_late{0}, g_late_events[3]{};  // [LLR, decrementer, other]
+
 SpuChannelResult SpuThread::read(SPUContext& c, uint32_t ch, uint32_t& value) {
     std::unique_lock<std::mutex> lk(m);
+    bool waited = false, late = false;
+    auto found = [&](uint32_t ev) {
+        if (!waited) return;
+        if (g_spu_timeline && idle_since) {
+            const double now = steady_ms_now();
+            if (now - idle_since > 1.0)
+                SLY4_INFO("%10.3f ms SPU%u: acordou após %.2f ms (pc 0x%05X, evento 0x%X)", now, id & 0xFF, now - idle_since,
+                          c.pc, ev);
+        }
+        idle_since = 0;
+        (late ? g_waits_late : g_waits_woken).fetch_add(1, std::memory_order_relaxed);
+        if (late) g_late_events[(ev & spu_event::LlrLost) ? 0 : (ev & 0x20) ? 1 : 2].fetch_add(1, std::memory_order_relaxed);
+    };
     // Gives up after ~10 ms with Wait: the rdch is retried, and the run loop sees stops.
     for (int tries = 0; tries < 10; ++tries) {
         const uint32_t seen = g_line_epoch.load();
@@ -96,6 +118,7 @@ SpuChannelResult SpuThread::read(SPUContext& c, uint32_t ch, uint32_t& value) {
         switch (ch) {
             case spu_ch::RdInMbox:
                 if (!in_mbox.empty()) {
+                    found(spu_event::InMbox);
                     value = in_mbox.front();
                     in_mbox.pop_front();
                     return SpuChannelResult::Ok;
@@ -105,6 +128,7 @@ SpuChannelResult SpuThread::read(SPUContext& c, uint32_t ch, uint32_t& value) {
             case spu_ch::RdSigNotify2: {
                 const int n = ch == spu_ch::RdSigNotify1 ? 0 : 1;
                 if (snr_valid[n]) {
+                    found(0);
                     value = snr[n];
                     snr[n] = 0;
                     snr_valid[n] = false;
@@ -116,6 +140,7 @@ SpuChannelResult SpuThread::read(SPUContext& c, uint32_t ch, uint32_t& value) {
                 spu_check_decrementer(c);
                 c.event_stat |= pending_events();
                 if (c.event_stat & c.event_mask) {
+                    found(c.event_stat & c.event_mask);
                     value = c.event_stat & c.event_mask;
                     return SpuChannelResult::Ok;
                 }
@@ -127,7 +152,11 @@ SpuChannelResult SpuThread::read(SPUContext& c, uint32_t ch, uint32_t& value) {
         // Atomic writes to any line wake the SPUs (wake_spus); a line written while we looked
         // is looked at again at once.
         if (g_line_epoch.load() != seen) continue;
-        cv.wait_for(lk, std::chrono::milliseconds(1));
+        waited = true;
+        if (g_spu_timeline && !idle_since) idle_since = steady_ms_now();
+        const auto w0 = std::chrono::steady_clock::now();
+        late = cv.wait_for(lk, std::chrono::milliseconds(1)) == std::cv_status::timeout;
+        waited_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - w0).count());
     }
     return SpuChannelResult::Wait;
 }
@@ -253,6 +282,7 @@ bool SpuThread::handle_stop(uint32_t code) {
 
 void SpuThread::run() {
     running = true;
+    name_host_thread("SPU" + std::to_string(id & 0xFF));  // --ppu-profile SPU1 ... SPU6
     while (!stop_requested) {
         uint64_t n = 0;
         const SpuStep st = spu_run_blocks(ctx, 100000, n);
@@ -370,6 +400,10 @@ void spu_profile_start() {
 }
 
 void spu_profile_print() {
+    if (const uint64_t late = g_waits_late.load())
+        SLY4_INFO("SPU: %" PRIu64 " esperas de canal acordadas, %" PRIu64
+                  " só vistas no timeout de 1 ms (reserva %" PRIu64 ", decrementador %" PRIu64 ", outras %" PRIu64 ")",
+                  g_waits_woken.load(), late, g_late_events[0].load(), g_late_events[1].load(), g_late_events[2].load());
     if (!g_profiling) return;
     std::lock_guard<std::mutex> g(g_profile_lock);
     std::map<uint32_t, std::vector<std::pair<uint64_t, uint32_t>>> by_spu;
@@ -382,7 +416,7 @@ void spu_profile_print() {
         std::shared_ptr<SpuThread> t;
         for (const auto& s : spu_threads())
             if (s->id == id) t = s;
-        for (size_t i = 0; i < v.size() && i < 16; ++i)
+        for (size_t i = 0; i < v.size() && i < 80; ++i)
             std::fprintf(stderr, "    %5.1f%%  %05X  %s\n", 100.0 * double(v[i].first) / double(total), v[i].second,
                          t ? spu::disasm(spu::decode(t->ctx.ls_u32(v[i].second)), v[i].second).c_str() : "");
     }

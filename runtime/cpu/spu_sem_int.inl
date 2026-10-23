@@ -17,7 +17,7 @@ SPU_SEM(stqr, c.write_quad(c.pc + u32(in.i16() * 4), RT))
 
 // Insertion controls: the "identity" shuffle pattern for inserting into the quadword
 // with the element at (address & 15) replaced by the preferred-slot bytes.
-inline void insertion_control(SpuReg& r, u32 addr, int size) {
+SLY4_SPU_INLINE void insertion_control(SpuReg& r, u32 addr, int size) {
     for (int i = 0; i < 16; ++i) r.u8(i) = u8(0x10 + i);
     const u32 at = addr & 15 & ~u32(size - 1);
     const int first = size == 8 ? 0 : 4 - size;  // byte of the preferred slot the element starts at
@@ -58,8 +58,8 @@ SPU_WORDS(bg, RA.u32(i) <= RB.u32(i) ? 1u : 0u)  // 1 = no borrow from RB - RA
 SPU_WORDS(bgx, (RT.u32(i) & 1) ? (RB.u32(i) >= RA.u32(i) ? 1u : 0u) : (RB.u32(i) > RA.u32(i) ? 1u : 0u))
 
 // 16 x 16 multiplies on halfwords of each word (low = bits 0-15 of the word).
-inline s32 lo16s(u32 x) { return s16(x); }
-inline s32 hi16s(u32 x) { return s16(x >> 16); }
+SLY4_SPU_INLINE s32 lo16s(u32 x) { return s16(x); }
+SLY4_SPU_INLINE s32 hi16s(u32 x) { return s16(x >> 16); }
 SPU_WORDS(mpy, u32(lo16s(RA.u32(i)) * lo16s(RB.u32(i))))
 SPU_WORDS(mpyu, (RA.u32(i) & 0xFFFF) * (RB.u32(i) & 0xFFFF))
 SPU_WORDS(mpyi, u32(lo16s(RA.u32(i)) * in.i10()))
@@ -101,14 +101,15 @@ SPU_SEM(gbh, u32 v = 0; for (int i = 0; i < 8; ++i) v = (v << 1) | (RA.u16(i) & 
 SPU_SEM(gb, u32 v = 0; for (int i = 0; i < 4; ++i) v = (v << 1) | (RA.u32(i) & 1); SpuReg r{}; r.u32(0) = v; RT = r)
 
 // ---------------------------------------------------------------- logical
-SPU_SEM(and_, set_q(RT, q(RA) & q(RB)))
-SPU_SEM(andc, set_q(RT, q(RA) & ~q(RB)))
-SPU_SEM(nand, set_q(RT, ~(q(RA) & q(RB))))
-SPU_SEM(or_, set_q(RT, q(RA) | q(RB)))
-SPU_SEM(orc, set_q(RT, q(RA) | ~q(RB)))
-SPU_SEM(nor, set_q(RT, ~(q(RA) | q(RB))))
-SPU_SEM(xor_, set_q(RT, q(RA) ^ q(RB)))
-SPU_SEM(eqv, set_q(RT, ~(q(RA) ^ q(RB))))
+SLY4_SPU_INLINE __m128i vnot(__m128i v) { return _mm_xor_si128(v, _mm_set1_epi32(-1)); }
+SPU_SEM(and_, set_vq(RT, _mm_and_si128(vq(RA), vq(RB))))
+SPU_SEM(andc, set_vq(RT, _mm_andnot_si128(vq(RB), vq(RA))))
+SPU_SEM(nand, set_vq(RT, vnot(_mm_and_si128(vq(RA), vq(RB)))))
+SPU_SEM(or_, set_vq(RT, _mm_or_si128(vq(RA), vq(RB))))
+SPU_SEM(orc, set_vq(RT, _mm_or_si128(vq(RA), vnot(vq(RB)))))
+SPU_SEM(nor, set_vq(RT, vnot(_mm_or_si128(vq(RA), vq(RB)))))
+SPU_SEM(xor_, set_vq(RT, _mm_xor_si128(vq(RA), vq(RB))))
+SPU_SEM(eqv, set_vq(RT, vnot(_mm_xor_si128(vq(RA), vq(RB)))))
 SPU_BYTES(andbi, RA.u8(i) & u8(in.i10()))
 SPU_HALVES(andhi, RA.u16(i) & u16(in.i10()))
 SPU_WORDS(andi, RA.u32(i) & u32(in.i10()))
@@ -120,29 +121,62 @@ SPU_HALVES(xorhi, RA.u16(i) ^ u16(in.i10()))
 SPU_WORDS(xori, RA.u32(i) ^ u32(in.i10()))
 SPU_SEM(orx, SpuReg r{}; r.u32(0) = RA.u32(0) | RA.u32(1) | RA.u32(2) | RA.u32(3); RT = r)
 // RRR: C = (A & ~T) | (B & T).
-SPU_SEM(selb, SpuReg r; set_q(r, (q(RA) & ~q(RT)) | (q(RB) & q(RT))); c.gpr[cc] = r)
+SPU_SEM(selb, SpuReg r; set_vq(r, _mm_or_si128(_mm_andnot_si128(vq(RT), vq(RA)), _mm_and_si128(vq(RB), vq(RT))));
+        c.gpr[cc] = r)
 // RRR: C = bytes of A:B picked by T, with the 0x80/0xC0/0xE0 constants.
-SPU_SEM(shufb, SpuReg r; for (int i = 0; i < 16; ++i) {
-    const u8 s = RT.u8(i);
-    if ((s & 0xC0) == 0x80)
-        r.u8(i) = 0x00;
-    else if ((s & 0xE0) == 0xC0)
-        r.u8(i) = 0xFF;
-    else if ((s & 0xE0) == 0xE0)
-        r.u8(i) = 0x80;
-    else
-        r.u8(i) = (s & 0x10) ? RB.u8(s & 15) : RA.u8(s & 15);
-} c.gpr[cc] = r)
+// shufb, byte by byte: the reference (and the path without SSE4.1).
+SLY4_SPU_INLINE SpuReg shufb_bytes(const SpuReg& a, const SpuReg& b, const SpuReg& sel) {
+    SpuReg r;
+    for (int i = 0; i < 16; ++i) {
+        const u8 s = sel.u8(i);
+        if ((s & 0xC0) == 0x80)
+            r.u8(i) = 0x00;
+        else if ((s & 0xE0) == 0xC0)
+            r.u8(i) = 0xFF;
+        else if ((s & 0xE0) == 0xE0)
+            r.u8(i) = 0x80;
+        else
+            r.u8(i) = (s & 0x10) ? b.u8(s & 15) : a.u8(s & 15);
+    }
+    return r;
+}
+
+// The same with pshufb. The registers hold the bytes reversed (host byte k is SPU byte
+// 15 - k), so SPU byte s & 15 is host byte (~s) & 15; selectors with the top bit set give
+// 0x00, 0xFF or 0x80. It was the most frequent instruction in the menu's SPU jobs.
+SLY4_SPU_INLINE SpuReg shufb(const SpuReg& a, const SpuReg& b, const SpuReg& sel) {
+#ifdef __SSE4_1__
+    __m128i va, vb, vs;
+    std::memcpy(&va, a.b, 16);
+    std::memcpy(&vb, b.b, 16);
+    std::memcpy(&vs, sel.b, 16);
+    const __m128i idx = _mm_andnot_si128(vs, _mm_set1_epi8(0x0F));
+    const __m128i use_b = _mm_cmpeq_epi8(_mm_and_si128(vs, _mm_set1_epi8(0x10)), _mm_set1_epi8(0x10));
+    __m128i r = _mm_blendv_epi8(_mm_shuffle_epi8(va, idx), _mm_shuffle_epi8(vb, idx), use_b);
+    const __m128i top3 = _mm_and_si128(vs, _mm_set1_epi8(char(0xE0)));
+    const __m128i ff = _mm_cmpeq_epi8(top3, _mm_set1_epi8(char(0xC0)));                       // 110xxxxx
+    const __m128i x80 = _mm_and_si128(_mm_cmpeq_epi8(top3, _mm_set1_epi8(char(0xE0))), _mm_set1_epi8(char(0x80)));
+    const __m128i special = _mm_or_si128(ff, x80);                                            // 10xxxxxx: 0
+    r = _mm_blendv_epi8(r, special, vs);  // blendv takes the top bit of each selector byte
+    SpuReg out;
+    std::memcpy(out.b, &r, 16);
+    return out;
+#else
+    return shufb_bytes(a, b, sel);
+#endif
+}
+
+SPU_SEM(shufb, c.gpr[cc] = shufb(RA, RB, RT))
 
 // ---------------------------------------------------------------- shifts and rotates
 // Element shifts: left by the count, or right ("rotate and mask") by the negated count;
 // a count of the element size or more gives 0 (or the sign for the arithmetic forms).
-inline u32 shl_w(u32 x, u32 n) { return n > 31 ? 0 : x << n; }
-inline u16 shl_h(u16 x, u32 n) { return n > 15 ? 0 : u16(x << n); }
-inline u32 shr_w(u32 x, u32 n) { return n > 31 ? 0 : x >> n; }
-inline u16 shr_h(u16 x, u32 n) { return n > 15 ? 0 : u16(x >> n); }
-inline u32 sar_w(u32 x, u32 n) { return u32(s32(x) >> (n > 31 ? 31 : n)); }
-inline u16 sar_h(u16 x, u32 n) { return u16(s16(x) >> (n > 15 ? 15 : n)); }
+SLY4_SPU_INLINE u32 shl_w(u32 x, u32 n) { return n > 31 ? 0 : x << n; }
+SLY4_SPU_INLINE u16 shl_h(u16 x, u32 n) { return n > 15 ? 0 : u16(x << n); }
+SLY4_SPU_INLINE u32 shr_w(u32 x, u32 n) { return n > 31 ? 0 : x >> n; }
+SLY4_SPU_INLINE u16 shr_h(u16 x, u32 n) { return n > 15 ? 0 : u16(x >> n); }
+SLY4_SPU_INLINE u32 sar_w(u32 x, u32 n) { return u32(s32(x) >> (n > 31 ? 31 : n)); }
+SLY4_SPU_INLINE u16 sar_h(u16 x, u32 n) { return u16(s16(x) >> (n > 15 ? 15 : n)); }
 
 SPU_HALVES(shlh, shl_h(RA.u16(i), RB.u16(i) & 0x1F))
 SPU_HALVES(shlhi, shl_h(RA.u16(i), u32(in.i7()) & 0x1F))
@@ -162,23 +196,43 @@ SPU_WORDS(rotma, sar_w(RA.u32(i), (0u - RB.u32(i)) & 0x3F))
 SPU_WORDS(rotmai, sar_w(RA.u32(i), (0u - u32(in.i7())) & 0x3F))
 
 // Quadword shifts by bits (0-7) or bytes (0-31, >= 16 clears) from the preferred word.
-inline u128 qshl(u128 x, u32 bits) { return bits > 127 ? 0 : x << bits; }
-inline u128 qshr(u128 x, u32 bits) { return bits > 127 ? 0 : x >> bits; }
+SLY4_SPU_INLINE u128 qshl(u128 x, u32 bits) { return bits > 127 ? 0 : x << bits; }
+SLY4_SPU_INLINE u128 qshr(u128 x, u32 bits) { return bits > 127 ? 0 : x >> bits; }
 SPU_SEM(shlqbi, set_q(RT, qshl(q(RA), RB.pref() & 7)))
 SPU_SEM(shlqbii, set_q(RT, qshl(q(RA), u32(in.i7()) & 7)))
-SPU_SEM(shlqby, set_q(RT, qshl(q(RA), (RB.pref() & 0x1F) * 8)))
-SPU_SEM(shlqbyi, set_q(RT, qshl(q(RA), (u32(in.i7()) & 0x1F) * 8)))
-SPU_SEM(shlqbybi, set_q(RT, qshl(q(RA), ((RB.pref() >> 3) & 0x1F) * 8)))
+// By bytes with pshufb: host byte k takes host byte k - n (left) or k + n (right); the
+// masks are windows into these tables, 0x80 giving zero.
+alignas(16) inline constexpr u8 kShiftWindow[48] = {
+    0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+    0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80};
+alignas(16) inline constexpr u8 kRotateWindow[32] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                                                     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+SLY4_SPU_INLINE void shuffle_bytes(SpuReg& rt, const SpuReg& ra, const u8* mask) {
+#ifdef __SSSE3__
+    set_vq(rt, _mm_shuffle_epi8(vq(ra), _mm_loadu_si128(reinterpret_cast<const __m128i*>(mask))));
+#else
+    SpuReg r;
+    for (int k = 0; k < 16; ++k) r.b[k] = (mask[k] & 0x80) ? 0 : ra.b[mask[k] & 15];
+    rt = r;
+#endif
+}
+SLY4_SPU_INLINE void qshl_bytes(SpuReg& rt, const SpuReg& ra, u32 n) { shuffle_bytes(rt, ra, kShiftWindow + 16 - (n > 16 ? 16 : n)); }
+SLY4_SPU_INLINE void qshr_bytes(SpuReg& rt, const SpuReg& ra, u32 n) { shuffle_bytes(rt, ra, kShiftWindow + 16 + (n > 16 ? 16 : n)); }
+SLY4_SPU_INLINE void qrotl_bytes(SpuReg& rt, const SpuReg& ra, u32 n) { shuffle_bytes(rt, ra, kRotateWindow + 16 - (n & 15)); }
+SPU_SEM(shlqby, qshl_bytes(RT, RA, RB.pref() & 0x1F))
+SPU_SEM(shlqbyi, qshl_bytes(RT, RA, u32(in.i7()) & 0x1F))
+SPU_SEM(shlqbybi, qshl_bytes(RT, RA, (RB.pref() >> 3) & 0x1F))
 SPU_SEM(rotqbi, set_q(RT, rotl128(q(RA), RB.pref() & 7)))
 SPU_SEM(rotqbii, set_q(RT, rotl128(q(RA), u32(in.i7()) & 7)))
-SPU_SEM(rotqby, set_q(RT, rotl128(q(RA), (RB.pref() & 0xF) * 8)))
-SPU_SEM(rotqbyi, set_q(RT, rotl128(q(RA), (u32(in.i7()) & 0xF) * 8)))
-SPU_SEM(rotqbybi, set_q(RT, rotl128(q(RA), ((RB.pref() >> 3) & 0xF) * 8)))
+SPU_SEM(rotqby, qrotl_bytes(RT, RA, RB.pref() & 0xF))
+SPU_SEM(rotqbyi, qrotl_bytes(RT, RA, u32(in.i7()) & 0xF))
+SPU_SEM(rotqbybi, qrotl_bytes(RT, RA, (RB.pref() >> 3) & 0xF))
 SPU_SEM(rotqmbi, set_q(RT, qshr(q(RA), (0u - RB.pref()) & 7)))
 SPU_SEM(rotqmbii, set_q(RT, qshr(q(RA), (0u - u32(in.i7())) & 7)))
-SPU_SEM(rotqmby, set_q(RT, qshr(q(RA), ((0u - RB.pref()) & 0x1F) * 8)))
-SPU_SEM(rotqmbyi, set_q(RT, qshr(q(RA), ((0u - u32(in.i7())) & 0x1F) * 8)))
-SPU_SEM(rotqmbybi, set_q(RT, qshr(q(RA), ((0u - (RB.pref() >> 3)) & 0x1F) * 8)))
+SPU_SEM(rotqmby, qshr_bytes(RT, RA, (0u - RB.pref()) & 0x1F))
+SPU_SEM(rotqmbyi, qshr_bytes(RT, RA, (0u - u32(in.i7())) & 0x1F))
+SPU_SEM(rotqmbybi, qshr_bytes(RT, RA, (0u - (RB.pref() >> 3)) & 0x1F))
 
 // ---------------------------------------------------------------- compares
 #define SPU_MASK(c_) ((c_) ? ~0u : 0u)
@@ -205,7 +259,7 @@ SPU_WORDS(clgti, SPU_MASK(RA.u32(i) > u32(in.i10())))
 // Halt: stop the SPU when the preferred words compare true.
 #define SPU_HALT(name, cond) \
     template <>              \
-    inline SpuStep op<Op::name>(SPUContext & c, Insn in) { \
+    SLY4_SPU_INLINE SpuStep op<Op::name>(SPUContext & c, Insn in) { \
         const u32 x = c.gpr[in.ra()].pref(), y = c.gpr[in.rb()].pref(); \
         (void)y; \
         return (cond) ? SpuStep::Halt : SpuStep::Ok; \

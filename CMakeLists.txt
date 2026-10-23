@@ -17,6 +17,11 @@ find_path(VULKAN_HEADERS_DIR vulkan/vulkan.h REQUIRED)
 # Vulkan structs are written as `VkFoo info{VK_STRUCTURE_TYPE_FOO}`: the remaining
 # members are value-initialised on purpose, so the missing-initializer warning is noise.
 add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
+# Guest registers are unions read and written through references to different members
+# (SpuReg::u32() and f32() on the same quadword). With strict aliasing GCC may assume they
+# do not overlap: once the SPU semantics were inlined into the blocks, an fnms read a
+# register from before the iohl that completed it.
+add_compile_options(-fno-strict-aliasing)
 
 add_subdirectory(runtime)
 add_subdirectory(recomp)
@@ -71,7 +76,13 @@ if(EXISTS "${SLY4_SPU_GEN_DIR}/sources.cmake")
     include("${SLY4_SPU_GEN_DIR}/sources.cmake")
     add_library(sly4_gen_spu STATIC ${SLY4_GEN_SOURCES})
     target_link_libraries(sly4_gen_spu PUBLIC sly4_cpu)
-    target_compile_options(sly4_gen_spu PRIVATE -O2 -frounding-math -fno-fast-math -ffp-contract=off -mfma)
+    # -fsignaling-nans: without it GCC turns x * 1.0 into x when the 1.0 is a constant of
+    # the block (ilhu), and the multiply that zeroes a denormal operand (DAZ) disappears.
+    target_compile_options(sly4_gen_spu PRIVATE -O2 -frounding-math -fno-fast-math -ffp-contract=off -fsignaling-nans -mfma)
+    # With the semantics forced inline each file needs a few GiB to compile: at most 4 at
+    # a time (Ninja pool), or the compiler runs out of the container's memory.
+    set_property(GLOBAL APPEND PROPERTY JOB_POOLS sly4_spu_gen=4)
+    set_property(TARGET sly4_gen_spu PROPERTY JOB_POOL_COMPILE sly4_spu_gen)
     set(_spu_decl "void register_spu_blocks();\n")
     set(_spu_call "    register_spu_blocks();\n")
     add_executable(sly4_spudiff tests/spudiff/spudiff.cpp recomp/tools/spu_oracle.cpp)

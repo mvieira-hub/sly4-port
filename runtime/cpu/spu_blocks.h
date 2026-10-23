@@ -50,7 +50,7 @@ void spu_register_blocks(const SpuBlockEntry* table, size_t count);
 size_t spu_block_count();
 const SpuBlockEntry* spu_block_table(size_t& count);
 // The compiled block for c.pc whose code matches the local store, or nullptr.
-SpuBlockFn spu_find_block(const SPUContext& c);
+SpuBlockFn spu_find_block(SPUContext& c);
 
 // Same contract as spu_run, with compiled blocks where they exist (and the interpreter
 // elsewhere). With the SPU cache on, interpreted blocks are recorded.

@@ -13,11 +13,15 @@
 //   sly4.exe ... --ring N            prints the last N calls (kept in memory) with the summary
 //   sly4.exe ... --spu-cache f.bin   records the SPU blocks run in the interpreter (for sly4_recomp spu-emit)
 //   sly4.exe ... --spu-interp        runs every SPU instruction in the interpreter, even when compiled
+//   sly4.exe ... --rsx-timeline      logs the RSX's long waits and flips with absolute times
+//   sly4.exe ... --thread-timeline NAME  logs the calls of PPU thread NAME with absolute times
+//   sly4.exe ... --call-times        time spent inside each HLE call and syscall, per thread
 //   sly4.exe ... --spu-profile       samples the SPUs' PCs and prints the hottest with the summary
 //   sly4.exe ... --ppu-profile NAME  samples where the PPU thread NAME runs in sly4.exe (resolve with nm)
 //   sly4.exe ... --verify-zlib       checks every block the SPU EDGE zlib task inflates (with --firmware)
 //   sly4.exe ... --rsx-capture N,f.txt  writes the RSX commands of frame N (counted in flips)
 //   sly4.exe ... --render            with --no-window: renders anyway (Vulkan without a window)
+//   sly4.exe ... --press start@30,cross@34  presses controller buttons at those seconds (no window)
 //   sly4.exe ... --watch 0xADDR       logs every change of the 128-byte guest line at ADDR (debugging)
 //   sly4.exe ... --watch-line 0xADDR[,0xADDR...]  logs every atomic/DMA write to those lines, with who and what (debugging)
 //   sly4.exe ... --dump-frames dir[,N]  writes every Nth displayed frame (default 60) as PNG
@@ -38,12 +42,15 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "cpu/guest_atomic.h"
 #include "cpu/ppu_rt.h"
 #include "gpu/rsx_vk.h"
 #include "gpu/vulkan_context.h"
+#include "kernel/hle.h"
 #include "kernel/kernel.h"
+#include "kernel/spu_thread.h"
 #include "loader/elf_loader.h"
 #include "loader/image_report.h"
 #include "loader/nid.h"
@@ -86,9 +93,11 @@ struct Args {
     std::string rsx_capture;  // "frame,file"
     std::string watch;        // guest address of a 128-byte line whose changes are logged
     std::string ppu_profile;  // PPU thread name sampled by --ppu-profile
+    std::string press;        // --press: scripted controller buttons
+    std::string thread_timeline;  // --thread-timeline NAME
     std::string watch_line;   // guest addresses (comma-separated) of 128-byte lines whose every write is logged
     std::string game_dir, eboot, nid_names, dump_imports, data_dir, firmware_dir, spu_cache;
-    bool window = true, run = true, trace = false, spu_interp = false, spu_profile = false, verify_zlib = false;
+    bool window = true, run = true, trace = false, spu_interp = false, spu_profile = false, verify_zlib = false, call_times = false;
     bool render = false;      // render without a window (Vulkan headless)
     std::string dump_frames;  // "dir[,every]": PNG of every Nth flip
     sly4::VulkanOptions vulkan;
@@ -132,8 +141,17 @@ bool parse_args(int argc, char** argv, Args& out) {
             ok = value(out.spu_cache);
         } else if (std::strcmp(argv[i], "--spu-interp") == 0) {
             out.spu_interp = true;
+        } else if (std::strcmp(argv[i], "--press") == 0) {
+            ok = value(out.press);
         } else if (std::strcmp(argv[i], "--ppu-profile") == 0) {
             ok = value(out.ppu_profile);
+        } else if (std::strcmp(argv[i], "--rsx-timeline") == 0) {
+            sly4::rsx::set_timeline(true);
+            sly4::spu_timeline(true);
+        } else if (std::strcmp(argv[i], "--thread-timeline") == 0) {
+            ok = value(out.thread_timeline);
+        } else if (std::strcmp(argv[i], "--call-times") == 0) {
+            out.call_times = true;
         } else if (std::strcmp(argv[i], "--spu-profile") == 0) {
             out.spu_profile = true;
         } else if (std::strcmp(argv[i], "--verify-zlib") == 0) {
@@ -256,6 +274,61 @@ void start_watch(sly4::GuestMemory& mem, const std::string& spec) {
     }).detach();
 }
 
+// --press start@30,cross@34: presses controller buttons at those seconds of the run, each
+// for 250 ms, to get through menus without a window (the window's input is phase 6).
+bool start_presses(const std::string& spec) {
+    struct Button {
+        const char* name;
+        uint16_t digital1, digital2;
+        int pressure;  // index in PadState::pressure, -1 for none
+    };
+    static constexpr Button kButtons[] = {
+        {"select", 0x01, 0, -1}, {"l3", 0x02, 0, -1},    {"r3", 0x04, 0, -1},       {"start", 0x08, 0, -1},
+        {"up", 0x10, 0, 2},      {"right", 0x20, 0, 0},  {"down", 0x40, 0, 3},      {"left", 0x80, 0, 1},
+        {"l2", 0, 0x01, 10},     {"r2", 0, 0x02, 11},    {"l1", 0, 0x04, 8},        {"r1", 0, 0x08, 9},
+        {"triangle", 0, 0x10, 4}, {"circle", 0, 0x20, 5}, {"cross", 0, 0x40, 6},    {"square", 0, 0x80, 7},
+    };
+    struct Press {
+        const Button* button;
+        double at;
+    };
+    std::vector<Press> presses;
+    for (size_t i = 0; i < spec.size();) {
+        const size_t end = std::min(spec.find(',', i), spec.size());
+        const std::string item = spec.substr(i, end - i);
+        i = end + 1;
+        const size_t at = item.find('@');
+        const Button* b = nullptr;
+        for (const Button& k : kButtons)
+            if (at != std::string::npos && item.compare(0, at, k.name) == 0 && std::strlen(k.name) == at) b = &k;
+        if (!b) {
+            SLY4_ERROR("--press: botão inválido em '%s' (use nome@segundos)", item.c_str());
+            return false;
+        }
+        presses.push_back({b, std::strtod(item.c_str() + at + 1, nullptr)});
+    }
+    std::thread([presses] {
+        const auto t0 = std::chrono::steady_clock::now();
+        auto wait_until = [&](double s) {
+            while (!game_over() && std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < s)
+                sly4::host_sleep_us(5000);
+        };
+        for (const Press& p : presses) {
+            wait_until(p.at);
+            if (game_over()) return;
+            sly4::PadState s;
+            s.digital1 = p.button->digital1;
+            s.digital2 = p.button->digital2;
+            if (p.button->pressure >= 0) s.pressure[p.button->pressure] = 255;
+            sly4::set_pad_state(s);
+            SLY4_INFO("controle: %s (%.1f s)", p.button->name, p.at);
+            wait_until(p.at + 0.25);
+            sly4::set_pad_state(sly4::PadState{});
+        }
+    }).detach();
+    return true;
+}
+
 [[noreturn]] void stop_with_summary(int code) {
     if (g_kernel) g_kernel->print_summary();
     if (g_renderer) g_renderer->summary();
@@ -300,6 +373,8 @@ bool start_game(const Args& args, sly4::GuestMemory& mem, const sly4::LoadedImag
     opt.ring = size_t(args.ring);
     opt.spu_cache = args.spu_cache;
     opt.spu_profile = args.spu_profile;
+    opt.call_times = args.call_times;
+    opt.thread_timeline = args.thread_timeline;
     opt.ppu_profile = args.ppu_profile;
     opt.verify_zlib = args.verify_zlib;
     if (!args.rsx_capture.empty()) {
@@ -351,7 +426,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         window = SDL_CreateWindow("Sly Cooper: Thieves in Time - port nativo", 1280, 720,
-                                  SDL_WINDOW_VULKAN || SDL_WINDOW_HIGH_PIXEL_DENSITY);
+                                  SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
         if (!window) {
             SLY4_ERROR("SDL_CreateWindow: %s", SDL_GetError());
             SDL_Quit();
@@ -380,6 +455,7 @@ int main(int argc, char** argv) {
     }
     const bool game = !args.eboot.empty() && args.run && start_game(args, mem, image, names);
     if (game && !args.watch.empty()) start_watch(mem, args.watch);
+    if (game && !args.press.empty() && !start_presses(args.press)) return 1;
     for (const char* p = args.watch_line.c_str(); *p;) {  // a comma-separated list
         char* end = nullptr;
         const uint32_t line = uint32_t(std::strtoul(p, &end, 0));
