@@ -8,6 +8,7 @@
 
 #include "core/log.h"
 #include "kernel/kernel.h"
+#include "memory/guest_memory.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -88,6 +89,17 @@ std::shared_ptr<Handle> get_handle(uint32_t fd) {
     std::lock_guard<std::mutex> g(g_lock);
     auto it = g_files.find(fd);
     return it == g_files.end() ? nullptr : it->second;
+}
+
+bool g_log_reads = false;  // --fs-reads
+
+// ReadFile writes into guest memory from the kernel, where a page kept read-only for the
+// renderer (track_writes) makes it fail instead of raising an exception: say so first.
+void guest_buffer_written(void* dst, uint64_t size) { before_host_write(dst, size); }
+
+void log_read(const Handle& h, uint64_t offset, uint64_t size) {
+    if (g_log_reads) SLY4_INFO("[fs] read %s @0x%llX +0x%llX", h.guest.c_str(), (unsigned long long)offset,
+                               (unsigned long long)size);
 }
 
 void log_fs(const char* op, const std::string& path, uint32_t r) {
@@ -228,6 +240,8 @@ uint32_t fs_open(const std::string& path, uint32_t flags, uint32_t& fd) {
     return r;
 }
 
+void fs_log_reads(bool on) { g_log_reads = on; }
+
 uint32_t fs_close(uint32_t fd) {
     std::lock_guard<std::mutex> g(g_lock);
     auto it = g_files.find(fd);
@@ -241,6 +255,12 @@ uint32_t fs_read(uint32_t fd, void* dst, uint64_t size, uint64_t& done) {
     auto h = get_handle(fd);
     if (!h || h->dir) return CELL_EBADF;
     std::lock_guard<std::mutex> lk(h->m);
+    guest_buffer_written(dst, size);
+    if (g_log_reads) {
+        LARGE_INTEGER cur{}, zero{};
+        SetFilePointerEx(h->h, zero, &cur, FILE_CURRENT);
+        log_read(*h, uint64_t(cur.QuadPart), size);
+    }
     auto* p = static_cast<uint8_t*>(dst);
     while (done < size) {
         const DWORD chunk = DWORD(std::min<uint64_t>(size - done, 1u << 30));
@@ -261,6 +281,8 @@ uint32_t fs_read_at(uint32_t fd, uint64_t offset, void* dst, uint64_t size, uint
     SetFilePointerEx(h->h, zero, &cur, FILE_CURRENT);
     to.QuadPart = int64_t(offset);
     SetFilePointerEx(h->h, to, nullptr, FILE_BEGIN);
+    log_read(*h, offset, size);
+    guest_buffer_written(dst, size);
     auto* p = static_cast<uint8_t*>(dst);
     uint32_t r = CELL_OK;
     while (done < size) {

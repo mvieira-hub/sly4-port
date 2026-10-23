@@ -94,3 +94,34 @@ TEST(guest_memory_read_only_protection) {
     mem.write<uint32_t>(0x40000, 0);
     CHECK_EQ(mem.read<uint32_t>(0x40000), 0u);
 }
+
+// Memory the GPU drew (track_writes) is read-only for everyone else: a write inside the
+// range ends the tracking and is recorded, then lands; one beside the range on the same
+// page lands without ending anything (one instruction with the page writable).
+TEST(guest_memory_tracked_writes) {
+    static GuestMemory mem;  // the fault handler keeps a pointer to it
+    CHECK(mem.reserve());
+    CHECK(mem.commit(0x50000, 0x3000, Protection::ReadWrite));
+    install_guest_fault_handler(mem);
+    std::vector<std::pair<GuestAddr, uint32_t>> written;
+    take_written(written);  // nothing left from elsewhere
+    track_writes(0x50000, 0x1800);  // a page and a half
+    mem.write<uint32_t>(0x51F00, 0xAABBCCDD);  // same page, outside the range
+    CHECK_EQ(mem.read<uint32_t>(0x51F00), 0xAABBCCDDu);
+    CHECK(!take_written(written));
+    mem.write<uint32_t>(0x50010, 0x11223344);  // inside
+    CHECK_EQ(mem.read<uint32_t>(0x50010), 0x11223344u);
+    CHECK(take_written(written));
+    CHECK_EQ(written.size(), size_t(1));
+    CHECK_EQ(written[0].first, 0x50000u);
+    CHECK_EQ(written[0].second, 0x1800u);
+    mem.write<uint32_t>(0x50020, 1);  // no longer watched
+    CHECK(!take_written(written));
+    // Writes the kernel makes (ReadFile) are announced instead.
+    track_writes(0x50000, 0x1000);
+    before_host_write(0x50800, 16);
+    CHECK(take_written(written));
+    untrack_writes(0x50000, 0x1000);
+    mem.write<uint32_t>(0x50000, 2);
+    CHECK_EQ(mem.read<uint32_t>(0x50000), 2u);
+}

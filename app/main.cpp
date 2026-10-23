@@ -16,14 +16,21 @@
 //   sly4.exe ... --rsx-timeline      logs the RSX's long waits and flips with absolute times
 //   sly4.exe ... --thread-timeline NAME  logs the calls of PPU thread NAME with absolute times
 //   sly4.exe ... --call-times        time spent inside each HLE call and syscall, per thread
+//   sly4.exe ... --fs-reads          logs every file read with its position and size
 //   sly4.exe ... --spu-profile       samples the SPUs' PCs and prints the hottest with the summary
 //   sly4.exe ... --ppu-profile NAME  samples where the PPU thread NAME runs in sly4.exe (resolve with nm)
 //   sly4.exe ... --verify-zlib       checks every block the SPU EDGE zlib task inflates (with --firmware)
 //   sly4.exe ... --rsx-capture N,f.txt  writes the RSX commands of frame N (counted in flips)
 //   sly4.exe ... --render            with --no-window: renders anyway (Vulkan without a window)
-//   sly4.exe ... --press start@30,cross@34  presses controller buttons at those seconds (no window)
+//   sly4.exe ... --press start@30,cross@34  presses controller buttons at those seconds
+//   sly4.exe ... --no-audio          no sound output (the game's audio clock keeps running)
+//   sly4.exe ... --dump-audio f.wav  also writes the mixed sound (48 kHz stereo float) to a WAV
+//
+// In the window the controller is the first gamepad plugged in, and the keyboard (see
+// app/pad_input.h); Esc closes the window.
 //   sly4.exe ... --watch 0xADDR       logs every change of the 128-byte guest line at ADDR (debugging)
 //   sly4.exe ... --watch-line 0xADDR[,0xADDR...]  logs every atomic/DMA write to those lines, with who and what (debugging)
+//   sly4.exe ... --watch-write 0xADDR[,size]  logs every write (plain stores too) to those bytes: thread, LR, host code (debugging)
 //   sly4.exe ... --dump-frames dir[,N]  writes every Nth displayed frame (default 60) as PNG
 //   sly4.exe ... --data <dir>        where /dev_hdd0 and /dev_hdd1 live (default %LOCALAPPDATA%\sly4-port)
 //   sly4.exe ... --dump-imports f.csv  writes module,nid,name,slot of every import
@@ -51,9 +58,11 @@
 #include "kernel/hle.h"
 #include "kernel/kernel.h"
 #include "kernel/spu_thread.h"
+#include "kernel/vfs.h"
 #include "loader/elf_loader.h"
 #include "loader/image_report.h"
 #include "loader/nid.h"
+#include "pad_input.h"
 #include "memory/guest_memory.h"
 #include "rsx/rsx.h"
 
@@ -96,10 +105,13 @@ struct Args {
     std::string press;        // --press: scripted controller buttons
     std::string thread_timeline;  // --thread-timeline NAME
     std::string watch_line;   // guest addresses (comma-separated) of 128-byte lines whose every write is logged
+    std::string watch_write;  // --watch-write addr[,size]
     std::string game_dir, eboot, nid_names, dump_imports, data_dir, firmware_dir, spu_cache;
     bool window = true, run = true, trace = false, spu_interp = false, spu_profile = false, verify_zlib = false, call_times = false;
     bool render = false;      // render without a window (Vulkan headless)
     std::string dump_frames;  // "dir[,every]": PNG of every Nth flip
+    bool audio = true;        // sound output (--no-audio)
+    std::string dump_audio;   // --dump-audio: the mixed output as a WAV
     sly4::VulkanOptions vulkan;
 };
 
@@ -127,6 +139,8 @@ bool parse_args(int argc, char** argv, Args& out) {
             ok = value(out.rsx_capture);
         } else if (std::strcmp(argv[i], "--watch") == 0) {
             ok = value(out.watch);
+        } else if (std::strcmp(argv[i], "--watch-write") == 0) {
+            ok = value(out.watch_write);
         } else if (std::strcmp(argv[i], "--watch-line") == 0) {
             ok = value(out.watch_line);
         } else if (std::strcmp(argv[i], "--no-window") == 0) {
@@ -150,12 +164,18 @@ bool parse_args(int argc, char** argv, Args& out) {
             sly4::spu_timeline(true);
         } else if (std::strcmp(argv[i], "--thread-timeline") == 0) {
             ok = value(out.thread_timeline);
+        } else if (std::strcmp(argv[i], "--fs-reads") == 0) {
+            sly4::fs_log_reads(true);
         } else if (std::strcmp(argv[i], "--call-times") == 0) {
             out.call_times = true;
         } else if (std::strcmp(argv[i], "--spu-profile") == 0) {
             out.spu_profile = true;
         } else if (std::strcmp(argv[i], "--verify-zlib") == 0) {
             out.verify_zlib = true;
+        } else if (std::strcmp(argv[i], "--no-audio") == 0) {
+            out.audio = false;
+        } else if (std::strcmp(argv[i], "--dump-audio") == 0) {
+            ok = value(out.dump_audio);
         } else if (std::strcmp(argv[i], "--render") == 0) {
             out.render = true;
         } else if (std::strcmp(argv[i], "--dump-frames") == 0) {
@@ -174,7 +194,7 @@ bool parse_args(int argc, char** argv, Args& out) {
             ok = false;
         }
         if (!ok) {
-            SLY4_ERROR("opÃ§Ã£o desconhecida ou sem valor: %s", argv[i]);
+            SLY4_ERROR("opção desconhecida ou sem valor: %s", argv[i]);
             return false;
         }
     }
@@ -201,7 +221,7 @@ bool load_executable(const Args& args, sly4::GuestMemory& mem, sly4::LoadedImage
     if (names.load_file(nid_file))
         SLY4_INFO("%zu nomes de NID carregados de %s", names.size(), nid_file.c_str());
     else if (!args.nid_names.empty())
-        SLY4_WARN("lista de NIDs nÃ£o encontrada: %s", nid_file.c_str());
+        SLY4_WARN("lista de NIDs não encontrada: %s", nid_file.c_str());
 
     std::string error;
     const auto t0 = std::chrono::steady_clock::now();
@@ -210,14 +230,14 @@ bool load_executable(const Args& args, sly4::GuestMemory& mem, sly4::LoadedImage
         return false;
     }
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    SLY4_INFO("%s carregado em %.1f ms; %.1f MiB confirmados na memÃ³ria do PS3", args.eboot.c_str(), ms,
+    SLY4_INFO("%s carregado em %.1f ms; %.1f MiB confirmados na memória do PS3", args.eboot.c_str(), ms,
               mem.committed_bytes() / 1048576.0);
     sly4::log_image_summary(img, names);
     if (!args.dump_imports.empty()) {
         if (sly4::write_imports_csv(img, names, args.dump_imports))
-            SLY4_INFO("importaÃ§Ãµes gravadas em %s", args.dump_imports.c_str());
+            SLY4_INFO("importações gravadas em %s", args.dump_imports.c_str());
         else
-            SLY4_ERROR("nÃ£o foi possÃ­vel gravar %s", args.dump_imports.c_str());
+            SLY4_ERROR("não foi possível gravar %s", args.dump_imports.c_str());
     }
     return true;
 }
@@ -238,17 +258,22 @@ void dump_memory() {
     const unsigned long addr = std::strtoul(g_dump_mem.c_str(), &end, 0);
     const unsigned long size = *end == ',' ? std::strtoul(end + 1, &end, 0) : 0;
     if (*end != ',' || !size) {
-        SLY4_ERROR("--dump-mem: use endereÃ§o,tamanho,arquivo");
+        SLY4_ERROR("--dump-mem: use endereço,tamanho,arquivo");
         return;
     }
     FILE* f = std::fopen(end + 1, "wb");
     if (!f) {
-        SLY4_ERROR("--dump-mem: nÃ£o foi possÃ­vel gravar %s", end + 1);
+        SLY4_ERROR("--dump-mem: não foi possível gravar %s", end + 1);
         return;
     }
-    std::fwrite(g_mem->host(uint32_t(addr)), 1, size, f);
+    // Page by page: pages that are not committed read as zeros (fwrite would stop at them).
+    static const uint8_t zeros[4096] = {};
+    for (unsigned long at = addr; at < addr + size; at = (at | 0xFFF) + 1) {
+        const unsigned long n = std::min((at | 0xFFF) + 1, addr + size) - at;
+        std::fwrite(g_mem->is_committed(uint32_t(at), uint32_t(n)) ? g_mem->host(uint32_t(at)) : zeros, 1, n, f);
+    }
     std::fclose(f);
-    SLY4_INFO("memÃ³ria 0x%08lX (+0x%lX) gravada em %s", addr, size, end + 1);
+    SLY4_INFO("memória 0x%08lX (+0x%lX) gravada em %s", addr, size, end + 1);
 }
 
 // --watch: a host thread compares the line with its last copy every ~250 us.
@@ -274,8 +299,34 @@ void start_watch(sly4::GuestMemory& mem, const std::string& spec) {
     }).detach();
 }
 
+// --watch-write: arms the write watchpoint once the page exists; each write is logged with
+// the guest thread, its LR and the host instruction (resolve with nm: generated functions
+// are named after their guest address).
+void on_watched_write(uint32_t at, const void* host_pc) {
+    static std::atomic<int> shown{0};
+    if (shown++ >= 200) return;
+    static const auto t0 = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const sly4::PpuThread* t = sly4::current_thread();
+    HMODULE exe = GetModuleHandleW(nullptr);
+    SLY4_INFO("watch-write %9.3f ms: 0x%08X por %s, LR 0x%08llX, host RVA 0x%llX", ms, at,
+              t ? t->name.c_str() : "(thread do host)", t ? static_cast<unsigned long long>(t->ctx.lr) : 0ull,
+              static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(host_pc) - reinterpret_cast<uintptr_t>(exe)));
+}
+
+void start_watch_write(sly4::GuestMemory& mem, const std::string& spec) {
+    char* end = nullptr;
+    const uint32_t addr = uint32_t(std::strtoul(spec.c_str(), &end, 0));
+    const uint32_t size = *end == ',' ? uint32_t(std::strtoul(end + 1, nullptr, 0)) : 4;
+    std::thread([&mem, addr, size] {
+        while (!game_over() && !mem.is_committed(addr, 1)) sly4::host_sleep_us(1000);
+        if (!game_over() && sly4::watch_writes(addr, size, on_watched_write))
+            SLY4_INFO("watch-write: 0x%08X +0x%X armado", addr, size);
+    }).detach();
+}
+
 // --press start@30,cross@34: presses controller buttons at those seconds of the run, each
-// for 250 ms, to get through menus without a window (the window's input is phase 6).
+// for 250 ms, to get through menus in scripted runs; it adds to the window's controller.
 bool start_presses(const std::string& spec) {
     struct Button {
         const char* name;
@@ -320,10 +371,10 @@ bool start_presses(const std::string& spec) {
             s.digital1 = p.button->digital1;
             s.digital2 = p.button->digital2;
             if (p.button->pressure >= 0) s.pressure[p.button->pressure] = 255;
-            sly4::set_pad_state(s);
+            sly4::set_pad_state(s, sly4::PadSource::Script);
             SLY4_INFO("controle: %s (%.1f s)", p.button->name, p.at);
             wait_until(p.at + 0.25);
-            sly4::set_pad_state(sly4::PadState{});
+            sly4::set_pad_state(sly4::PadState{}, sly4::PadSource::Script);
         }
     }).detach();
     return true;
@@ -345,7 +396,7 @@ void on_guest_fault(sly4::PPUContext& c, sly4::GuestMemory&, const char* what) {
 
 LONG WINAPI on_unhandled(EXCEPTION_POINTERS* e) {
     const sly4::PpuThread* t = sly4::current_thread();
-    SLY4_ERROR("exceÃ§Ã£o 0x%08lX no host%s; LR do convidado 0x%08llX", e->ExceptionRecord->ExceptionCode,
+    SLY4_ERROR("exceção 0x%08lX no host%s; LR do convidado 0x%08llX", e->ExceptionRecord->ExceptionCode,
                t ? (" na thread " + t->name).c_str() : "", t ? static_cast<unsigned long long>(t->ctx.lr) : 0ull);
     stop_with_summary(5);
 }
@@ -397,7 +448,7 @@ bool start_game(const Args& args, sly4::GuestMemory& mem, const sly4::LoadedImag
     CloseHandle(h);
     return true;
 #else
-    SLY4_WARN("este build nÃ£o tem o cÃ³digo do jogo: gere com \"sly4_recomp emit\" e compile de novo");
+    SLY4_WARN("este build não tem o código do jogo: gere com \"sly4_recomp emit\" e compile de novo");
     return false;
 #endif
 }
@@ -410,7 +461,7 @@ int main(int argc, char** argv) {
 #endif
     Args args;
     if (!parse_args(argc, argv, args)) return 2;
-    SLY4_INFO("sly4 %s - port nativo, fase 3 (kernel e HLE)", "0.0.3");
+    SLY4_INFO("sly4 %s - port nativo, fase 6 (áudio, controle e vídeo)", "0.0.6");
 
     sly4::GuestMemory mem;
     sly4::LoadedImage image;
@@ -420,8 +471,14 @@ int main(int argc, char** argv) {
     SDL_Window* window = nullptr;
     static sly4::VulkanContext gpu;
     bool gpu_ok = false;
+    // Sound goes out through SDL (WASAPI on Windows); the game's cellAudio opens the device.
+    if (args.audio && !SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+        SLY4_WARN("áudio: SDL_Init: %s (sem som)", SDL_GetError());
+        args.audio = false;
+    }
+    sly4::audio_configure({args.audio, args.dump_audio});
     if (args.window) {
-        if (!SDL_Init(SDL_INIT_VIDEO)) {
+        if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
             SLY4_ERROR("SDL_Init: %s", SDL_GetError());
             return 1;
         }
@@ -455,6 +512,7 @@ int main(int argc, char** argv) {
     }
     const bool game = !args.eboot.empty() && args.run && start_game(args, mem, image, names);
     if (game && !args.watch.empty()) start_watch(mem, args.watch);
+    if (game && !args.watch_write.empty()) start_watch_write(mem, args.watch_write);
     if (game && !args.press.empty() && !start_presses(args.press)) return 1;
     for (const char* p = args.watch_line.c_str(); *p;) {  // a comma-separated list
         char* end = nullptr;
@@ -483,9 +541,11 @@ int main(int argc, char** argv) {
     const auto start = std::chrono::steady_clock::now();
     long presented = 0;
     bool running = true, ok = true;
+    sly4::PadInput pad;
     while (running) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
+            pad.handle(ev);
             switch (ev.type) {
                 case SDL_EVENT_QUIT:
                 case SDL_EVENT_WINDOW_CLOSE_REQUESTED: running = false; break;
@@ -497,6 +557,7 @@ int main(int argc, char** argv) {
             }
         }
         if (!running) break;
+        pad.update((SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) != 0);
         if (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED) {
             SDL_Delay(16);
             continue;

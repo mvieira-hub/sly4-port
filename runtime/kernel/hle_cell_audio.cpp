@@ -2,14 +2,22 @@
 // into ring buffers of up to 8 "ports"; the audio hardware reads one block of 256
 // samples per port every 5.33 ms (48 kHz) and advances each port's read index, which
 // the game watches to know where to write next. This module keeps that clock running,
-// as RPCS3's cellAudio.cpp does. Nothing is played yet (phase 6): the blocks are
-// consumed, measured (peak level, for the summary) and cleared.
+// as RPCS3's cellAudio.cpp does, on the host's timer: each block of the running ports is
+// mixed down to stereo, measured (peak level, for the summary), cleared and sent to the
+// default sound device through SDL (WASAPI on Windows), or to a WAV file (--dump-audio).
+// The device's own clock drifts from the timer: a block is dropped when more than 100 ms
+// are waiting, and an empty queue plays silence.
+#include <SDL3/SDL.h>
+
 #include <atomic>
 #include <bit>
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <algorithm>
+#include <iterator>
 #include <mutex>
 #include <thread>
 
@@ -52,31 +60,109 @@ Audio g;
 
 GuestAddr port_buffer(uint32_t n) { return g.buffers + kPortBytes * n; }
 
+// Where the mixed sound goes.
+struct Output {
+    AudioOptions options;
+    SDL_AudioStream* stream = nullptr;
+    FILE* wav = nullptr;
+    uint64_t wav_frames = 0;
+    std::atomic<uint64_t> dropped{0};
+};
+Output g_out;
+constexpr uint32_t kRate = 48000, kMaxQueued = kRate / 10 * 2 * 4;  // 100 ms of stereo float
+
+// WAV, 16-bit stereo: the sizes are written when the run ends (audio_summary).
+void wav_header(FILE* f, uint64_t frames) {
+    const uint32_t data = uint32_t(frames * 4);
+    const uint32_t head[11] = {0x46464952, 36 + data, 0x45564157, 0x20746D66, 16, 0x00020001, kRate, kRate * 4,
+                               0x00100004, 0x61746164, data};
+    std::fseek(f, 0, SEEK_SET);
+    std::fwrite(head, 4, 11, f);
+    std::fseek(f, 0, SEEK_END);
+}
+
+void open_output() {
+    if (g_out.options.output) {
+        const SDL_AudioSpec spec{SDL_AUDIO_F32, 2, int(kRate)};
+        g_out.stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
+        if (!g_out.stream) {
+            SLY4_WARN("cellAudio: sem dispositivo de som (%s)", SDL_GetError());
+        } else {
+            SDL_ResumeAudioStreamDevice(g_out.stream);
+            const char* name = SDL_GetAudioDeviceName(SDL_GetAudioStreamDevice(g_out.stream));
+            SLY4_INFO("cellAudio: som em \"%s\" (48 kHz, estéreo)", name ? name : "?");
+        }
+    }
+    if (!g_out.options.dump_wav.empty()) {
+        g_out.wav = std::fopen(g_out.options.dump_wav.c_str(), "wb+");
+        if (g_out.wav)
+            wav_header(g_out.wav, 0);
+        else
+            SLY4_ERROR("cellAudio: não foi possível gravar %s", g_out.options.dump_wav.c_str());
+    }
+}
+
+// One block of a port, scaled by its level, added to the stereo mix. Eight channels (L, R,
+// C, LFE, then the surround pairs) are folded into two; LFE is left out.
+void mix_port(GuestMemory& m, GuestAddr a, uint32_t channels, float level, float* mix, float& peak) {
+    for (uint32_t i = 0; i < kSamples; ++i) {
+        float v[kMaxChannels] = {};
+        for (uint32_t c = 0; c < channels; ++c) {
+            const float s = std::bit_cast<float>(m.read<uint32_t>(a + (i * channels + c) * 4));
+            v[c] = std::isfinite(s) ? s : 0.0f;
+            peak = std::max(peak, std::fabs(v[c]));
+        }
+        float l = v[0], r = v[1];
+        if (channels == 8) {
+            constexpr float k = 0.70710678f;
+            l += k * (v[2] + v[4] + v[6]);
+            r += k * (v[2] + v[5] + v[7]);
+        }
+        mix[2 * i] += l * level;
+        mix[2 * i + 1] += r * level;
+    }
+}
+
 // Every 5.33 ms: each running port gives up its current block.
 void audio_thread() {
     GuestMemory& m = kernel().mem();
+    open_output();
     auto next = std::chrono::steady_clock::now();
-    const auto period = std::chrono::nanoseconds(1'000'000'000ull * kSamples / 48000);
+    const auto period = std::chrono::nanoseconds(1'000'000'000ull * kSamples / kRate);
+    float mix[kSamples * 2];
+    int16_t pcm[kSamples * 2];
     while (!kernel().exited()) {
         next += period;
         host_sleep_until(next);
-        std::lock_guard<std::mutex> lk(g.lock);
-        for (uint32_t n = 0; n < kPorts; ++n) {
-            Port& p = g.ports[n];
-            if (p.status != kStatusRun || !p.blocks) continue;
-            const uint32_t block = uint32_t(p.position % p.blocks);
-            const uint32_t bytes = p.channels * kSamples * 4;
-            const GuestAddr a = port_buffer(n) + block * bytes;
-            float peak = 0;
-            for (uint32_t i = 0; i < bytes; i += 4) {
-                const float s = std::fabs(std::bit_cast<float>(m.read<uint32_t>(a + i)));
-                if (s > peak && std::isfinite(s)) peak = s;
+        std::fill(std::begin(mix), std::end(mix), 0.0f);
+        {
+            std::lock_guard<std::mutex> lk(g.lock);
+            for (uint32_t n = 0; n < kPorts; ++n) {
+                Port& p = g.ports[n];
+                if (p.status != kStatusRun || !p.blocks) continue;
+                const uint32_t block = uint32_t(p.position % p.blocks);
+                const uint32_t bytes = p.channels * kSamples * 4;
+                const GuestAddr a = port_buffer(n) + block * bytes;
+                float peak = 0;
+                mix_port(m, a, p.channels, p.level, mix, peak);
+                if (peak > std::bit_cast<float>(g.peak_bits.load())) g.peak_bits = std::bit_cast<uint32_t>(peak);
+                std::memset(m.host(a), 0, bytes);
+                ++p.position;
+                m.write<uint64_t>(g.indexes + 8 * n, p.position % p.blocks);
+                g.blocks.fetch_add(1, std::memory_order_relaxed);
             }
-            if (peak > std::bit_cast<float>(g.peak_bits.load())) g.peak_bits = std::bit_cast<uint32_t>(peak);
-            std::memset(m.host(a), 0, bytes);
-            ++p.position;
-            m.write<uint64_t>(g.indexes + 8 * n, p.position % p.blocks);
-            g.blocks.fetch_add(1, std::memory_order_relaxed);
+            for (float& s : mix) s = std::clamp(s, -1.0f, 1.0f);
+            if (g_out.wav) {
+                for (uint32_t i = 0; i < kSamples * 2; ++i) pcm[i] = int16_t(std::lrint(mix[i] * 32767.0f));
+                std::fwrite(pcm, sizeof(pcm), 1, g_out.wav);
+                g_out.wav_frames += kSamples;
+            }
+        }
+        if (g_out.stream) {
+            if (SDL_GetAudioStreamQueued(g_out.stream) > int(kMaxQueued))
+                g_out.dropped.fetch_add(1, std::memory_order_relaxed);
+            else
+                SDL_PutAudioStreamData(g_out.stream, mix, sizeof(mix));
         }
     }
 }
@@ -234,10 +320,20 @@ HleModule hle_cell_audio() {
             }};
 }
 
+void audio_configure(const AudioOptions& o) { g_out.options = o; }
+
 void audio_summary() {
     if (!g.buffers) return;
-    SLY4_INFO("cellAudio: %" PRIu64 " blocos de 256 amostras consumidos, pico %.3f", g.blocks.load(),
-              double(std::bit_cast<float>(g.peak_bits.load())));
+    SLY4_INFO("cellAudio: %" PRIu64 " blocos de 256 amostras consumidos, pico %.3f, %" PRIu64
+              " blocos descartados (fila cheia)",
+              g.blocks.load(), double(std::bit_cast<float>(g.peak_bits.load())), g_out.dropped.load());
+    std::lock_guard<std::mutex> lk(g.lock);
+    if (g_out.wav) {
+        wav_header(g_out.wav, g_out.wav_frames);
+        std::fflush(g_out.wav);
+        SLY4_INFO("cellAudio: %.1f s de som gravados em %s", double(g_out.wav_frames) / kRate,
+                  g_out.options.dump_wav.c_str());
+    }
 }
 
 }  // namespace sly4

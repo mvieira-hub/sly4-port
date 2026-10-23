@@ -9,6 +9,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <utility>
+#include <vector>
 #include <cstring>
 #include <optional>
 #include <string>
@@ -81,5 +83,28 @@ private:
 // Installs a vectored exception handler that logs access violations inside the
 // guest reservation as guest addresses (then lets the crash continue normally).
 void install_guest_fault_handler(const GuestMemory& mem);
+
+// Debugging (--watch-write): every write to [addr, addr + size), inside one page, calls
+// `hook` with the address and the host instruction, on the writing thread, before it
+// happens. The page must be committed; false otherwise.
+using WriteWatchHook = void (*)(GuestAddr at, const void* host_pc);
+bool watch_writes(GuestAddr addr, uint32_t size, WriteWatchHook hook);
+
+// Writes to memory the GPU drew and has not written back yet (the RSX renderer's
+// surfaces): the range's pages are kept read-only, and the first write by anyone else
+// (PPU, SPU DMA, HLE) ends the tracking and records the range, for the renderer to drop
+// its copy instead of writing it back over the new data later (RPCS3: invalidate on
+// write). The game reuses that memory for other things: Bink's video planes landed on a
+// surface drawn seconds before.
+void track_writes(GuestAddr addr, uint32_t size);
+void untrack_writes(GuestAddr addr, uint32_t size);    // the renderer writes it back itself
+void before_host_write(GuestAddr addr, uint32_t size);  // kernel-mode writes (ReadFile)
+void before_host_write(const void* host, uint64_t size);  // the same, by host pointer (none if not guest memory)
+bool take_written(std::vector<std::pair<GuestAddr, uint32_t>>& out);  // ranges written since the last call
+// While alive, this thread's writes to tracked pages pass without ending any tracking.
+struct HostWriteScope {
+    HostWriteScope();
+    ~HostWriteScope();
+};
 
 }  // namespace sly4

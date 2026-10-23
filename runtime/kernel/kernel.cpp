@@ -63,8 +63,8 @@ Kernel::~Kernel() {
 bool Kernel::init(const NidNames& names, const KernelOptions& opt) {
     const GuestAddr main_base = align_up(img_.image_end, 0x10000);
     main_ = std::make_unique<GuestAllocator>(mem_, main_base, layout::kMainEnd - main_base, "principal");
-    user_ = std::make_unique<GuestAllocator>(mem_, layout::kUserBase, layout::kUserSize, "usuÃ¡rio 1 MiB");
-    user64k_ = std::make_unique<GuestAllocator>(mem_, layout::kUser64kBase, layout::kUser64kSize, "usuÃ¡rio 64 KiB");
+    user_ = std::make_unique<GuestAllocator>(mem_, layout::kUserBase, layout::kUserSize, "usuário 1 MiB");
+    user64k_ = std::make_unique<GuestAllocator>(mem_, layout::kUser64kBase, layout::kUser64kSize, "usuário 64 KiB");
     stacks_ = std::make_unique<GuestAllocator>(mem_, layout::kStackBase, layout::kStackSize, "pilhas");
     mmapper_ = std::make_unique<GuestAllocator>(mem_, layout::kMmapperBase, layout::kMmapperSize, "mmapper");
 
@@ -82,7 +82,7 @@ bool Kernel::init(const NidNames& names, const KernelOptions& opt) {
     for (const HleModule& mod : {hle_sys_prx_for_user(), hle_sys_fs(), hle_cell_game(), hle_cell_sysutil(),
                                  hle_cell_sysutil_avconf_ext(), hle_cell_sysmodule(), hle_cell_rtc(), hle_cell_net_ctl(),
                                  hle_sys_net(), hle_cell_spurs(), hle_sys_prx_for_user_spu(), hle_sys_prx_for_user_libc(),
-                                 hle_cell_gcm_sys(), hle_cell_audio(), hle_sys_io()})
+                                 hle_cell_gcm_sys(), hle_cell_audio(), hle_sys_io(), hle_cell_savedata()})
         table.add(mod);
 
     // Firmware modules that run as they are (their recompiled code is linked in).
@@ -92,7 +92,7 @@ bool Kernel::init(const NidNames& names, const KernelOptions& opt) {
             const std::filesystem::path p = path_from_utf8(opt.firmware_dir) / fm.file;
             std::error_code ec;
             if (!std::filesystem::exists(p, ec)) {
-                SLY4_WARN("mÃ³dulo do firmware %s nÃ£o encontrado em %s: fica em HLE", fm.file, opt.firmware_dir.c_str());
+                SLY4_WARN("módulo do firmware %s não encontrado em %s: fica em HLE", fm.file, opt.firmware_dir.c_str());
                 continue;
             }
             LoadedImage m;
@@ -169,7 +169,7 @@ int Kernel::run_main() {
     uint32_t stack = img_.param.present ? img_.param.primary_stack_size : 0x100000;
     stack = align_up(std::clamp<uint32_t>(stack, 0x10000, 0x100000), 0x1000);
     if (!alloc_stack(t, stack)) {
-        SLY4_ERROR("nÃ£o foi possÃ­vel criar a pilha da thread principal");
+        SLY4_ERROR("não foi possível criar a pilha da thread principal");
         request_exit(-1);
         return -1;
     }
@@ -224,7 +224,7 @@ int Kernel::run_main() {
     try {
         start_modules(t);
         if (run_entry(t)) {
-            SLY4_INFO("a funÃ§Ã£o de entrada da thread principal retornou (0x%" PRIX64 ")", t.exit_value);
+            SLY4_INFO("a função de entrada da thread principal retornou (0x%" PRIX64 ")", t.exit_value);
             request_exit(int(t.exit_value));
         } else {
             SLY4_INFO("a thread principal saiu com sys_ppu_thread_exit(0x%" PRIX64 ")", t.exit_value);
@@ -500,7 +500,7 @@ void Kernel::print_summary() const {
         SLY4_INFO("threads: %zu", threads_.size());
         for (const auto& [id, t] : threads_) {
             const char* call = t->last_call.load();
-            std::fprintf(stderr, "  0x%08" PRIX64 " %-26s %s Ãºltima chamada: %s(0x%" PRIX64 ", 0x%" PRIX64 ") de 0x%08X\n",
+            std::fprintf(stderr, "  0x%08" PRIX64 " %-26s %s última chamada: %s(0x%" PRIX64 ", 0x%" PRIX64 ") de 0x%08X\n",
                          id, t->name.c_str(), t->done ? "terminada" : "ativa    ", call ? call : "-", t->last_r3.load(),
                          t->last_r4.load(), t->last_lr.load());
             if (t->done) continue;
@@ -521,7 +521,7 @@ void Kernel::print_summary() const {
     rt::interpreter_stats(icalls, isteps);
     if (icalls) SLY4_INFO("PPU: %" PRIu64 " entradas no interpretador, %" PRIu64 " instruções interpretadas", icalls, isteps);
     for (const auto& s : spu_threads())
-        std::fprintf(stderr, "  SPU 0x%08X grupo %08X[%u] %-10s %12" PRIu64 " instruÃ§Ãµes, pc 0x%05X, %.1f s esperando canais\n",
+        std::fprintf(stderr, "  SPU 0x%08X grupo %08X[%u] %-10s %12" PRIu64 " instruções, pc 0x%05X, %.1f s esperando canais\n",
                      s->id, s->group ? s->group->id : 0, s->index, s->running ? "rodando" : "parada", s->executed.load(),
                      s->ctx.pc, double(s->waited_ns.load()) * 1e-9);
     // Where each SPU is: a few instructions around its PC.
@@ -554,7 +554,7 @@ void Kernel::print_summary() const {
         if (spu_cache_save(spu_cache_))
             SLY4_INFO("cache SPU: %zu blocos novos interpretados, gravados em %s", n, spu_cache_.c_str());
         else
-            SLY4_ERROR("cache SPU: nÃ£o foi possÃ­vel gravar %s", spu_cache_.c_str());
+            SLY4_ERROR("cache SPU: não foi possível gravar %s", spu_cache_.c_str());
     }
     call_log().print_ring(ring_lines_);
     call_log().print_times();
@@ -566,18 +566,18 @@ void Kernel::print_summary() const {
         ++called;
         missing += !s.implemented;
     }
-    SLY4_INFO("HLE: %zu funÃ§Ãµes chamadas, %zu delas sem implementaÃ§Ã£o", called, missing);
+    SLY4_INFO("HLE: %zu funções chamadas, %zu delas sem implementação", called, missing);
     for (const auto& s : hs)
         if (s.calls)
             std::fprintf(stderr, "  %10" PRIu64 "  %s.%s%s\n", s.calls, s.module.c_str(), s.name.c_str(),
-                         s.implemented ? "" : "  [sem implementaÃ§Ã£o]");
+                         s.implemented ? "" : "  [sem implementação]");
     auto ss = syscall_stats();
     std::stable_sort(ss.begin(), ss.end(), [](const auto& a, const auto& b) { return a.calls > b.calls; });
-    SLY4_INFO("syscalls: %zu nÃºmeros chamados", ss.size());
+    SLY4_INFO("syscalls: %zu números chamados", ss.size());
     for (const auto& s : ss) {
         const char* n = syscall_name(s.number);
         std::fprintf(stderr, "  %10" PRIu64 "  %u %s%s\n", s.calls, s.number, n ? n : "?",
-                     s.implemented ? "" : "  [sem implementaÃ§Ã£o]");
+                     s.implemented ? "" : "  [sem implementação]");
     }
     std::fflush(stderr);
 }

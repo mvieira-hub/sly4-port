@@ -1,6 +1,7 @@
-// cellPad (sys_io): one DualShock 3 connected on port 0. Its state comes from
-// pad_state(), which the window's input will fill (phase 6); until then the controller
-// is idle (sticks centred, nothing pressed).
+// cellPad (sys_io): one DualShock 3 connected on port 0. Its state comes from the window's
+// gamepad and keyboard (app/main.cpp) and from --press, merged: buttons pressed in either,
+// the strongest pressure, the stick that moved.
+#include <algorithm>
 #include <cstring>
 #include <mutex>
 
@@ -27,9 +28,23 @@ struct Pads {
     uint32_t max_connect = 0;
     uint32_t setting[kPorts] = {};
     bool reported = false;  // the connection was announced (ASSIGN_CHANGES once)
-    PadState state;
+    PadState device, script;
+    PadRumble rumble;
 };
 Pads g;
+
+uint16_t stick(uint16_t a, uint16_t b) { return a != 0x80 ? a : b; }
+PadState merged() {
+    PadState s;
+    s.digital1 = g.device.digital1 | g.script.digital1;
+    s.digital2 = g.device.digital2 | g.script.digital2;
+    s.right_x = stick(g.script.right_x, g.device.right_x);
+    s.right_y = stick(g.script.right_y, g.device.right_y);
+    s.left_x = stick(g.script.left_x, g.device.left_x);
+    s.left_y = stick(g.script.left_y, g.device.left_y);
+    for (int i = 0; i < 12; ++i) s.pressure[i] = std::max(g.device.pressure[i], g.script.pressure[i]);
+    return s;
+}
 
 void cellPadInit(PPUContext& c, GuestMemory&) {
     std::lock_guard<std::mutex> lk(g.lock);
@@ -87,7 +102,7 @@ void cellPadGetData(PPUContext& c, GuestMemory& m) {
         c.gpr[3] = CELL_PAD_ERROR_NO_DEVICE;
         return;
     }
-    const PadState& s = g.state;
+    const PadState s = merged();
     std::memset(m.host(d), 0, 4 + 2 * 64);
     m.write<int32_t>(d, 24);
     auto b = [&](int i, uint16_t v) { m.write<uint16_t>(d + 4 + 2 * i, v); };
@@ -120,17 +135,41 @@ void cellPadSetPortSetting(PPUContext& c, GuestMemory&) {
     c.gpr[3] = CELL_OK;
 }
 
-// Vibration: nothing to drive yet.
-void cellPadSetActDirect(PPUContext& c, GuestMemory&) {
+// cellPadSetActDirect(port, CellPadActParam*): {u8 motor[6]}; motor[0] is the small motor
+// (on/off), motor[1] the large one (0-255).
+void cellPadSetActDirect(PPUContext& c, GuestMemory& m) {
+    const uint32_t port = a32(c, 3);
+    const GuestAddr p = a32(c, 4);
     std::lock_guard<std::mutex> lk(g.lock);
-    c.gpr[3] = g.initialized ? CELL_OK : CELL_PAD_ERROR_UNINITIALIZED;
+    if (!g.initialized) {
+        c.gpr[3] = CELL_PAD_ERROR_UNINITIALIZED;
+        return;
+    }
+    if (port >= kPorts || !p) {
+        c.gpr[3] = CELL_PAD_ERROR_INVALID_PARAMETER;
+        return;
+    }
+    if (port == 0) {
+        const uint8_t small = m.read<uint8_t>(p) ? 1 : 0, large = m.read<uint8_t>(p + 1);
+        if (small != g.rumble.small || large != g.rumble.large) {
+            g.rumble.small = small;
+            g.rumble.large = large;
+            ++g.rumble.serial;
+        }
+    }
+    c.gpr[3] = port == 0 ? CELL_OK : CELL_PAD_ERROR_NO_DEVICE;
 }
 
 }  // namespace
 
-void set_pad_state(const PadState& s) {
+void set_pad_state(const PadState& s, PadSource source) {
     std::lock_guard<std::mutex> lk(g.lock);
-    g.state = s;
+    (source == PadSource::Script ? g.script : g.device) = s;
+}
+
+PadRumble pad_rumble() {
+    std::lock_guard<std::mutex> lk(g.lock);
+    return g.rumble;
 }
 
 HleModule hle_sys_io() {

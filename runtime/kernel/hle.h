@@ -176,6 +176,7 @@ HleModule hle_sys_prx_for_user_libc();  // kernel/hle_libc.cpp
 HleModule hle_cell_gcm_sys();           // kernel/hle_cell_gcm.cpp
 HleModule hle_cell_audio();             // kernel/hle_cell_audio.cpp
 HleModule hle_sys_io();                 // kernel/hle_cell_pad.cpp
+HleModule hle_cell_savedata();          // kernel/hle_cell_savedata.cpp
 
 // Controller on port 0 as cellPadGetData reports it: digital buttons (CELL_PAD_CTRL_*
 // bits of words 2 and 3), sticks (0x00-0xFF, 0x80 centred) and button pressures.
@@ -184,8 +185,25 @@ struct PadState {
     uint16_t right_x = 0x80, right_y = 0x80, left_x = 0x80, left_y = 0x80;
     uint16_t pressure[12] = {};
 };
-void set_pad_state(const PadState& s);
+// The controller's state comes from two sources, merged: the devices (the window's gamepad
+// and keyboard) and the script of --press.
+enum class PadSource { Device, Script };
+void set_pad_state(const PadState& s, PadSource source = PadSource::Device);
+// Vibration the game asked for (cellPadSetActDirect): the small motor on or off and the
+// large one's strength; `serial` changes on every request.
+struct PadRumble {
+    uint8_t small = 0, large = 0;
+    uint32_t serial = 0;
+};
+PadRumble pad_rumble();
 void audio_summary();                   // audio counters for the end-of-run summary
+// Sound output, set before the game starts: to the default device (SDL), and/or the mixed
+// output as a WAV file.
+struct AudioOptions {
+    bool output = true;
+    std::string dump_wav;
+};
+void audio_configure(const AudioOptions& o);
 void gcm_summary();                     // RSX counters for the end-of-run summary
 
 // A string from the game's PARAM.SFO ("" if missing), e.g. "TITLE_ID".

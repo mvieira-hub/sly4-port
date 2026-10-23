@@ -57,6 +57,7 @@ uint32_t fs_write(uint32_t fd, const void* src, uint64_t size, uint64_t& done);
 uint32_t fs_lseek(uint32_t fd, int64_t offset, uint32_t whence, uint64_t& pos);
 uint32_t fs_read_at(uint32_t fd, uint64_t offset, void* dst, uint64_t size, uint64_t& done);  // keeps the position
 uint32_t fs_fsync(uint32_t fd);
+void fs_log_reads(bool on);  // --fs-reads: every read, with its position and size
 uint32_t fs_stat(const std::string& path, FsStat& st);
 uint32_t fs_fstat(uint32_t fd, FsStat& st);
 uint32_t fs_opendir(const std::string& path, uint32_t& fd);

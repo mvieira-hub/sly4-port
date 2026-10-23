@@ -434,10 +434,14 @@ Plano da fase:
 - Comparação quadro a quadro com o RPCS3, usando capturas do mesmo ponto.
 - **Saída:** a splash da Sanzaru e o menu principal aparecem corretos.
 
-### Fase 6: áudio, controle e vídeo (3–5 semanas)
-- Já existe a parte mínima, que a Fase 4 precisou: `cellAudio` com portas e relógio de 48 kHz (sem saída de som) e `cellPad` com um controle parado.
-- `cellAudio` → WASAPI; `cellPad` → SDL3; Bink rodando (recompilado ou, no plano B, FFmpeg).
-- **Saída:** menu com música, navegação pelo controle e a abertura em vídeo.
+### Fase 6: áudio, controle e vídeo (3–5 semanas) — **concluída** (2026-10-23)
+
+Andamento em [FASE6.md](FASE6.md):
+- **6a, saves (concluída):** o `cellSaveData` segue o RPCS3 e chama as funções do jogo. O silêncio vinha daí: o *stub* deixava as configurações zeradas, com os volumes em 0. Na primeira partida o jogo agora pede o idioma e grava as configurações como no RPCS3.
+- **6b, som (concluída):** as portas do `cellAudio` são misturadas em estéreo e saem pelo dispositivo padrão (SDL3, WASAPI). `--dump-audio` grava a mistura em WAV.
+- **6c, controle (concluída):** gamepad e teclado na janela, juntos com o `--press`; vibração.
+- **6d, vídeo (concluída):** o Bink (recompilado, como o resto do jogo) decodificava certo. O vídeo saía verde porque o renderizador escrevia uma superfície velha por cima dos planos. Agora as superfícies desenhadas têm a memória vigiada por proteção de página. O pós-processamento das SPUs no menu passou a valer, e o menu roda a ~37–41 quadros/s.
+- **Saída (alcançada):** menu com música, navegação pelo controle e a abertura em vídeo.
 
 ### Fase 7: POC, primeira fase jogável (4–8 semanas)
 - Novo jogo → Prólogo em Paris: carregamento da fase, física Havok e IA (`NavGraph`).

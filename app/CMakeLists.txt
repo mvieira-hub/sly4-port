@@ -1,4 +1,4 @@
-add_executable(sly4 main.cpp "${CMAKE_BINARY_DIR}/gen_firmware.cpp")
+add_executable(sly4 main.cpp pad_input.cpp "${CMAKE_BINARY_DIR}/gen_firmware.cpp")
 foreach(mod ${SLY4_FW_MODULES})
     target_link_libraries(sly4 PRIVATE sly4_gen_${mod})
 endforeach()

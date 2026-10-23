@@ -139,7 +139,7 @@ O código SPU novo do vídeo e do menu foi gravado na cache SPU e compilado ([SP
 
 ### O que falta
 
-- **Desempenho:** o menu roda a ~41–47 quadros/s (ver abaixo), acima dos 30 que o jogo mira.
+- **Desempenho:** o menu roda a ~41–47 quadros/s (ver abaixo), acima dos 30 que o jogo mira. Na Fase 6 caiu para ~37–41, porque o pós-processamento que o jogo faz nas SPUs passou a ser emulado (ver FASE6.md, 6d).
 - MRT, desvios e laços em *fragment programs*, e superfícies de 16 bits e de ponto flutuante na coerência com a memória: nada disso aparece até o menu.
 
 ## Comparação com o RPCS3 (5e)

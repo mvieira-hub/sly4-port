@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
@@ -55,6 +56,8 @@ struct Image {
     bool cpu_dirty = false, gpu_dirty = false;
     uint32_t pitch = 0, guest_format = 0;  // color surfaces: bytes per line, SET_SURFACE_FORMAT color
     uint64_t writes = 0;  // depth surfaces: draws and clears that wrote them (conversions follow it)
+    GuestAddr addr = 0;   // surfaces: where they live in guest memory
+    bool tracked = false;  // surfaces: their memory is watched for writes (track_writes)
 };
 
 // Texture change detection: 8 bytes at a time (FNV-1a byte by byte was 40% of the RSX
@@ -99,6 +102,26 @@ bool surface_byte_order(uint32_t format, uint32_t (&o)[4]) {
 bool shadow_texture(const Texture& t) {
     const uint32_t f = t.base_format();
     return f >= 0x90 && f <= 0x93 && ((t.address >> 28) & 7) != 0;
+}
+
+// A row of 32-bit pixels between the host's RGBA and a surface format in memory: A8R8G8B8 is
+// RGBA with its bytes rotated, A8B8G8R8 with them reversed, so whole words at a time
+// (byte by byte, writing back a 1280x720 frame cost ~10 ms).
+void rgba_to_guest(uint8_t* dst, const uint8_t* src, uint32_t pixels, bool argb) {
+    for (uint32_t i = 0; i < pixels; ++i) {
+        uint32_t v;
+        std::memcpy(&v, src + 4 * i, 4);
+        v = argb ? (v << 8) | (v >> 24) : __builtin_bswap32(v);
+        std::memcpy(dst + 4 * i, &v, 4);
+    }
+}
+void guest_to_rgba(uint8_t* dst, const uint8_t* src, uint32_t pixels, bool argb) {
+    for (uint32_t i = 0; i < pixels; ++i) {
+        uint32_t v;
+        std::memcpy(&v, src + 4 * i, 4);
+        v = argb ? (v >> 8) | (v << 24) : __builtin_bswap32(v);
+        std::memcpy(dst + 4 * i, &v, 4);
+    }
 }
 
 // Everything a pipeline depends on besides the dynamic state.
@@ -294,6 +317,11 @@ private:
 
     VkCommandPool pool_ = VK_NULL_HANDLE;
     VkCommandBuffer cmd_ = VK_NULL_HANDLE;
+    // Command buffers handed to the GPU without waiting (kick) since the last wait: the GPU
+    // draws one pass while the next is recorded.
+    static constexpr uint32_t kCommandBuffers = 64;
+    VkCommandBuffer cmds_[kCommandBuffers] = {};
+    uint32_t cmd_index_ = 0;
     VkFence fence_ = VK_NULL_HANDLE;
     bool recording_ = false;
 
@@ -338,6 +366,7 @@ private:
 
     // Counters.
     uint64_t draws_ = 0, skipped_ = 0, texture_uploads_ = 0, pipelines_built_ = 0, flushes_ = 0, gpu_copies_ = 0, hashed_bytes_ = 0, converted_vertices_ = 0;
+    uint64_t cpu_overwrites_ = 0;  // surfaces the CPU wrote over before they were read back
 
     uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want);
     bool make_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer& b, VkDeviceMemory& m, uint8_t** map,
@@ -350,12 +379,17 @@ private:
 
     VkCommandBuffer cmd();
     void submit_and_wait();
+    void kick();
     void transition(Image& img, VkImageLayout layout);
     VkDeviceSize ring_alloc(VkDeviceSize size, VkDeviceSize align = 16);
 
     bool bind_targets(GuestMemory& mem, const State& s);
     bool ensure_readback(VkDeviceSize bytes);
     void flush_depth(GuestMemory& mem, GuestAddr addr, Image& img);
+    void drawn(Image& img);
+    void track(Image& img);
+    void apply_cpu_writes();
+    void forget(Image& img);
     // Guest memory -> a color surface written by the CPU (cpu_dirty).
     void upload_surface(GuestMemory& mem, GuestAddr ea, Image& img);
     static uint32_t surface_bytes(const Image& img) { return (img.pitch ? img.pitch : img.width * 4) * img.height; }
@@ -485,8 +519,9 @@ bool Renderer::init() {
     VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     cai.commandPool = pool_;
     cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cai.commandBufferCount = 1;
-    if (!ok(vkAllocateCommandBuffers(dev_, &cai, &cmd_), "vkAllocateCommandBuffers")) return false;
+    cai.commandBufferCount = kCommandBuffers;
+    if (!ok(vkAllocateCommandBuffers(dev_, &cai, cmds_), "vkAllocateCommandBuffers")) return false;
+    cmd_ = cmds_[0];
     VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     if (!ok(vkCreateFence(dev_, &fi, nullptr, &fence_), "vkCreateFence")) return false;
 
@@ -560,23 +595,52 @@ VkCommandBuffer Renderer::cmd() {
     return cmd_;
 }
 
+// What was recorded goes to the GPU, without waiting for it; recording goes on in the next
+// command buffer. At pass changes: by the time something must be read back the GPU has
+// drawn most of the frame already (waiting for all of it there cost 2.5 ms per read-back).
+void Renderer::kick() {
+    if (!recording_) return;
+    end_rendering();
+    if (cmd_index_ + 1 >= kCommandBuffers) {
+        submit_and_wait();
+        return;
+    }
+    vkEndCommandBuffer(cmd_);
+    recording_ = false;
+    VkCommandBufferSubmitInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+    cbi.commandBuffer = cmd_;
+    VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+    si.commandBufferInfoCount = 1;
+    si.pCommandBufferInfos = &cbi;
+    {
+        std::lock_guard<std::mutex> lk(ctx_.queue_lock());
+        ok(vkQueueSubmit2(ctx_.queue(), 1, &si, VK_NULL_HANDLE), "vkQueueSubmit2");
+    }
+    cmd_ = cmds_[++cmd_index_];
+}
+
 void Renderer::submit_and_wait() {
     end_rendering();
-    if (recording_) {
-        vkEndCommandBuffer(cmd_);
-        recording_ = false;
+    if (recording_ || cmd_index_) {
+        // The queue runs in order: a fence after the last submission covers the kicked ones.
         VkCommandBufferSubmitInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
         cbi.commandBuffer = cmd_;
         VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
-        si.commandBufferInfoCount = 1;
-        si.pCommandBufferInfos = &cbi;
+        if (recording_) {
+            vkEndCommandBuffer(cmd_);
+            recording_ = false;
+            si.commandBufferInfoCount = 1;
+            si.pCommandBufferInfos = &cbi;
+        }
         {
             std::lock_guard<std::mutex> lk(ctx_.queue_lock());
             ok(vkQueueSubmit2(ctx_.queue(), 1, &si, fence_), "vkQueueSubmit2");
         }
         vkWaitForFences(dev_, 1, &fence_, VK_TRUE, UINT64_MAX);
         vkResetFences(dev_, 1, &fence_);
-        vkResetCommandBuffer(cmd_, 0);
+        for (uint32_t i = 0; i <= cmd_index_; ++i) vkResetCommandBuffer(cmds_[i], 0);
+        cmd_index_ = 0;
+        cmd_ = cmds_[0];
     }
     ring_at_ = 0;
     if (sets_used_) {
@@ -630,6 +694,7 @@ VkFormat surface_color_format(uint32_t f) {
 }
 
 bool Renderer::bind_targets(GuestMemory& mem, const State& s) {
+    apply_cpu_writes();
     const Surface sf = s.surface();
     const uint32_t w = sf.x + sf.width, h = sf.y + sf.height;
     if (!w || !h || w > 4096 || h > 4096) return false;
@@ -646,12 +711,14 @@ bool Renderer::bind_targets(GuestMemory& mem, const State& s) {
             if (it->second.get() == color_ || it->second.get() == depth_) end_rendering();
             if (color_ == it->second.get()) color_ = nullptr;
             if (depth_ == it->second.get()) depth_ = nullptr;
+            forget(*it->second);
             retired_.push_back(std::move(it->second));
             surfaces_.erase(it);
         }
         auto img = make_image(w, h, f, usage, aspect);
         if (!img) return nullptr;
         Image* p = img.get();
+        p->addr = ea;
         surfaces_[ea] = std::move(img);
         return p;
     };
@@ -684,7 +751,7 @@ bool Renderer::bind_targets(GuestMemory& mem, const State& s) {
         }
     }
     if (!color && !depth) return false;
-    if (rendering_ && (color != color_ || depth != depth_)) end_rendering();
+    if (color != color_ || depth != depth_) kick();  // a new pass: the GPU starts on the last one
     color_ = color;
     depth_ = depth;
     target_w_ = w;
@@ -694,7 +761,7 @@ bool Renderer::bind_targets(GuestMemory& mem, const State& s) {
 
 void Renderer::begin_rendering() {
     if (rendering_) return;
-    if (color_) color_->gpu_dirty = true;
+    if (color_) drawn(*color_);
     if (color_) transition(*color_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     if (depth_) transition(*depth_, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
     VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
@@ -755,7 +822,7 @@ void Renderer::clear(GuestMemory& mem, const State& s, uint32_t mask) {
     if (!n) return;
     begin_rendering();
     if (depth_ && (mask & 3)) {
-        depth_->gpu_dirty = true;
+        drawn(*depth_);
         ++depth_->writes;
     }
     VkClearRect rect{};
@@ -788,12 +855,57 @@ bool Renderer::ensure_readback(VkDeviceSize bytes) {
 }
 
 // Surfaces the GPU drew in [ea, ea + size) are read back into guest memory.
+// Surfaces whose GPU copy is current (drawn since, or the same as memory) have their memory
+// watched: a write by anyone else (PPU, SPU, kernel) means memory now holds the truth, and
+// the surface takes it again when next used (apply_cpu_writes) instead of overwriting it
+// later. The game reuses such memory (Bink's video planes landed on a surface drawn
+// seconds before) and has the SPUs post-process frames it copied to main memory.
+void Renderer::track(Image& img) {
+    if (img.tracked || !img.addr) return;
+    img.tracked = true;
+    track_writes(img.addr, surface_bytes(img));
+}
+
+void Renderer::drawn(Image& img) {
+    img.gpu_dirty = true;
+    track(img);
+}
+
+// A surface going away (or about to be written back): its memory is no longer watched.
+void Renderer::forget(Image& img) {
+    if (img.tracked) untrack_writes(img.addr, surface_bytes(img));
+    img.tracked = false;
+    img.gpu_dirty = false;
+}
+
+void Renderer::apply_cpu_writes() {
+    std::vector<std::pair<GuestAddr, uint32_t>> written;
+    if (!take_written(written)) return;
+    for (const auto& [ea, size] : written) {
+        for (auto& [addr, img] : surfaces_)
+            if (img->tracked && ea < addr + surface_bytes(*img) && addr < ea + size) {
+                img->tracked = false;  // the write ended the watch
+                img->gpu_dirty = false;
+                if (!(img->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) img->cpu_dirty = true;
+                ++cpu_overwrites_;
+            }
+        invalidate(ea, size);
+    }
+}
+
 void Renderer::flush(GuestMemory& mem, GuestAddr ea, uint32_t size) {
+    apply_cpu_writes();
+    HostWriteScope host_writes;  // writing it back: a page it shares with another surface stays watched
     for (auto& [addr, ptr] : surfaces_) {
         Image& img = *ptr;
         if (!img.gpu_dirty || !(ea < addr + surface_bytes(img) && addr < ea + size)) continue;
-        img.gpu_dirty = false;
+        forget(img);
         ++flushes_;
+        struct Retrack {  // memory and GPU agree again once written back: watched again
+            Renderer& r;
+            Image& i;
+            ~Retrack() { r.track(i); }
+        } retrack{*this, img};
         for (auto& [key, tex] : textures_)  // read from these bytes before: hashed again
             if (tex && addr < tex->src + tex->src_size && tex->src < addr + surface_bytes(img)) tex->hashed_flip = ~0ull;
         if (img.aspect & VK_IMAGE_ASPECT_DEPTH_BIT) {
@@ -812,12 +924,8 @@ void Renderer::flush(GuestMemory& mem, GuestAddr ea, uint32_t size) {
         copy.imageExtent = {img.width, img.height, 1};
         vkCmdCopyImageToBuffer(cmd(), img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback_, 1, &copy);
         submit_and_wait();
-        for (uint32_t y = 0; y < img.height; ++y) {
-            const uint8_t* q = readback_map_ + size_t(y) * img.width * 4;
-            uint8_t* p = mem.host(addr + y * img.pitch);
-            for (uint32_t x = 0; x < img.width; ++x, q += 4, p += 4)
-                for (int c = 0; c < 4; ++c) p[o[c]] = q[c];
-        }
+        for (uint32_t y = 0; y < img.height; ++y)
+            rgba_to_guest(mem.host(addr + y * img.pitch), readback_map_ + size_t(y) * img.width * 4, img.width, o[0] == 1);
     }
 }
 
@@ -889,6 +997,7 @@ Image* Renderer::surface_holding(GuestAddr ea, uint32_t pitch, uint32_t& x, uint
 // destination that is no surface yet (the game saves the display buffer in main memory
 // and copies it back later) gets one, a shadow of that memory filled from it first.
 bool Renderer::scaled_copy(GuestMemory& mem, const ScaledCopy& c) {
+    apply_cpu_writes();
     uint32_t sx, sy, dx, dy;
     GuestAddr sbase, dbase;
     Image* s = surface_holding(c.src, c.src_pitch, sx, sy, sbase);
@@ -904,6 +1013,7 @@ bool Renderer::scaled_copy(GuestMemory& mem, const ScaledCopy& c) {
         img->pitch = c.dst_pitch;
         img->guest_format = s->guest_format;
         img->cpu_dirty = true;  // its pixels come from memory before the copy lands
+        img->addr = c.dst;
         d = img.get();
         dbase = c.dst;
         dx = dy = 0;
@@ -925,24 +1035,26 @@ bool Renderer::scaled_copy(GuestMemory& mem, const ScaledCopy& c) {
     blit.dstOffsets[1] = {int32_t(dx + c.dst_x + c.dst_w), int32_t(dy + c.dst_y + c.dst_h), 1};
     vkCmdBlitImage(cmd(), s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, d->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                    &blit, c.linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
-    d->gpu_dirty = true;
+    drawn(*d);
     ++gpu_copies_;
+    // Into main memory: the game copies there for the PPU or the SPUs to read (the menu's
+    // frame, post-processed on the SPUs and copied back), so the bytes go there now, before
+    // the RSX goes on to the label that tells the game the copy is done.
+    if (dbase < kLocalBase || dbase >= kLocalBase + kLocalSize)
+        flush(mem, dbase + (dy + c.dst_y) * d->pitch, c.dst_h * d->pitch);
     return true;
 }
 
 void Renderer::upload_surface(GuestMemory& mem, GuestAddr ea, Image& img) {
     img.cpu_dirty = false;
+    track(img);
     uint32_t o[4];
     if (!surface_byte_order(img.guest_format, o) || img.format != VK_FORMAT_R8G8B8A8_UNORM || img.pitch < img.width * 4)
         return;
     end_rendering();
     const VkDeviceSize at = ring_alloc(VkDeviceSize(img.width) * img.height * 4, 16);
-    for (uint32_t y = 0; y < img.height; ++y) {
-        const uint8_t* p = mem.host(ea + y * img.pitch);
-        uint8_t* q = ring_map_ + at + size_t(y) * img.width * 4;
-        for (uint32_t x = 0; x < img.width; ++x, q += 4, p += 4)
-            for (int c = 0; c < 4; ++c) q[c] = p[o[c]];
-    }
+    for (uint32_t y = 0; y < img.height; ++y)
+        guest_to_rgba(ring_map_ + at + size_t(y) * img.width * 4, mem.host(ea + y * img.pitch), img.width, o[0] == 1);
     transition(img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     VkBufferImageCopy copy{};
     copy.bufferOffset = at;
@@ -1142,6 +1254,7 @@ Image* Renderer::depth_as_color(const Texture& t) {
 }
 
 Image* Renderer::texture(GuestMemory& mem, const Texture& t, uint32_t dims) {
+    apply_cpu_writes();
     if (!t.enabled() || !t.width || !t.height || dims != 2) return nullptr;
     const GuestAddr ea = location_address(t.location, t.offset);
     if (!ea) return nullptr;
@@ -1149,7 +1262,12 @@ Image* Renderer::texture(GuestMemory& mem, const Texture& t, uint32_t dims) {
     // A texture that is a surface we rendered: sample the surface itself, or, when the
     // texture is a smaller rectangle at its start (a 704x396 image in a 1280x720 target),
     // a copy of that rectangle; sampling the whole surface would shrink the picture.
-    if (auto it = surfaces_.find(ea); it != surfaces_.end() && !(it->second->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) {
+    // Only a texture laid out as the surface is: 32-bit color, the same pitch. Memory that
+    // held a surface once may hold anything later (Bink's 8-bit video planes, at the address
+    // of a frame the SPUs had post-processed), read as plain memory then.
+    const bool as_surface = (t.base_format() == 0x85 || t.base_format() == 0x9E) && t.linear();  // A8R8G8B8, D8R8G8B8
+    if (auto it = surfaces_.find(ea); as_surface && it != surfaces_.end() && !(it->second->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) &&
+                                      it->second->format == VK_FORMAT_R8G8B8A8_UNORM && it->second->pitch == t.pitch) {
         Image* img = it->second.get();
         if (img != color_ && t.width <= img->width && t.height <= img->height) {
             if (img->cpu_dirty) upload_surface(mem, ea, *img);
@@ -1642,7 +1760,7 @@ void Renderer::draw(GuestMemory& mem, const State& s, const DrawCommand& d) {
     // (as A8R8G8B8) while it stays bound, and each read would otherwise read it back again.
     begin_rendering();
     if (depth_ && ((k.depth_test && k.depth_write) || k.stencil[0])) {
-        depth_->gpu_dirty = true;
+        drawn(*depth_);
         ++depth_->writes;
     }
     VkCommandBuffer c = cmd();
@@ -1765,9 +1883,10 @@ void Renderer::flip(GuestMemory& mem, const State&, uint32_t buffer) {
 
 void Renderer::summary() {
     SLY4_INFO("RSX/Vulkan: %" PRIu64 " draws (%" PRIu64 " não desenhados), %zu pipelines, %zu programas, %" PRIu64
-              " texturas enviadas, %zu superfícies, %" PRIu64 " leituras da GPU, %" PRIu64 " cópias na GPU; %.1f GiB de texturas conferidas, %" PRIu64 " vértices convertidos",
+              " texturas enviadas, %zu superfícies, %" PRIu64 " leituras da GPU, %" PRIu64 " cópias na GPU, %" PRIu64
+              " superfícies sobrescritas pela CPU; %.1f GiB de texturas conferidas, %" PRIu64 " vértices convertidos",
               draws_, skipped_, pipelines_.size(), modules_.size(), texture_uploads_, surfaces_.size(), flushes_, gpu_copies_,
-              double(hashed_bytes_) / double(1u << 30), converted_vertices_);
+              cpu_overwrites_, double(hashed_bytes_) / double(1u << 30), converted_vertices_);
 }
 
 }  // namespace

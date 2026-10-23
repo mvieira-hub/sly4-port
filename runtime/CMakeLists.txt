@@ -45,6 +45,7 @@ add_library(sly4_kernel STATIC
     kernel/hle_cell_fs.cpp
     kernel/hle_cell_game.cpp
     kernel/hle_cell_pad.cpp
+    kernel/hle_cell_savedata.cpp
     kernel/hle_cell_gcm.cpp
     kernel/hle_cell_spurs.cpp
     kernel/hle_libc.cpp

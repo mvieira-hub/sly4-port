@@ -87,7 +87,8 @@ Estado atual: **Fases 0 a 4 concluídas; Fase 5 (GPU) com a saída alcançada: o
   - os 2.577 blocos que a tarefa EDGE zlib descomprime no SPU durante o boot são idênticos ao inflate nativo, que bate com o `zlib` do Python nos 148.603 blocos do psarc.
 - Fase 5, início: um `cellGcm` mínimo com um RSX que consome o FIFO sem desenhar, mais `cellAudio` e `cellPad` mínimos. O jogo sobe até o vídeo de abertura, com as threads de áudio (SCREAM, Bink) e de física (Havok, BFX) rodando.
 - Fase 5 (ver [docs/GPU.md](docs/GPU.md)): o RSX tem rastreador de estado e um renderizador Vulkan que traduz os *shaders* do jogo direto para SPIR-V (os 541 traduzem). Tela de carregamento, splash da Sanzaru, tela de título e menu principal saem corretos (`--no-window --render --dump-frames pasta` grava os quadros em PNG; `--press start@40` aperta botões).
-- O menu roda a ~41–47 quadros/s, acima dos 30 do jogo, e o título e o menu batem com o RPCS3 (Fase 5 concluída). Próximo passo: a Fase 6 (som, controle de verdade, vídeo).
+- O título e o menu batem com o RPCS3 (Fase 5 concluída).
+- Fase 6 (ver [docs/FASE6.md](docs/FASE6.md)): o jogo tem som (música e efeitos pelo dispositivo padrão), controle (gamepad, ou o teclado na janela: setas, Enter = Start, X = Cross, C = Circle), saves (o idioma é pedido na primeira partida) e a abertura em vídeo Bink. O menu roda a ~37–41 quadros/s, agora com o pós-processamento que o jogo faz nas SPUs. Próximo passo: a Fase 7 (a primeira fase jogável).
 - O programa abre a janela Vulkan 1.3 na GPU dedicada.
 - Reserva os 4 GiB do espaço de endereços do PS3 e carrega o `EBOOT.elf`: segmentos, TLS, parâmetros do processo e as 251 importações, idênticas às do `eboot_scan.py`.
 - A CI (`.github/workflows/build.yml`) compila o `.exe`, roda os testes num runner Windows e publica os binários como artefato.
