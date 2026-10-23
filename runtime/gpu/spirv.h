@@ -22,7 +22,8 @@ enum Op : uint16_t {
     OpFunction = 54, OpFunctionEnd = 56, OpVariable = 59, OpLoad = 61, OpStore = 62, OpAccessChain = 65,
     OpDecorate = 71, OpMemberDecorate = 72, OpVectorShuffle = 79, OpCompositeConstruct = 80,
     OpCompositeExtract = 81, OpCompositeInsert = 82, OpImageSampleImplicitLod = 87, OpImageSampleExplicitLod = 88,
-    OpImageSampleProjImplicitLod = 91, OpConvertFToS = 110, OpConvertSToF = 111, OpBitcast = 124,
+    OpImageSampleDrefImplicitLod = 89,
+    OpImageSampleProjImplicitLod = 91, OpImageSampleProjDrefImplicitLod = 93, OpConvertFToS = 110, OpConvertSToF = 111, OpBitcast = 124,
     OpFNegate = 127, OpIAdd = 128, OpFAdd = 129, OpFSub = 131, OpFMul = 133, OpFDiv = 136, OpFMod = 141,
     OpISub = 130, OpVectorTimesScalar = 142, OpDot = 148, OpAny = 154, OpAll = 155, OpLogicalOr = 166,
     OpLogicalAnd = 167, OpLogicalNot = 168, OpSelect = 169, OpIEqual = 170, OpINotEqual = 171, OpSGreaterThan = 173,
@@ -64,7 +65,7 @@ public:
     Id t_struct(const std::vector<Id>& members);  // not deduplicated (decorations differ)
     Id t_pointer(StorageClass sc, Id type);
     Id t_function(Id ret, const std::vector<Id>& params = {});
-    Id t_sampled_image(Dim dim);
+    Id t_sampled_image(Dim dim, bool depth = false);  // depth: sampled with a comparison (Dref)
 
     // Constants (deduplicated).
     Id c_float(float v);

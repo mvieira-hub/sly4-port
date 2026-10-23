@@ -140,7 +140,7 @@ ShaderResult translate_fragment_program(const uint8_t* code, const FragmentProgr
         if (!(info.textures & (1u << t))) continue;
         const uint32_t d = key.texture_dims[t];
         const spv::Dim dim = d == 3 ? spv::Dim3D : d == 6 ? spv::DimCube : spv::Dim2D;
-        sampler_types[t] = b.t_sampled_image(dim);
+        sampler_types[t] = b.t_sampled_image(dim, (key.shadow >> t) & 1);
         samplers[t] = b.variable(b.t_pointer(spv::UniformConstant, sampler_types[t]), spv::UniformConstant);
         b.decorate(samplers[t], spv::DescriptorSet, {0});
         b.decorate(samplers[t], spv::Binding, {kTextureBinding0 + t});
@@ -235,6 +235,16 @@ ShaderResult translate_fragment_program(const uint8_t* code, const FragmentProgr
             const uint32_t n = (d == 3 || d == 6) ? 3 : 2;
             const Id coords = s0();
             const Id ct = b.t_vec(v.f, n);
+            // A shadow map: the hardware compares z (z / w for TXP) with the texel, as RPCS3
+            // does, and every component gets the result.
+            if ((key.shadow >> t) & 1) {
+                const Id xy = b.op(spv::OpVectorShuffle, b.t_vec(v.f, 2), {coords, coords, 0, 1});
+                const Id r = kind == TXP ? b.op(spv::OpImageSampleProjDrefImplicitLod, v.f,
+                                                {smp, b.op(spv::OpVectorShuffle, b.t_vec(v.f, 3), {coords, coords, 0, 1, 3}),
+                                                 v.comp(coords, 2)})
+                                         : b.op(spv::OpImageSampleDrefImplicitLod, v.f, {smp, xy, v.comp(coords, 2)});
+                return v.splat(r);
+            }
             auto take = [&](Id c, uint32_t a, uint32_t b2, uint32_t c3) {
                 return n == 2 ? b.op(spv::OpVectorShuffle, ct, {c, c, a, b2})
                               : b.op(spv::OpVectorShuffle, ct, {c, c, a, b2, c3});

@@ -1,6 +1,7 @@
 #include "gpu/rsx_vk.h"
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
@@ -53,6 +54,7 @@ struct Image {
     // written from it; cpu_dirty: guest memory written behind the GPU's back (2D copies).
     bool cpu_dirty = false, gpu_dirty = false;
     uint32_t pitch = 0, guest_format = 0;  // color surfaces: bytes per line, SET_SURFACE_FORMAT color
+    uint64_t writes = 0;  // depth surfaces: draws and clears that wrote them (conversions follow it)
 };
 
 // Texture change detection: 8 bytes at a time (FNV-1a byte by byte was 40% of the RSX
@@ -90,6 +92,13 @@ bool surface_byte_order(uint32_t format, uint32_t (&o)[4]) {
         case 14: case 15: case 16: std::memcpy(o, abgr, sizeof(o)); return true;  // X8B8G8R8, A8B8G8R8
         default: return false;
     }
+}
+
+// A depth texture (DEPTH24_D8, DEPTH16 and their float forms) with a compare function in
+// TEXTURE_ADDRESS (bits 28-30): a shadow map, sampled with a comparison.
+bool shadow_texture(const Texture& t) {
+    const uint32_t f = t.base_format();
+    return f >= 0x90 && f <= 0x93 && ((t.address >> 28) & 7) != 0;
 }
 
 // Everything a pipeline depends on besides the dynamic state.
@@ -292,6 +301,9 @@ private:
     VkDeviceMemory ring_memory_ = VK_NULL_HANDLE;
     uint8_t* ring_map_ = nullptr;
     VkDeviceSize ring_at_ = 0;
+    VkBuffer convert_ = VK_NULL_HANDLE;  // depth -> color conversions, on the GPU
+    VkDeviceMemory convert_memory_ = VK_NULL_HANDLE;
+    VkDeviceSize convert_size_ = 0;
     VkBuffer readback_ = VK_NULL_HANDLE;
     VkDeviceMemory readback_memory_ = VK_NULL_HANDLE;
     uint8_t* readback_map_ = nullptr;
@@ -304,13 +316,13 @@ private:
 
     std::map<GuestAddr, std::unique_ptr<Image>> surfaces_;
     std::map<TextureKey, std::unique_ptr<Image>> textures_;
-    std::unique_ptr<Image> dummy2d_, dummy3d_, dummy_cube_;
+    std::unique_ptr<Image> dummy2d_, dummy3d_, dummy_cube_, dummy_depth_;
     std::vector<std::unique_ptr<Image>> retired_;  // destroyed after the next submit
     std::unordered_map<uint64_t, VkShaderModule> modules_;
     std::unordered_map<uint64_t, uint32_t> vp_inputs_;  // VP hash -> input mask
     std::unordered_set<uint64_t> failed_;                // programs that did not translate
     std::unordered_map<PipelineKey, VkPipeline, PipelineKeyHash> pipelines_;
-    std::unordered_map<uint64_t, VkSampler> samplers_;
+    std::map<std::array<uint32_t, 3>, VkSampler> samplers_;  // filter, address, LOD bits of CONTROL0
 
     // Current render targets.
     Image* color_ = nullptr;
@@ -328,7 +340,8 @@ private:
     uint64_t draws_ = 0, skipped_ = 0, texture_uploads_ = 0, pipelines_built_ = 0, flushes_ = 0, gpu_copies_ = 0, hashed_bytes_ = 0, converted_vertices_ = 0;
 
     uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want);
-    bool make_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer& b, VkDeviceMemory& m, uint8_t** map);
+    bool make_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer& b, VkDeviceMemory& m, uint8_t** map,
+                     bool cached = false);
     std::unique_ptr<Image> make_image(uint32_t w, uint32_t h, VkFormat f, VkImageUsageFlags usage,
                                       VkImageAspectFlags aspect, const VkComponentMapping& swizzle = {},
                                       VkImageViewType view_type = VK_IMAGE_VIEW_TYPE_2D, uint32_t depth = 1,
@@ -342,6 +355,7 @@ private:
 
     bool bind_targets(GuestMemory& mem, const State& s);
     bool ensure_readback(VkDeviceSize bytes);
+    void flush_depth(GuestMemory& mem, GuestAddr addr, Image& img);
     // Guest memory -> a color surface written by the CPU (cpu_dirty).
     void upload_surface(GuestMemory& mem, GuestAddr ea, Image& img);
     static uint32_t surface_bytes(const Image& img) { return (img.pitch ? img.pitch : img.width * 4) * img.height; }
@@ -350,6 +364,8 @@ private:
 
     VkShaderModule module(uint64_t key, const std::vector<uint32_t>& spirv);
     Image* texture(GuestMemory& mem, const Texture& t, uint32_t dims);
+    Image* depth_texture(const Texture& t);
+    Image* depth_as_color(const Texture& t);
     VkSampler sampler(const Texture& t);
     VkPipeline pipeline(const PipelineKey& key);
     void present_from(Image* src, GuestMemory& mem, const DisplayBuffer& db);
@@ -365,13 +381,15 @@ Renderer::~Renderer() {
     for (auto& [k, img] : textures_) destroy(*img);
     for (auto& img : retired_) destroy(*img);
     for (auto& img : fronts_) destroy(*img);
-    for (Image* img : {dummy2d_.get(), dummy3d_.get(), dummy_cube_.get()})
+    for (Image* img : {dummy2d_.get(), dummy3d_.get(), dummy_cube_.get(), dummy_depth_.get()})
         if (img) destroy(*img);
     if (descriptor_pool_) vkDestroyDescriptorPool(dev_, descriptor_pool_, nullptr);
     if (pipeline_layout_) vkDestroyPipelineLayout(dev_, pipeline_layout_, nullptr);
     if (set_layout_) vkDestroyDescriptorSetLayout(dev_, set_layout_, nullptr);
     if (ring_) vkDestroyBuffer(dev_, ring_, nullptr);
     if (ring_memory_) vkFreeMemory(dev_, ring_memory_, nullptr);
+    if (convert_) vkDestroyBuffer(dev_, convert_, nullptr);
+    if (convert_memory_) vkFreeMemory(dev_, convert_memory_, nullptr);
     if (readback_) vkDestroyBuffer(dev_, readback_, nullptr);
     if (readback_memory_) vkFreeMemory(dev_, readback_memory_, nullptr);
     if (fence_) vkDestroyFence(dev_, fence_, nullptr);
@@ -385,7 +403,7 @@ uint32_t Renderer::memory_type(uint32_t bits, VkMemoryPropertyFlags want) {
 }
 
 bool Renderer::make_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer& b, VkDeviceMemory& m,
-                           uint8_t** map) {
+                           uint8_t** map, bool cached) {
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = size;
     bi.usage = usage;
@@ -394,8 +412,11 @@ bool Renderer::make_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer
     vkGetBufferMemoryRequirements(dev_, b, &req);
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     ai.allocationSize = req.size;
-    ai.memoryTypeIndex =
-        memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    // What the CPU reads back wants cached memory: uncached, each byte read costs a trip over
+    // the bus (reading a depth buffer back took ~0.2 s).
+    const VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    ai.memoryTypeIndex = cached ? memory_type(req.memoryTypeBits, host | VK_MEMORY_PROPERTY_HOST_CACHED_BIT) : UINT32_MAX;
+    if (ai.memoryTypeIndex == UINT32_MAX) ai.memoryTypeIndex = memory_type(req.memoryTypeBits, host);
     if (ai.memoryTypeIndex == UINT32_MAX || !ok(vkAllocateMemory(dev_, &ai, nullptr, &m), "vkAllocateMemory"))
         return false;
     vkBindBufferMemory(dev_, b, m, 0);
@@ -506,7 +527,15 @@ bool Renderer::init() {
                           VK_IMAGE_VIEW_TYPE_3D);
     dummy_cube_ = make_image(1, 1, VK_FORMAT_R8G8B8A8_UNORM, tex_usage, VK_IMAGE_ASPECT_COLOR_BIT, {},
                              VK_IMAGE_VIEW_TYPE_CUBE, 1, 6);
-    if (!dummy2d_ || !dummy3d_ || !dummy_cube_) return false;
+    // A shadow map nobody drew: far away everywhere (depth 1).
+    dummy_depth_ = make_image(1, 1, VK_FORMAT_D16_UNORM, tex_usage, VK_IMAGE_ASPECT_DEPTH_BIT);
+    if (!dummy2d_ || !dummy3d_ || !dummy_cube_ || !dummy_depth_) return false;
+    transition(*dummy_depth_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    const VkClearDepthStencilValue far_depth{1.0f, 0};
+    const VkImageSubresourceRange depth_range{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+    vkCmdClearDepthStencilImage(cmd(), dummy_depth_->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &far_depth, 1,
+                                &depth_range);
+    transition(*dummy_depth_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     for (Image* img : {dummy2d_.get(), dummy3d_.get(), dummy_cube_.get()}) {
         transition(*img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkClearColorValue black{};
@@ -645,7 +674,14 @@ bool Renderer::bind_targets(GuestMemory& mem, const State& s) {
         const VkImageAspectFlags aspect =
             f == VK_FORMAT_D16_UNORM ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
         if (ea && ea != (color ? location_address(sf.color_location[index], sf.color_offset[index]) : 0))
-            depth = find(ea, f, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, aspect);
+            depth = find(ea, f,
+                         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                             VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                         aspect);
+        if (depth) {
+            depth->pitch = sf.depth_pitch;
+            depth->guest_format = sf.depth_format;
+        }
     }
     if (!color && !depth) return false;
     if (rendering_ && (color != color_ || depth != depth_)) end_rendering();
@@ -718,6 +754,10 @@ void Renderer::clear(GuestMemory& mem, const State& s, uint32_t mask) {
     }
     if (!n) return;
     begin_rendering();
+    if (depth_ && (mask & 3)) {
+        depth_->gpu_dirty = true;
+        ++depth_->writes;
+    }
     VkClearRect rect{};
     rect.rect = {{0, 0}, {target_w_, target_h_}};
     rect.layerCount = 1;
@@ -741,18 +781,25 @@ bool Renderer::ensure_readback(VkDeviceSize bytes) {
         readback_ = VK_NULL_HANDLE;
         readback_size_ = 0;
     }
-    if (!make_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, readback_, readback_memory_, &readback_map_)) return false;
+    if (!make_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, readback_, readback_memory_, &readback_map_, true))
+        return false;
     readback_size_ = bytes;
     return true;
 }
 
-// Color surfaces the GPU drew in [ea, ea + size) are read back into guest memory.
+// Surfaces the GPU drew in [ea, ea + size) are read back into guest memory.
 void Renderer::flush(GuestMemory& mem, GuestAddr ea, uint32_t size) {
     for (auto& [addr, ptr] : surfaces_) {
         Image& img = *ptr;
         if (!img.gpu_dirty || !(ea < addr + surface_bytes(img) && addr < ea + size)) continue;
         img.gpu_dirty = false;
         ++flushes_;
+        for (auto& [key, tex] : textures_)  // read from these bytes before: hashed again
+            if (tex && addr < tex->src + tex->src_size && tex->src < addr + surface_bytes(img)) tex->hashed_flip = ~0ull;
+        if (img.aspect & VK_IMAGE_ASPECT_DEPTH_BIT) {
+            flush_depth(mem, addr, img);
+            continue;
+        }
         uint32_t o[4];
         if (!surface_byte_order(img.guest_format, o) || img.format != VK_FORMAT_R8G8B8A8_UNORM ||
             img.pitch < img.width * 4)
@@ -770,6 +817,55 @@ void Renderer::flush(GuestMemory& mem, GuestAddr ea, uint32_t size) {
             uint8_t* p = mem.host(addr + y * img.pitch);
             for (uint32_t x = 0; x < img.width; ++x, q += 4, p += 4)
                 for (int c = 0; c < 4; ++c) p[o[c]] = q[c];
+        }
+    }
+}
+
+// A depth surface in guest memory as the RSX keeps it: big-endian 16-bit words (Z16) or
+// 32-bit words with the depth in the upper 24 bits and the stencil in the lower 8 (Z24S8).
+// The game reads them back as textures: the main depth as A8R8G8B8 for the menu's
+// post-processing, the shadow maps as DEPTH16 and G8B8.
+void Renderer::flush_depth(GuestMemory& mem, GuestAddr addr, Image& img) {
+    const bool z16 = img.format == VK_FORMAT_D16_UNORM;
+    const uint32_t bpp = z16 ? 2 : 4;
+    if (img.pitch < img.width * bpp) return;
+    end_rendering();
+    const VkDeviceSize pixels = VkDeviceSize(img.width) * img.height;
+    // Depth: 2 bytes a pixel (D16), 4 (D24 in the low 24 bits, or D32 float); stencil: 1.
+    if (!ensure_readback(pixels * (z16 ? 2 : 5))) return;
+    transition(img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    VkBufferImageCopy copies[2]{};
+    copies[0].imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+    copies[0].imageExtent = {img.width, img.height, 1};
+    copies[1] = copies[0];
+    copies[1].bufferOffset = pixels * 4;
+    copies[1].imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+    vkCmdCopyImageToBuffer(cmd(), img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback_, z16 ? 1 : 2, copies);
+    submit_and_wait();
+    const bool d32f = img.format == VK_FORMAT_D32_SFLOAT_S8_UINT;
+    for (uint32_t y = 0; y < img.height; ++y) {
+        uint8_t* p = mem.host(addr + y * img.pitch);
+        const size_t row = size_t(y) * img.width;
+        if (z16) {
+            const uint8_t* q = readback_map_ + row * 2;
+            for (uint32_t x = 0; x < img.width; ++x) {
+                uint16_t d;
+                std::memcpy(&d, q + 2 * x, 2);
+                store_be<uint16_t>(p + 2 * x, d);
+            }
+            continue;
+        }
+        const uint8_t* q = readback_map_ + row * 4;
+        const uint8_t* st = readback_map_ + pixels * 4 + row;
+        for (uint32_t x = 0; x < img.width; ++x) {
+            uint32_t d;
+            std::memcpy(&d, q + 4 * x, 4);
+            if (d32f) {
+                float f;
+                std::memcpy(&f, &d, 4);
+                d = uint32_t(std::clamp(f, 0.0f, 1.0f) * 16777215.0f + 0.5f);
+            }
+            store_be<uint32_t>(p + 4 * x, (d & 0xFFFFFF) << 8 | st[x]);
         }
     }
 }
@@ -868,7 +964,8 @@ VkShaderModule Renderer::module(uint64_t key, const std::vector<uint32_t>& spirv
 }
 
 VkSampler Renderer::sampler(const Texture& t) {
-    const uint64_t key = (uint64_t(t.filter) << 32) | t.address;
+    const bool shadow = shadow_texture(t);
+    const std::array<uint32_t, 3> key{t.filter, t.address, (t.control0 & 0x7FFFFF80u) | (shadow ? 1u : 0u)};
     if (auto it = samplers_.find(key); it != samplers_.end()) return it->second;
     VkSamplerCreateInfo ci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     const uint32_t mag = (t.filter >> 24) & 7, min = (t.filter >> 16) & 7;
@@ -880,12 +977,168 @@ VkSampler Renderer::sampler(const Texture& t) {
     ci.addressModeU = address_mode(t.address & 0xF);
     ci.addressModeV = address_mode((t.address >> 8) & 0xF);
     ci.addressModeW = address_mode((t.address >> 16) & 0xF);
-    ci.maxLod = min >= 3 ? VK_LOD_CLAMP_NONE : 0.0f;
+    // Levels between CONTROL0's min LOD (bits 19-30) and max LOD (bits 7-18), and FILTER's
+    // bias (bits 0-12, signed), all fixed point with 8 fraction bits, as RPCS3 reads them.
+    // Most of the menu's textures have a max LOD of 0: their base level only (sampling the
+    // smaller ones, which they do not fill, made the time tunnel blurred and dark).
+    if (min >= 3) {
+        ci.minLod = float((t.control0 >> 19) & 0xFFF) / 256.0f;
+        ci.maxLod = std::max(ci.minLod, float((t.control0 >> 7) & 0xFFF) / 256.0f);
+        ci.mipLodBias = float(int32_t(t.filter << 19) >> 19) / 256.0f;
+    }
     ci.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+    if (shadow) {
+        // The RSX compares the texel with the reference, Vulkan the reference with the texel:
+        // the function goes the other way round (RPCS3's get_compare_func(op, true)).
+        static constexpr VkCompareOp kReversed[8] = {
+            VK_COMPARE_OP_NEVER, VK_COMPARE_OP_GREATER,   VK_COMPARE_OP_EQUAL,         VK_COMPARE_OP_GREATER_OR_EQUAL,
+            VK_COMPARE_OP_LESS,  VK_COMPARE_OP_NOT_EQUAL, VK_COMPARE_OP_LESS_OR_EQUAL, VK_COMPARE_OP_ALWAYS};
+        ci.compareEnable = VK_TRUE;
+        ci.compareOp = kReversed[(t.address >> 28) & 7];
+    }
     VkSampler s = VK_NULL_HANDLE;
     ok(vkCreateSampler(dev_, &ci, nullptr, &s), "vkCreateSampler");
     samplers_[key] = s;
     return s;
+}
+
+// A shadow map: the D16 surface the game drew it into, sampled on the GPU, or a copy of the
+// part the texture starts at (the menu's two 1024x1024 maps share one 1024x2048 surface).
+Image* Renderer::depth_texture(const Texture& t) {
+    const GuestAddr ea = location_address(t.location, t.offset);
+    if (!ea || t.base_format() != 0x92) return nullptr;  // DEPTH16
+    for (auto& [addr, ptr] : surfaces_) {
+        Image& img = *ptr;
+        if (img.format != VK_FORMAT_D16_UNORM || !img.pitch || ea < addr || ea >= addr + surface_bytes(img)) continue;
+        const uint32_t off = ea - addr, y = off / img.pitch;
+        if (off % img.pitch || t.width > img.width || y + t.height > img.height || &img == depth_) return nullptr;
+        end_rendering();
+        if (y == 0 && t.width == img.width && t.height == img.height) {
+            transition(img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            return &img;
+        }
+        const TextureKey key{ea, t.format, t.width, t.height, t.pitch, t.control1 & 0xFFFF, t.dimension};
+        auto& part = textures_[key];
+        if (!part || part->format != img.format) {
+            if (part) retired_.push_back(std::move(part));
+            part = make_image(t.width, t.height, img.format, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                              VK_IMAGE_ASPECT_DEPTH_BIT);
+            if (!part) return nullptr;
+        }
+        transition(img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        transition(*part, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkImageCopy region{};
+        region.srcSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+        region.srcOffset = {0, int32_t(y), 0};
+        region.dstSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+        region.extent = {t.width, t.height, 1};
+        vkCmdCopyImage(cmd(), img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, part->image,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        transition(*part, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        part->hash = 0;
+        ++gpu_copies_;
+        return part.get();
+    }
+    return nullptr;
+}
+
+// A depth surface read as color: the main depth (D24S8) as A8R8G8B8 for the menu's
+// post-processing, a shadow map (D16) as G8B8. The depth goes through a buffer into an
+// RGBA8 or RG8 image, and the view's swizzle puts each byte where decoding the PS3's memory
+// layout would (big-endian words, depth in the upper 24 bits); the stencil byte, B of
+// A8R8G8B8, reads as 0. Before, the depth went through guest memory and the CPU, with a
+// wait for the GPU each time (menu ~42 -> ~24 frames/s).
+Image* Renderer::depth_as_color(const Texture& t) {
+    const uint32_t f = t.base_format();
+    const GuestAddr ea = location_address(t.location, t.offset);
+    if (!ea || (f != 0x85 && f != 0x8B)) return nullptr;  // A8R8G8B8, G8B8
+    for (auto& [addr, ptr] : surfaces_) {
+        Image& img = *ptr;
+        if (!(img.aspect & VK_IMAGE_ASPECT_DEPTH_BIT) || !img.pitch || ea < addr || ea >= addr + surface_bytes(img))
+            continue;
+        // Which component of the converted image holds A, R, G and B of the decoded texel.
+        VkComponentSwizzle argb[4];
+        VkFormat cf;
+        if (f == 0x85 && img.format == VK_FORMAT_D24_UNORM_S8_UINT) {
+            cf = VK_FORMAT_R8G8B8A8_UNORM;  // r = depth bits 0-7, g = 8-15, b = 16-23
+            argb[0] = VK_COMPONENT_SWIZZLE_B, argb[1] = VK_COMPONENT_SWIZZLE_G, argb[2] = VK_COMPONENT_SWIZZLE_R,
+            argb[3] = VK_COMPONENT_SWIZZLE_ZERO;
+        } else if (f == 0x8B && img.format == VK_FORMAT_D16_UNORM) {
+            cf = VK_FORMAT_R8G8_UNORM;  // r = depth bits 0-7, g = 8-15
+            argb[0] = VK_COMPONENT_SWIZZLE_G, argb[1] = VK_COMPONENT_SWIZZLE_R, argb[2] = VK_COMPONENT_SWIZZLE_G,
+            argb[3] = VK_COMPONENT_SWIZZLE_R;
+        } else {
+            return nullptr;
+        }
+        const uint32_t off = ea - addr, y = off / img.pitch;
+        if (off % img.pitch || t.width > img.width || y + t.height > img.height) return nullptr;
+        const uint32_t remap = t.control1 & 0xFFFF;
+        auto map = [&](int out) {
+            const uint32_t op = (remap >> (8 + 2 * out)) & 3;
+            return op == 0 ? VK_COMPONENT_SWIZZLE_ZERO : op == 1 ? VK_COMPONENT_SWIZZLE_ONE : argb[(remap >> (2 * out)) & 3];
+        };
+        const VkComponentMapping swizzle{map(1), map(2), map(3), map(0)};
+        const TextureKey key{ea, t.format, t.width, t.height, t.pitch, remap, t.dimension};
+        auto& part = textures_[key];
+        if (part && part->format == cf && part->src == addr && part->hash == img.writes + 1) return part.get();
+        if (!part || part->format != cf) {
+            if (part) retired_.push_back(std::move(part));
+            part = make_image(t.width, t.height, cf, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                              VK_IMAGE_ASPECT_COLOR_BIT, swizzle);
+            if (!part) return nullptr;
+        }
+        const VkDeviceSize bytes = VkDeviceSize(t.width) * t.height * (cf == VK_FORMAT_R8G8_UNORM ? 2 : 4);
+        if (convert_size_ < bytes) {
+            if (convert_) {
+                submit_and_wait();
+                vkDestroyBuffer(dev_, convert_, nullptr);
+                vkFreeMemory(dev_, convert_memory_, nullptr);
+                convert_ = VK_NULL_HANDLE;
+                convert_memory_ = VK_NULL_HANDLE;
+                convert_size_ = 0;
+            }
+            VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            bi.size = bytes;
+            bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            if (!ok(vkCreateBuffer(dev_, &bi, nullptr, &convert_), "vkCreateBuffer")) return nullptr;
+            VkMemoryRequirements req;
+            vkGetBufferMemoryRequirements(dev_, convert_, &req);
+            VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            ai.allocationSize = req.size;
+            ai.memoryTypeIndex = memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if (ai.memoryTypeIndex == UINT32_MAX ||
+                !ok(vkAllocateMemory(dev_, &ai, nullptr, &convert_memory_), "vkAllocateMemory"))
+                return nullptr;
+            vkBindBufferMemory(dev_, convert_, convert_memory_, 0);
+            convert_size_ = bytes;
+        }
+        end_rendering();
+        transition(img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+        copy.imageOffset = {0, int32_t(y), 0};
+        copy.imageExtent = {t.width, t.height, 1};
+        vkCmdCopyImageToBuffer(cmd(), img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, convert_, 1, &copy);
+        VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        mb.srcStageMask = mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        mb.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+        VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        dep.memoryBarrierCount = 1;
+        dep.pMemoryBarriers = &mb;
+        vkCmdPipelineBarrier2(cmd(), &dep);
+        transition(*part, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copy.imageOffset = {0, 0, 0};
+        vkCmdCopyBufferToImage(cmd(), convert_, part->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        transition(*part, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        part->src = addr;
+        part->src_size = 0;  // not compared with memory: follows the surface's writes
+        part->hash = img.writes + 1;
+        ++gpu_copies_;
+        return part.get();
+    }
+    return nullptr;
 }
 
 Image* Renderer::texture(GuestMemory& mem, const Texture& t, uint32_t dims) {
@@ -928,6 +1181,7 @@ Image* Renderer::texture(GuestMemory& mem, const Texture& t, uint32_t dims) {
             return part.get();
         }
     }
+    if (Image* conv = depth_as_color(t)) return conv;
     const uint32_t size = texture_source_size(t);
     if (!size || size > 64u << 20) return nullptr;
     flush(mem, ea, size);  // a surface drawn at another address or size, read as plain memory
@@ -1101,6 +1355,7 @@ void Renderer::draw(GuestMemory& mem, const State& s, const DrawCommand& d) {
         if (fpi.textures & (1u << t)) {
             const Texture tex = s.texture(t);
             fk.texture_dims[t] = tex.cubemap ? 6 : tex.dimension == 3 ? 3 : 2;
+            if (fk.texture_dims[t] == 2 && shadow_texture(tex)) fk.shadow |= 1u << t;
         }
     const uint64_t fs_key = fnv1a64(&fk, sizeof(fk), fpi.hash);
     if (failed_.count(fs_key)) return skip();
@@ -1123,6 +1378,12 @@ void Renderer::draw(GuestMemory& mem, const State& s, const DrawCommand& d) {
     for (uint32_t t = 0; t < kTextureUnits; ++t) {
         if (!(fpi.textures & (1u << t))) continue;
         const Texture tex = s.texture(t);
+        if ((fk.shadow >> t) & 1) {
+            Image* img = depth_texture(tex);
+            image_infos[t] = {sampler(tex), (img ? img : dummy_depth_.get())->view,
+                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            continue;
+        }
         Image* img = texture(mem, tex, fk.texture_dims[t]);
         if (!img) img = fk.texture_dims[t] == 6 ? dummy_cube_.get() : fk.texture_dims[t] == 3 ? dummy3d_.get()
                                                                                                 : dummy2d_.get();
@@ -1377,8 +1638,13 @@ void Renderer::draw(GuestMemory& mem, const State& s, const DrawCommand& d) {
     }
     vkUpdateDescriptorSets(dev_, nw, writes, 0, nullptr);
 
-    // Record.
+    // Record. Depth counts as drawn only when written: the menu samples its depth buffer
+    // (as A8R8G8B8) while it stays bound, and each read would otherwise read it back again.
     begin_rendering();
+    if (depth_ && ((k.depth_test && k.depth_write) || k.stencil[0])) {
+        depth_->gpu_dirty = true;
+        ++depth_->writes;
+    }
     VkCommandBuffer c = cmd();
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
     const VkViewport viewport{0, 0, float(target_w_), float(target_h_), 0.0f, 1.0f};

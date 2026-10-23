@@ -57,9 +57,9 @@ Id Builder::t_function(Id ret, const std::vector<Id>& params) {
     w.insert(w.end(), params.begin(), params.end());
     return type(OpTypeFunction, w);
 }
-Id Builder::t_sampled_image(Dim dim) {
-    // OpTypeImage: sampled type, dim, depth 0, arrayed 0, MS 0, sampled 1, format Unknown.
-    const Id image = type(OpTypeImage, {t_float(), dim, 0, 0, 0, 1, 0});
+Id Builder::t_sampled_image(Dim dim, bool depth) {
+    // OpTypeImage: sampled type, dim, depth, arrayed 0, MS 0, sampled 1, format Unknown.
+    const Id image = type(OpTypeImage, {t_float(), dim, depth ? 1u : 0u, 0, 0, 1, 0});
     return type(OpTypeSampledImage, {image});
 }
 

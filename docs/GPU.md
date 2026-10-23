@@ -6,11 +6,11 @@ O RSX é a GPU do PS3. O jogo não fala com ela diretamente. Ele monta *command 
 |---|---|
 | 5a. `cellGcm` mínimo e "RSX nulo": o FIFO é consumido sem desenhar, para o jogo seguir | **Concluída** (2026-10-22) |
 | 5b. Rastreador de estado do RSX (registradores dos métodos NV4097) e módulo `runtime/rsx` | **Concluída** (2026-10-22) |
-| 5c. *Vertex fetch*, texturas e *render targets* em Vulkan | **Concluída para o menu** (2026-10-22): superfícies coerentes com a memória, cópias 2D na GPU, *mipmaps*, *culling* |
+| 5c. *Vertex fetch*, texturas e *render targets* em Vulkan | **Concluída para o menu** (2026-10-22): superfícies coerentes com a memória, cópias 2D na GPU, *mipmaps*, *culling*, profundidade lida como textura e *shadow maps* |
 | 5d. Tradutor de *shaders* VP/FP → SPIR-V | **Concluída para os 541 programas do jogo** (2026-10-22): desvios de VP; nenhum FP usa desvios ou laços |
-| 5e. *Flip* para a *swapchain* e comparação com o RPCS3 | Janela e PNG funcionam; falta a comparação quadro a quadro com o RPCS3 |
+| 5e. *Flip* para a *swapchain* e comparação com o RPCS3 | **Concluída** (2026-10-22): título e menu iguais aos do RPCS3, depois de três correções; TTY igual |
 
-**Saída da fase:** a splash da Sanzaru, a tela de título e o menu principal aparecem corretos (conferidos pelos PNGs). Falta só a comparação com o RPCS3 para fechar a 5e.
+**Saída da fase (alcançada):** a splash da Sanzaru, a tela de título e o menu principal aparecem corretos, conferidos lado a lado com o RPCS3 (ver "Comparação com o RPCS3").
 
 ## 5a. cellGcm mínimo e RSX nulo
 
@@ -140,8 +140,30 @@ O código SPU novo do vídeo e do menu foi gravado na cache SPU e compilado ([SP
 ### O que falta
 
 - **Desempenho:** o menu roda a ~41–47 quadros/s (ver abaixo), acima dos 30 que o jogo mira.
-- A comparação quadro a quadro com o RPCS3 (5e).
 - MRT, desvios e laços em *fragment programs*, e superfícies de 16 bits e de ponto flutuante na coerência com a memória: nada disso aparece até o menu.
+
+## Comparação com o RPCS3 (5e)
+
+O RPCS3 local (v0.0.43, com o firmware do disco) roda o jogo numa janela. O `tools/rpcs3_capture.ps1` aperta as teclas nos segundos pedidos e tira capturas com o F12. Cada tecla fica apertada por 150 ms, porque o RPCS3 lê o teclado uma vez por milissegundo e não via o aperto instantâneo do `SendKeys`. O jogador 1 usa o teclado (`config\input_configs\global\Default.yml`: Enter = Start, X = Cross). Os mesmos pontos saem do sly4 com `--dump-frames`, e `work/comparacao_5e.png` põe os dois lado a lado.
+
+**Uma diferença esperada.** No RPCS3, o jogo pede o idioma antes do título. O `cellSaveDataAutoLoad2` real chama as funções do jogo, e ele vê que não há save (primeira partida). No sly4, as funções de save ainda são *stubs* que não chamam ninguém, e o jogo pula essa tela. Os saves estão na Fase 8.
+
+**O que a comparação achou.** Interface, logo e textos eram iguais nos dois. O fundo não: no sly4, o túnel do tempo saía escuro, borrado e coberto de feixes radiais de luz. A captura do quadro do menu mostrou as passadas:
+1. a cena (túnel, van) no alvo principal, com profundidade Z24S8 em `0x00010000`;
+2. dois *shadow maps* Z16 de 1024×1024, empilhados numa superfície de 1024×2048 em `0x020A0000`;
+3. o resto da cena e o pós-processamento (reduções a 640×360 e 320×180, raios de luz, composição). Eles leem a profundidade principal como **A8R8G8B8** e os *shadow maps* como **DEPTH16** com comparação (`zfunc` em `TEXTURE_ADDRESS`) e como **G8B8**.
+
+Três correções:
+
+| Problema | Correção |
+|---|---|
+| Profundidade lida como textura vinha da memória, onde nunca era escrita: o efeito de luz calculava com lixo | A profundidade vira cor **na GPU**: o plano de profundidade vai para um *buffer* e dele para uma imagem RGBA8 (D24S8) ou RG8 (D16). O *swizzle* da *view* põe cada byte onde a decodificação da memória do PS3 poria (palavras *big-endian*, profundidade nos 24 bits altos). O *remap* do `control1` vem por cima. O *stencil* (B do A8R8G8B8) lê 0 |
+| `DEPTH16` com comparação não era decodificado (textura vazia) | *Shadow maps* amostrados direto da superfície D16, ou de uma cópia do pedaço em que a textura começa. *Sampler* com comparação, com a função invertida como no RPCS3 (`get_compare_func(op, true)`). No *shader*, imagem de profundidade com `OpImageSampleDrefImplicitLod` (e a versão projetiva no `TXP`): o `z` é a referência |
+| *Sampler* ignorava o LOD mínimo/máximo (`CONTROL0`) e o *bias* (`FILTER`) | Lidos como o RPCS3 os lê. A maioria das texturas do menu tem LOD máximo 0 |
+
+Além disso, uma superfície de profundidade passa a ser escrita na memória do convidado quando alguém lê aquela memória: `flush` em *big-endian*, D24S8 com o *stencil* no byte baixo, ou D16. O *buffer* dessa leitura de volta agora usa memória com *cache* do host. Sem *cache*, cada byte lido pela CPU atravessava o barramento, e uma profundidade de 1280×720 levava ~0,2 s. Com a conversão na GPU, o menu voltou a ~41–47 quadros/s, com 1 leitura de volta em 100 s (eram ~3 por quadro na primeira versão, que passava pela CPU: ~24 quadros/s).
+
+**TTY.** Até o menu, 172 das 178 linhas do RPCS3 são iguais e na mesma ordem. O que muda são os números de "Shader patch buffer: N k free", que dependem de quantos *shaders* o jogo remenda por quadro, e uma linha que o jogo imprime em dois pedaços.
 
 ## Desempenho do menu: de ~2 para ~41–47 quadros/s
 

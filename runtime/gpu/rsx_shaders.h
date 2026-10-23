@@ -55,6 +55,7 @@ struct FragmentProgramKey {
     uint32_t shader_control = 0;  // SET_SHADER_CONTROL (32-bit exports, depth replace)
     uint32_t texture_dims[16] = {};
     uint32_t alpha_func = 0;      // 0 = no alpha test, else the GL compare function
+    uint32_t shadow = 0;          // units holding depth textures sampled with a comparison
 };
 ShaderResult translate_fragment_program(const uint8_t* code, const FragmentProgramInfo& info,
                                         const FragmentProgramKey& key);

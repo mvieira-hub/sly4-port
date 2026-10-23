@@ -91,6 +91,35 @@ TEST(rsx_fragment_program_with_constant) {
     CHECK_EQ(r.spirv[0], 0x07230203u);
 }
 
+// A shadow map (FragmentProgramKey::shadow): TEX and TXP become comparisons with a depth
+// image (OpImageSampleDrefImplicitLod, OpImageSampleProjDrefImplicitLod).
+TEST(rsx_fragment_program_shadow_map) {
+    for (const uint32_t op : {0x17u, 0x18u}) {  // TEX, TXP
+        // TEX R0, f[TEX0], texture 1; END.
+        uint8_t code[16] = {};
+        const uint32_t dst = 1 | (0xF << 9) | (4u << 13) | (1u << 17) | (op << 24);
+        const uint32_t src0 = 1 | (0 << 9) | (1 << 11) | (2 << 13) | (3 << 15) | (7u << 18);  // input, xyzw, always
+        put_fp_word(code, dst);
+        put_fp_word(code + 4, src0);
+        const FragmentProgramInfo info = scan_fragment_program(code, sizeof(code));
+        CHECK_EQ(info.textures, 2u);
+        FragmentProgramKey key;
+        key.shader_control = 0x40;
+        key.texture_dims[1] = 2;
+        key.shadow = 2;
+        const ShaderResult r = translate_fragment_program(code, info, key);
+        CHECK(r.ok);
+        bool dref = false;
+        for (size_t i = 5; i < r.spirv.size();) {
+            const uint32_t o = r.spirv[i] & 0xFFFF, n = r.spirv[i] >> 16;
+            dref |= o == (op == 0x17 ? 89u : 93u);
+            if (!n) break;
+            i += n;
+        }
+        CHECK(dref);
+    }
+}
+
 TEST(rsx_texture_decode) {
     // 2x2 A8R8G8B8, linear, identity remap: bytes A R G B -> R G B A.
     const uint8_t argb[16] = {0xFF, 0x10, 0x20, 0x30, 0x80, 0x40, 0x50, 0x60,

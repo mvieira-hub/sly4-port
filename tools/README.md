@@ -238,3 +238,11 @@ O `.gltf` também abre no Blender (File → Import → glTF 2.0).
 ```powershell
 .\tools\run.ps1 tests/test_eboot_scan.py
 ```
+
+## Comparação com o RPCS3
+
+`rpcs3_capture.ps1` roda o jogo no RPCS3 local (janela, sem a interface) e aperta teclas nos segundos pedidos. O F12 tira uma captura, salva em `screenshots\BCES01284` dentro da pasta do RPCS3. Enter, X, C e as setas chegam ao controle do jogo quando o jogador 1 usa o teclado. Roda no Windows, fora do contêiner:
+
+```
+.\tools\rpcs3_capture.ps1 -Keys "X@32,F12@38,F12@46,RETURN@58,F12@62" -Seconds 85
+```

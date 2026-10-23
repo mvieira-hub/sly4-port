@@ -418,12 +418,13 @@ Plano da fase:
 - Catálogo de quem usa o quê: EDGE (geometria e zlib), Havok, SCREAM e mp3, Bink.
 - **Saída:** os jobs `edgezlib` descomprimem o conteúdo de uma fase com resultado idêntico ao do `psarc.py`/`san2gltf.py`, e as threads de áudio e física rodam sem travar.
 
-### Fase 5: RSX → Vulkan (8–14 semanas) — **saída alcançada; falta a comparação com o RPCS3**
+### Fase 5: RSX → Vulkan (8–14 semanas) — **concluída** (2026-10-22)
 
 Andamento em [GPU.md](GPU.md):
 - **5a, `cellGcm` mínimo e RSX nulo (concluída):** memória local, mapa de IO, buffer de comandos em fragmentos com o *callback* de contexto, *labels*, *reports* e VBlank; uma thread consome o FIFO (saltos, chamadas, semáforos, *reports*, *flip*) sem desenhar. O jogo passa do `cellGcmInit` e vira quadros na tela de carregamento.
 - **5b, rastreador de estado (concluída):** o RSX virou o módulo `runtime/rsx`: banco de registradores, memória do *vertex program* e das constantes, cópias 2D na CPU e captura de quadros com os nomes dos métodos.
-- **5c–5e, renderizador Vulkan (menu alcançado, 2026-10-22):** superfícies como imagens Vulkan coerentes com a memória (leitura de volta antes das cópias 2D da CPU, reenvio do que a CPU escreveu, cópias NV3089 na GPU), *vertex* e *fragment programs* traduzidos direto para SPIR-V (os 541 do jogo traduzem, com desvios de VP), *mipmaps*, *culling* e *flip* para a janela ou para PNG. O jogo mostra, corretos, a tela de carregamento, a splash da Sanzaru, a tela de título e o menu principal (com `--press start@40,start@42`). O menu roda a ~41–47 quadros/s (era ~2; ver GPU.md, "Desempenho do menu"). Falta a comparação com o RPCS3.
+- **5c–5e, renderizador Vulkan (menu alcançado, 2026-10-22):** superfícies como imagens Vulkan coerentes com a memória (leitura de volta antes das cópias 2D da CPU, reenvio do que a CPU escreveu, cópias NV3089 na GPU), *vertex* e *fragment programs* traduzidos direto para SPIR-V (os 541 do jogo traduzem, com desvios de VP), *mipmaps*, *culling* e *flip* para a janela ou para PNG. O jogo mostra, corretos, a tela de carregamento, a splash da Sanzaru, a tela de título e o menu principal (com `--press start@40,start@42`). O menu roda a ~41–47 quadros/s (era ~2; ver GPU.md, "Desempenho do menu").
+- **5e, comparação com o RPCS3 (concluída):** título e menu capturados nos dois (`tools/rpcs3_capture.ps1`). A comparação achou o túnel do tempo escuro e borrado no sly4. As causas eram a profundidade lida como textura (A8R8G8B8, G8B8), os *shadow maps* com comparação (`DEPTH16`) e o LOD do *sampler*. Depois das correções, as imagens batem com as do RPCS3, e o TTY também (172 de 178 linhas iguais; o resto depende do tempo de cada quadro). Ver GPU.md, "Comparação com o RPCS3".
 
 Plano da fase:
 - `cellGcm` em HLE e consumidor do FIFO com rastreador de estado.
