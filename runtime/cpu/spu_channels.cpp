@@ -58,6 +58,19 @@ void dma_copy(uint8_t* dst, const uint8_t* src, uint32_t size) {
     }
 }
 
+// Each 128-byte line of a transfer is moved under that line's lock, the one getllar,
+// putllc and the PPU's store-conditional take: as on the Cell (and in RPCS3), a DMA never
+// sees a line half way through an atomic update, nor tears one, so SPURS reading its
+// structures with plain gets finds them whole.
+void copy_lines(uint8_t* dst, const uint8_t* src, GuestAddr ea, uint32_t size) {
+    for (uint32_t done = 0; done < size;) {
+        const uint32_t n = std::min(size - done, 128 - ((ea + done) & 127));
+        std::lock_guard<std::mutex> g(guest_line_lock(ea + done));
+        dma_copy(dst + done, src + done, n);
+        done += n;
+    }
+}
+
 void transfer(SPUContext& c, bool put, uint32_t lsa, uint32_t ea, uint32_t size) {
     lsa &= kSpuLsMask;
     if (lsa + size > kSpuLsSize) size = kSpuLsSize - lsa;  // never past the local store
@@ -72,30 +85,38 @@ void transfer(SPUContext& c, bool put, uint32_t lsa, uint32_t ea, uint32_t size)
         uint8_t before[kMaxDebugLines][128];
         for (int i = 0; i < n; ++i) std::memcpy(before[i], c.mem->host(lines[i]), 128);
         std::memcpy(main, c.ls + lsa, size);
+        guest_range_stored(ea, size);
         char who[96];
         spu_who(c, "put (DMA)", who);
         for (int i = 0; i < n; ++i) debug_line_log(*c.mem, lines[i], before[i], who, c.pc);
         return;
     }
     if (put) {
-        dma_copy(main, c.ls + lsa, size);
+        copy_lines(main, c.ls + lsa, ea, size);
+        guest_range_stored(ea, size);
     } else {
-        dma_copy(c.ls + lsa, main, size);
+        copy_lines(c.ls + lsa, main, ea, size);
         c.ls_written(lsa, size);
     }
 }
 
 // Runs a DMA list from where it is. The list (8-byte elements: stall-and-notify flag in
-// bit 31 + size, then the low EA word) is in local store; each element's data follows
-// the previous one, 16-byte aligned. An element with the flag stops the list after its
-// transfer and raises the list stall event until the SPU acknowledges it.
+// bit 31 + size, then the low EA word) is in local store. Each element's data goes to the
+// next 16-byte slot after the previous one, at the same offset within it as its EA has
+// (the MFC keeps the low 4 bits of both equal, as RPCS3's do_list_transfer does): the
+// game's antialiasing on the SPUs gathers a few pixels around each edge this way, and at
+// the slot's start they came in up to 3 pixels off (bright dots at characters' edges). An
+// element with the flag stops the list after its transfer and raises the list stall event
+// until the SPU acknowledges it.
 void run_list(SPUContext& c, uint32_t tag) {
     SPUContext::StalledList& l = c.stalled[tag];
     while (l.active && l.left >= 8) {
         const uint32_t e0 = c.ls_u32(l.list), e1 = c.ls_u32(l.list + 4);
         const uint32_t n = e0 & 0x7FFF;
-        if (n) transfer(c, l.put, l.lsa, e1, n);
-        l.lsa = (l.lsa + n + 15) & ~15u;
+        if (n) {
+            transfer(c, l.put, (l.lsa & ~15u) | (e1 & 15u), e1, n);
+            l.lsa = (l.lsa & ~15u) + ((n + 15) & ~15u);
+        }
         l.list = (l.list + 8) & kSpuLsMask;
         l.left -= 8;
         if (e0 & 0x80000000u) {
@@ -143,7 +164,11 @@ SpuChannelResult spu_mfc_command(SPUContext& c, uint32_t cmd) {
             {
                 std::lock_guard<std::mutex> g(guest_line_lock(line));
                 uint8_t* p = c.mem->host(line);
-                if (c.reserved && c.reserve_ea == line && std::memcmp(p, c.reserve_data, 128) == 0) {
+                // Fails as on the Cell when anyone wrote the line since the getllar, even
+                // putting back the same bytes (a lock taken and released: the "ABA" a data
+                // compare alone lets through), or stored over it by DMA.
+                if (c.reserved && c.reserve_ea == line && !__atomic_load_n(&c.llr_lost, __ATOMIC_ACQUIRE) &&
+                    std::memcmp(p, c.reserve_data, 128) == 0) {
                     const bool dbg = debug_line_hit(line, 128) != 0;
                     uint8_t before[128];
                     if (dbg) std::memcpy(before, p, 128);

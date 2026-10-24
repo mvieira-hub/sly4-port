@@ -16,7 +16,7 @@ namespace sly4 {
 
 struct VulkanOptions {
     bool validation = false;  // enable VK_LAYER_KHRONOS_validation if it is installed
-    bool vsync = true;        // FIFO present mode; off = MAILBOX/IMMEDIATE when available
+    bool vsync = true;        // MAILBOX present mode (FIFO without it); off = IMMEDIATE when available
 };
 
 class VulkanContext {
@@ -58,7 +58,7 @@ private:
     struct Frame {
         VkCommandPool pool = VK_NULL_HANDLE;
         VkCommandBuffer cmd = VK_NULL_HANDLE;
-        VkSemaphore image_available = VK_NULL_HANDLE;
+        VkFence acquired = VK_NULL_HANDLE;  // the swapchain image is free (waited for on the CPU)
         VkFence in_flight = VK_NULL_HANDLE;
     };
 

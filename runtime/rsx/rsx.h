@@ -53,5 +53,7 @@ void set_capture(uint32_t frame, const std::string& path, uint32_t count = 1);
 bool capturing();
 void capture_note(const std::string& line);
 void summary();
+// Frames the game has shown so far (flips), for the frame rate in the window title.
+uint64_t flip_count();
 
 }  // namespace sly4::rsx

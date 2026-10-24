@@ -6,10 +6,11 @@
 // c.pc and returns Branch; everything else returns Ok and the caller advances the PC.
 // Channels (rdch/wrch/rchcnt) go through spu_channels.h.
 //
-// Single-precision float follows the SPU: denormal inputs and results are zero, and
-// there are no infinities or NaNs (exponent 255 is one more binade, overflow saturates;
-// see spu_sem_float.inl). Rounding is the host's (to nearest, not the SPU's truncation),
-// and frest/frsqest return the exact value, which fi passes through. Double precision is
+// Single-precision float follows the SPU where RPCS3 does by default: denormal inputs and
+// results are zero, comparisons read exponent 255 as a number (no NaNs on the SPU) and zero
+// times anything is zero; the rest is the host's IEEE, rounding to nearest (see
+// spu_sem_float.inl). frest/frsqest give the SPU's piecewise-linear estimate, in the form fi
+// completes (a little below the exact value, even for powers of two). Double precision is
 // IEEE, as on the SPU. SPU code runs inside a SpuFloatMode (spu_run, spu_run_blocks): the
 // host's own DAZ/FTZ do the denormals.
 //
@@ -84,7 +85,8 @@ SLY4_SPU_INLINE u128 rotl128(u128 x, u32 n) { return n ? (x << n) | (x >> (128 -
 // Denormals are zero on the SPU (single precision): MXCSR's DAZ (denormal operands are
 // zero) and FTZ (denormal results are zero) do that on the host. Around all SPU code;
 // before, filtering every operand and result in software made fm/fma ~25 host
-// instructions each.
+// instructions each. The SPU's single precision rounds toward zero; like RPCS3, this
+// rounds to nearest.
 class SpuFloatMode {
 public:
     static constexpr unsigned kDazFtz = 0x8040;
@@ -116,8 +118,7 @@ private:
     unsigned saved_;
 };
 
-// Denormals as zero in software, for values that do not go through a float operation
-// (the conversions to and from double).
+// Denormals as zero in software, for values that do not go through a float operation.
 SLY4_SPU_INLINE float ftz(float f) {
     // On the bits, without branches, so the 4-lane loops of the float instructions can be
     // vectorized: exponent 0 (denormal or zero) keeps only the sign, NaN becomes the default.

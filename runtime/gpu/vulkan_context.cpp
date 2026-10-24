@@ -275,13 +275,15 @@ bool VulkanContext::create_swapchain() {
     vkGetPhysicalDeviceSurfacePresentModesKHR(physical_, surface_, &n, nullptr);
     std::vector<VkPresentModeKHR> modes(n);
     vkGetPhysicalDeviceSurfacePresentModesKHR(physical_, surface_, &n, modes.data());
-    present_mode_ = VK_PRESENT_MODE_FIFO_KHR;  // always available
-    if (!options_.vsync) {
-        for (VkPresentModeKHR want : {VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR}) {
-            if (std::find(modes.begin(), modes.end(), want) != modes.end()) {
-                present_mode_ = want;
-                break;
-            }
+    // MAILBOX: no tearing, and a present never waits for the display (with FIFO on a 144 Hz
+    // monitor it did, holding the queue the renderer shares). FIFO is always there.
+    present_mode_ = VK_PRESENT_MODE_FIFO_KHR;
+    const VkPresentModeKHR wanted[2] = {options_.vsync ? VK_PRESENT_MODE_MAILBOX_KHR : VK_PRESENT_MODE_IMMEDIATE_KHR,
+                                        VK_PRESENT_MODE_MAILBOX_KHR};
+    for (VkPresentModeKHR want : wanted) {
+        if (std::find(modes.begin(), modes.end(), want) != modes.end()) {
+            present_mode_ = want;
+            break;
         }
     }
 
@@ -360,8 +362,8 @@ bool VulkanContext::create_frames() {
         ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         ai.commandBufferCount = 1;
         if (!check(vkAllocateCommandBuffers(device_, &ai, &f.cmd), "vkAllocateCommandBuffers")) return false;
-        VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-        if (!check(vkCreateSemaphore(device_, &si, nullptr, &f.image_available), "vkCreateSemaphore")) return false;
+        VkFenceCreateInfo ai_fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        if (!check(vkCreateFence(device_, &ai_fence, nullptr, &f.acquired), "vkCreateFence")) return false;
         VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
         if (!check(vkCreateFence(device_, &fi, nullptr, &f.in_flight), "vkCreateFence")) return false;
@@ -382,14 +384,19 @@ bool VulkanContext::draw_frame(const std::array<float, 4>& rgba, const Source& s
     Frame& f = frames_[frame_index_];
     if (!check(vkWaitForFences(device_, 1, &f.in_flight, VK_TRUE, UINT64_MAX), "vkWaitForFences")) return false;
 
+    // The image is waited for here, on the CPU, not by a semaphore in the submit: the queue is
+    // shared with the renderer, and a submit waiting for the display held the game's work
+    // behind it (up to a refresh per present).
     uint32_t image = 0;
-    VkResult r = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, f.image_available, VK_NULL_HANDLE, &image);
+    VkResult r = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, VK_NULL_HANDLE, f.acquired, &image);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         resize_pending_ = true;
         return true;
     }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) return check(r, "vkAcquireNextImageKHR");
     if (r == VK_SUBOPTIMAL_KHR) resize_pending_ = true;
+    if (!check(vkWaitForFences(device_, 1, &f.acquired, VK_TRUE, UINT64_MAX), "vkWaitForFences")) return false;
+    vkResetFences(device_, 1, &f.acquired);
 
     vkResetFences(device_, 1, &f.in_flight);
     vkResetCommandBuffer(f.cmd, 0);
@@ -451,17 +458,12 @@ bool VulkanContext::draw_frame(const std::array<float, 4>& rgba, const Source& s
     vkCmdPipelineBarrier2(f.cmd, &dep);
     vkEndCommandBuffer(f.cmd);
 
-    VkSemaphoreSubmitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
-    wait.semaphore = f.image_available;
-    wait.stageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
     VkSemaphoreSubmitInfo signal{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
     signal.semaphore = render_finished_[image];
     signal.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     VkCommandBufferSubmitInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
     cbi.commandBuffer = f.cmd;
     VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
-    si.waitSemaphoreInfoCount = 1;
-    si.pWaitSemaphoreInfos = &wait;
     si.commandBufferInfoCount = 1;
     si.pCommandBufferInfos = &cbi;
     si.signalSemaphoreInfoCount = 1;
@@ -492,7 +494,7 @@ void VulkanContext::shutdown() {
         vkDeviceWaitIdle(device_);
         for (Frame& f : frames_) {
             if (f.in_flight) vkDestroyFence(device_, f.in_flight, nullptr);
-            if (f.image_available) vkDestroySemaphore(device_, f.image_available, nullptr);
+            if (f.acquired) vkDestroyFence(device_, f.acquired, nullptr);
             if (f.pool) vkDestroyCommandPool(device_, f.pool, nullptr);
             f = Frame{};
         }

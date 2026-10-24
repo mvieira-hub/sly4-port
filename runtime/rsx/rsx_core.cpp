@@ -14,6 +14,7 @@
 
 #include "core/host_sleep.h"
 #include "core/log.h"
+#include "core/png.h"
 #include "kernel/kernel.h"
 #include "rsx/rsx_backend.h"
 #include "rsx/rsx_state.h"
@@ -371,6 +372,25 @@ void Processor::image_from_cpu(uint32_t index, uint32_t arg) {
     if (g_backend) g_backend->invalidate(a, 4);
 }
 
+// --rsx-capture: a full-frame copy into or out of main memory (the game's frame on its way
+// to the SPUs' post-processing and back) is also written as PNG, as memory holds it.
+void capture_image(const char* what, GuestMemory& m, GuestAddr ea, uint32_t pitch, uint32_t w, uint32_t h) {
+    if (!g_capture || w < 640 || (ea >= kLocalBase && ea < kLocalBase + kLocalSize)) return;
+    static uint32_t n = 0;
+    std::vector<uint8_t> rgba(size_t(w) * h * 4);
+    for (uint32_t y = 0; y < h; ++y)
+        for (uint32_t x = 0; x < w; ++x) {
+            const uint8_t* p = m.host(ea + y * pitch + x * 4);  // A8R8G8B8, big-endian
+            uint8_t* q = &rgba[(size_t(y) * w + x) * 4];
+            q[0] = p[1], q[1] = p[2], q[2] = p[3], q[3] = p[0];  // alpha kept: the SPUs read it too
+        }
+    char path[96];
+    std::snprintf(path, sizeof(path), ".%u.%s_%08X.png", n++, what, ea);
+    const std::string file = capture_file(g_capture_open) + path;
+    write_png(file, rgba.data(), w, h);
+    std::fprintf(g_capture, "  # imagem %s 0x%08X %ux%u em %s\n", what, ea, w, h, file.c_str());
+}
+
 // NV3089: scaled copy from the source image into the NV3062 surface, nearest sampling,
 // same pixel size on both sides.
 void Processor::scaled_blit() {
@@ -408,7 +428,11 @@ void Processor::scaled_blit() {
         c.dst_w = out_w;
         c.dst_h = out_h;
         c.linear = ((in_fmt >> 24) & 0xFF) == 1;  // interpolator: 0 zero-order hold, 1 first-order
-        if (c.src_w && c.src_h && g_backend->scaled_copy(m_, c)) return;
+        capture_image("origem", m_, src, src_pitch, in_w, in_h);
+        if (c.src_w && c.src_h && g_backend->scaled_copy(m_, c)) {
+            capture_image("destino", m_, dst + out_y * dst_pitch, dst_pitch, out_w, out_h);
+            return;
+        }
     }
     if (g_backend) {
         g_backend->flush(m_, src, in_h * src_pitch);
@@ -588,6 +612,8 @@ void set_capture(uint32_t frame, const std::string& path, uint32_t count) {
     g_capture_end = frame + std::max(count, 1u);
     g_capture_path = path;
 }
+
+uint64_t flip_count() { return g_count.flips.load(std::memory_order_relaxed); }
 
 void summary() {
     if (!g_control) return;

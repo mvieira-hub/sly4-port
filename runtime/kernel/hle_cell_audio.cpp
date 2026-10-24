@@ -6,7 +6,9 @@
 // mixed down to stereo, measured (peak level, for the summary), cleared and sent to the
 // default sound device through SDL (WASAPI on Windows), or to a WAV file (--dump-audio).
 // The device's own clock drifts from the timer: a block is dropped when more than 100 ms
-// are waiting, and an empty queue plays silence.
+// are waiting. The device takes the sound in periods of ~10 ms, so the queue keeps ~40 ms
+// ahead of it: silence is put first when it starts or runs dry (blocks sent as they came,
+// 5.3 ms apart with nothing queued, made the device fill its periods with silence: clicks).
 #include <SDL3/SDL.h>
 
 #include <atomic>
@@ -20,6 +22,7 @@
 #include <iterator>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 #include "core/host_sleep.h"
 #include "core/log.h"
@@ -46,6 +49,7 @@ struct Port {
     uint32_t channels = 0, blocks = 0;
     float level = 1.0f;
     uint64_t position = 0;  // blocks consumed
+    bool sounding = false;  // the last block consumed was not silent
 };
 
 struct Audio {
@@ -67,9 +71,14 @@ struct Output {
     FILE* wav = nullptr;
     uint64_t wav_frames = 0;
     std::atomic<uint64_t> dropped{0};
+    std::atomic<uint64_t> underruns{0};  // the device found the queue (nearly) empty
+    std::atomic<uint64_t> held{0};       // periods a late block was waited for
+    std::atomic<uint64_t> arrived{0}, gave_up{0};  // waits that ended with the block / without it
+    bool primed = false;
 };
 Output g_out;
 constexpr uint32_t kRate = 48000, kMaxQueued = kRate / 10 * 2 * 4;  // 100 ms of stereo float
+constexpr uint32_t kCushion = kRate / 25 * 2 * 4;                   // 40 ms
 
 // WAV, 16-bit stereo: the sizes are written when the run ends (audio_summary).
 void wav_header(FILE* f, uint64_t frames) {
@@ -123,7 +132,26 @@ void mix_port(GuestMemory& m, GuestAddr a, uint32_t channels, float level, float
     }
 }
 
-// Every 5.33 ms: each running port gives up its current block.
+// The game's mixer is a SPURS task sharing five SPUs with the game's jobs, which run slower
+// here than on the PS3: during heavy frames it filled the next block too late, the block
+// was played empty and the sound broke up (a quarter of the blocks in Paris). A port that
+// was sounding and whose next block is still all zeros is held, its read index unchanged,
+// for up to kMaxHold periods: the device plays from the output's cushion meanwhile, and
+// the held blocks are caught up later (two a period while the game is ahead).
+constexpr uint32_t kMaxHold = 8;   // 43 ms: about the cushion
+constexpr uint32_t kMaxDebt = 32;  // held blocks still to catch up (beyond: the clock just slipped)
+
+bool block_has_sound(GuestMemory& m, GuestAddr a, uint32_t bytes) {
+    const uint8_t* p = m.host(a);
+    for (uint32_t i = 0; i < bytes; i += 4) {
+        uint32_t w;
+        std::memcpy(&w, p + i, 4);
+        if (w & 0x7FFFFFFFu) return true;
+    }
+    return false;
+}
+
+// Every 5.33 ms: each running port gives up its current block (or none, or two; see above).
 void audio_thread() {
     GuestMemory& m = kernel().mem();
     open_output();
@@ -131,38 +159,76 @@ void audio_thread() {
     const auto period = std::chrono::nanoseconds(1'000'000'000ull * kSamples / kRate);
     float mix[kSamples * 2];
     int16_t pcm[kSamples * 2];
+    uint32_t held = 0, debt = 0;
     while (!kernel().exited()) {
         next += period;
         host_sleep_until(next);
-        std::fill(std::begin(mix), std::end(mix), 0.0f);
+        uint32_t steps = 1;
         {
             std::lock_guard<std::mutex> lk(g.lock);
+            bool late = false, ready = true;
             for (uint32_t n = 0; n < kPorts; ++n) {
-                Port& p = g.ports[n];
+                const Port& p = g.ports[n];
                 if (p.status != kStatusRun || !p.blocks) continue;
-                const uint32_t block = uint32_t(p.position % p.blocks);
                 const uint32_t bytes = p.channels * kSamples * 4;
-                const GuestAddr a = port_buffer(n) + block * bytes;
-                float peak = 0;
-                mix_port(m, a, p.channels, p.level, mix, peak);
-                if (peak > std::bit_cast<float>(g.peak_bits.load())) g.peak_bits = std::bit_cast<uint32_t>(peak);
-                std::memset(m.host(a), 0, bytes);
-                ++p.position;
-                m.write<uint64_t>(g.indexes + 8 * n, p.position % p.blocks);
-                g.blocks.fetch_add(1, std::memory_order_relaxed);
+                const bool sound = block_has_sound(m, port_buffer(n) + uint32_t(p.position % p.blocks) * bytes, bytes);
+                late |= p.sounding && !sound;
+                ready &= sound || !p.sounding;
             }
-            for (float& s : mix) s = std::clamp(s, -1.0f, 1.0f);
-            if (g_out.wav) {
-                for (uint32_t i = 0; i < kSamples * 2; ++i) pcm[i] = int16_t(std::lrint(mix[i] * 32767.0f));
-                std::fwrite(pcm, sizeof(pcm), 1, g_out.wav);
-                g_out.wav_frames += kSamples;
+            if (late && held < kMaxHold) {
+                steps = 0;
+                ++held;
+                debt = std::min(debt + 1, kMaxDebt);
+                g_out.held.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                if (held) (late ? g_out.gave_up : g_out.arrived).fetch_add(1, std::memory_order_relaxed);
+                held = 0;
+                if (debt && ready) {
+                    steps = 2;
+                    --debt;
+                }
             }
         }
-        if (g_out.stream) {
-            if (SDL_GetAudioStreamQueued(g_out.stream) > int(kMaxQueued))
-                g_out.dropped.fetch_add(1, std::memory_order_relaxed);
-            else
-                SDL_PutAudioStreamData(g_out.stream, mix, sizeof(mix));
+        for (uint32_t s = 0; s < steps; ++s) {
+            std::fill(std::begin(mix), std::end(mix), 0.0f);
+            {
+                std::lock_guard<std::mutex> lk(g.lock);
+                for (uint32_t n = 0; n < kPorts; ++n) {
+                    Port& p = g.ports[n];
+                    if (p.status != kStatusRun || !p.blocks) continue;
+                    const uint32_t block = uint32_t(p.position % p.blocks);
+                    const uint32_t bytes = p.channels * kSamples * 4;
+                    const GuestAddr a = port_buffer(n) + block * bytes;
+                    float peak = 0;
+                    p.sounding = block_has_sound(m, a, bytes);
+                    mix_port(m, a, p.channels, p.level, mix, peak);
+                    if (peak > std::bit_cast<float>(g.peak_bits.load())) g.peak_bits = std::bit_cast<uint32_t>(peak);
+                    std::memset(m.host(a), 0, bytes);
+                    ++p.position;
+                    m.write<uint64_t>(g.indexes + 8 * n, p.position % p.blocks);
+                    g.blocks.fetch_add(1, std::memory_order_relaxed);
+                }
+                for (float& v : mix) v = std::clamp(v, -1.0f, 1.0f);
+                if (g_out.wav) {
+                    for (uint32_t i = 0; i < kSamples * 2; ++i) pcm[i] = int16_t(std::lrint(mix[i] * 32767.0f));
+                    std::fwrite(pcm, sizeof(pcm), 1, g_out.wav);
+                    g_out.wav_frames += kSamples;
+                }
+            }
+            if (g_out.stream) {
+                const int queued = SDL_GetAudioStreamQueued(g_out.stream);
+                if (queued > int(kMaxQueued)) {
+                    g_out.dropped.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    if (queued < int(sizeof(mix))) {  // starting, or ran dry: the cushion again
+                        if (g_out.primed) g_out.underruns.fetch_add(1, std::memory_order_relaxed);
+                        static const std::vector<float> silence(kCushion / 4, 0.0f);
+                        SDL_PutAudioStreamData(g_out.stream, silence.data(), int(kCushion));
+                        g_out.primed = true;
+                    }
+                    SDL_PutAudioStreamData(g_out.stream, mix, sizeof(mix));
+                }
+            }
         }
     }
 }
@@ -325,8 +391,12 @@ void audio_configure(const AudioOptions& o) { g_out.options = o; }
 void audio_summary() {
     if (!g.buffers) return;
     SLY4_INFO("cellAudio: %" PRIu64 " blocos de 256 amostras consumidos, pico %.3f, %" PRIu64
-              " blocos descartados (fila cheia)",
-              g.blocks.load(), double(std::bit_cast<float>(g.peak_bits.load())), g_out.dropped.load());
+              " blocos descartados (fila cheia), %" PRIu64 " vezes em que a fila secou, %" PRIu64
+              " esperas por blocos atrasados do jogo",
+              g.blocks.load(), double(std::bit_cast<float>(g.peak_bits.load())), g_out.dropped.load(),
+              g_out.underruns.load(), g_out.held.load());
+    SLY4_INFO("cellAudio: esperas que terminaram com o bloco: %" PRIu64 ", sem ele: %" PRIu64, g_out.arrived.load(),
+              g_out.gave_up.load());
     std::lock_guard<std::mutex> lk(g.lock);
     if (g_out.wav) {
         wav_header(g_out.wav, g_out.wav_frames);

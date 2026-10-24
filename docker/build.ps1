@@ -2,10 +2,13 @@
 #   .\docker\build.ps1                 # Release -> build\mingw-release\sly4.exe
 #   .\docker\build.ps1 -Config Debug   # Debug   -> build\mingw-debug\sly4.exe
 #   .\docker\build.ps1 -Clean          # wipes the build folder first
+#   .\docker\build.ps1 -Jobs 6         # at most 6 compilers at once (the generated SPU files
+#                                      # take ~2 GB each: too many at once run out of memory)
 # The toolchain image (sly4-mingw:1) is built on first use and cached by Docker.
 param(
     [ValidateSet('Release', 'Debug', 'RelWithDebInfo')][string]$Config = 'Release',
-    [switch]$Clean
+    [switch]$Clean,
+    [int]$Jobs = 0
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
@@ -20,6 +23,6 @@ if ($Clean -and (Test-Path "$root\$dir")) { Remove-Item -Recurse -Force "$root\$
 $ErrorActionPreference = 'Continue'
 docker run --rm -v "${root}:/src" -w /src $image sh -c (
     "cmake -S . -B $dir -G Ninja -DCMAKE_TOOLCHAIN_FILE=/opt/cmake/mingw-w64-x86_64.cmake " +
-    "-DCMAKE_BUILD_TYPE=$Config && cmake --build $dir")
+    "-DCMAKE_BUILD_TYPE=$Config && cmake --build $dir" + $(if ($Jobs -gt 0) { " -j $Jobs" } else { "" }))
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 "$root\$($dir -replace '/', '\')\sly4.exe"

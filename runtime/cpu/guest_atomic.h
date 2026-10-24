@@ -24,6 +24,11 @@ std::mutex& guest_line_lock(GuestAddr ea);
 using LineWriteHook = void (*)(GuestAddr line);
 void set_line_write_hook(LineWriteHook h);
 void guest_line_written(GuestAddr ea);
+// Called after a plain DMA store (SPU put) to [ea, ea + size): on the Cell it kills the
+// lock-line reservations on those lines too. Only marks them lost; nobody is woken.
+using RangeStoreHook = void (*)(GuestAddr ea, uint32_t size);
+void set_range_store_hook(RangeStoreHook h);
+void guest_range_stored(GuestAddr ea, uint32_t size);
 
 // PPU load-and-reserve: copies the 128-byte line holding `ea` to `line` (consistently,
 // under the line lock).

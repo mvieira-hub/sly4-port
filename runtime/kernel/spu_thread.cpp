@@ -41,6 +41,18 @@ void wake_spus(GuestAddr line) {
         }
 }
 
+// A plain DMA store over reserved lines: those reservations are lost too (the putllc that
+// follows fails, as on the Cell), without waking anyone (DMA stores are many; a waiter
+// finds the change by comparing the line).
+void reservations_stored(GuestAddr ea, uint32_t size) {
+    const GuestAddr first = ea & ~127u;
+    const size_t n = g_waiter_count.load();
+    for (size_t i = 0; i < n; ++i)
+        if (SpuThread* t = g_waiters[i].load())
+            if (t->ctx.reserved && t->ctx.reserve_ea >= first && t->ctx.reserve_ea < ea + size)
+                __atomic_store_n(&t->ctx.llr_lost, 1u, __ATOMIC_RELEASE);
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------- PPU -> SPU
@@ -369,6 +381,7 @@ void add_spu_thread(const std::shared_ptr<SpuThread>& t) {
         g_waiter_count = i + 1;
     }
     set_line_write_hook(wake_spus);
+    set_range_store_hook(reservations_stored);
 }
 
 std::vector<std::shared_ptr<SpuThread>> spu_threads() {

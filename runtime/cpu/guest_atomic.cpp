@@ -13,6 +13,7 @@ namespace {
 constexpr size_t kStripes = 256;
 std::mutex g_locks[kStripes];
 std::atomic<LineWriteHook> g_hook{nullptr};
+std::atomic<RangeStoreHook> g_range_hook{nullptr};
 DebugWhoHook g_debug_who = nullptr;  // --watch-line
 }  // namespace
 
@@ -22,6 +23,12 @@ void set_line_write_hook(LineWriteHook h) { g_hook = h; }
 
 void guest_line_written(GuestAddr ea) {
     if (LineWriteHook h = g_hook.load(std::memory_order_relaxed)) h(ea & ~127u);
+}
+
+void set_range_store_hook(RangeStoreHook h) { g_range_hook = h; }
+
+void guest_range_stored(GuestAddr ea, uint32_t size) {
+    if (RangeStoreHook h = g_range_hook.load(std::memory_order_relaxed)) h(ea, size);
 }
 
 void guest_load_reserve(GuestMemory& mem, GuestAddr ea, uint8_t* line) {

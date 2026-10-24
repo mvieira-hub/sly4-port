@@ -75,11 +75,13 @@ Os registradores usam o mesmo layout do VMX do PPU (bytes invertidos), então a 
 - `get`/`put` (e as variantes de barreira e *fence*) e as listas (`getl`/`putl`) terminam na hora, e a leitura do status de tag devolve a máscara inteira;
 - os atômicos de 128 bytes (`getllar`, `putllc`, `putlluc`) usam uma reserva com comparação dos 128 bytes, protegidos por um lock global.
 
-**Ponto flutuante simples:** o SPU não segue a IEEE: não tem denormais, infinitos nem NaN, e trunca. O expoente 255 é só mais uma faixa de números, e `0x7FFFFFFF` (~6,8·10³⁸) é o maior valor. As semânticas zeram denormais na entrada e na saída. Desde a Fase 7 (ver FASE7.md, 7b), seguem também o formato estendido:
-- as comparações são feitas nos bits (sinal e magnitude como inteiros);
-- a aritmética roda nos floats do host, e as pistas que saem infinitas ou NaN são refeitas em double, saturando em ±`0x7FFFFFFF`.
+**Ponto flutuante simples:** o SPU não segue a IEEE: não tem denormais, infinitos nem NaN, e trunca. O expoente 255 é só mais uma faixa de números, e `0x7FFFFFFF` (~6,8·10³⁸) é o maior valor. As semânticas seguem as regras do RPCS3 no modo padrão ("approximate xfloat"; ver FASE7.md, 7b):
+- denormais zerados na entrada e na saída;
+- comparações feitas nos bits (sinal e magnitude como inteiros), o que vale para o expoente 255;
+- zero vezes qualquer coisa é zero nas multiplicações;
+- o resto é a IEEE do host, com todo NaN feito o NaN padrão (`0x7FC00000`; no duplo, `0x7FF8000000000000`). Qual NaN de entrada uma FMA do x86 repassa depende da ordem de operandos que o compilador escolhe, e sem isso o interpretador e o código gerado divergiam (4e).
 
-O arredondamento continua o do host (ao mais próximo). `frest`/`frsqest` devolvem o valor exato e `fi` repassa a estimativa. No duplo, todo NaN vira o mesmo (`0x7FF8000000000000`): qual NaN de entrada uma FMA do x86 repassa depende da ordem de operandos que o compilador escolhe, e sem isso o interpretador e o código gerado divergiam (4e). O ponto flutuante duplo é IEEE, como no SPU.
+O arredondamento é o do host (ao mais próximo). `frest`/`frsqest` entregam a estimativa no formato do SPU (base de 13 bits e passo de 10 bits na mantissa, por intervalo da mantissa do operando) e `fi` completa a interpolação; a estimativa fica um pouco abaixo do exato mesmo para potências de dois (`1/1,0 = 1 − 2⁻¹⁴`), e o antisserrilhado do jogo depende disso (FASE7.md, 7i). O ponto flutuante duplo é IEEE, como no SPU.
 
 ### Oráculo: o próprio inflate do jogo
 
@@ -284,7 +286,7 @@ O vídeo do Bink ainda não avança, e o áudio sai em silêncio: o próximo tra
 - As semânticas são `always_inline` nos blocos gerados.
 - `shufb` usa `pshufb` (com o laço original como referência e um teste que compara os dois).
 - Os *loads*/*stores* de quadword são um `pshufb` (a inversão dos 16 bytes).
-- Os denormais da precisão simples são zerados pelo próprio host: DAZ/FTZ do MXCSR, ligados em volta do código SPU (`SpuFloatMode`, em `spu_run` e `spu_run_blocks`). Infinitos e NaN do host só aparecem nas pistas do formato estendido, refeitas em double (Fase 7). A precisão dupla desliga os dois (`IeeeDoubles`) e continua IEEE. Os blocos e o interpretador compilam com `-fsignaling-nans`, que impede o GCC de trocar `x * 1.0` por `x`.
+- Os denormais da precisão simples são zerados pelo próprio host: DAZ/FTZ do MXCSR, ligados em volta do código SPU (`SpuFloatMode`, em `spu_run` e `spu_run_blocks`). Só o NaN do resultado é normalizado. A precisão dupla desliga os dois (`IeeeDoubles`) e continua IEEE. Os blocos e o interpretador compilam com `-fsignaling-nans`, que impede o GCC de trocar `x * 1.0` por `x`.
 - Os laços elemento a elemento vão do último elemento ao primeiro, a ordem da memória do host, e o GCC os vetoriza sem inverter as *lanes*.
 - A lógica de 128 bits usa SSE, e os deslocamentos e rotações por bytes usam `pshufb` com máscaras de uma tabela.
 - Um bloco já achado fica num cache por SPU (`block_cache`), validado pelas épocas das páginas de 4 KiB do *local store*. Cada escrita (*store* SPU, DMA, `getllar`, kernel) avança a época da página. O acerto é testado no próprio laço, sem chamada.

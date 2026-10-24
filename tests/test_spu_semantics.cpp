@@ -199,22 +199,17 @@ TEST(spu_single_float) {
     CHECK(s.w(4, 1) == 0xFFFFFFFF && s.w(4, 0) == 0);
     s.rr(Op::fcmgt, 4, 2, 1);
     CHECK(s.w(4, 3) == 0xFFFFFFFF);
-    // A denormal result is zero too (with its sign). Exponent 255 is not infinity or NaN
-    // but one more binade: 2^128 * 0 is 0, 1.0 * 0x7FC00007 is itself.
+    // A denormal result is zero too (with its sign); zero times anything (infinity too) is
+    // zero, as on the SPU; other NaN results are the default one.
     s.floats(1, 1e-20f, -1e-20f, std::numeric_limits<float>::infinity(), 1.0f);
     s.floats(2, 1e-20f, 1e-20f, 0.0f, std::nanf("7"));
     s.rr(Op::fm, 4, 1, 2);
-    CHECK(s.w(4, 0) == 0 && s.w(4, 1) == 0x80000000u && s.w(4, 2) == 0 && s.w(4, 3) == 0x7FC00007u);
-    // Overflow saturates at the largest value instead of becoming infinity.
-    s.words(1, 0x7F7FFFFFu, 0xFF000000u, 0x7F800000u, 0x7FFFFFFFu);  // 3.4e38, -1.7e38, 2^128, max
-    s.words(2, 0x40000000u, 0x41000000u, 0x7F800000u, 0xBF800000u);  // 2, 8, 2^128, -1
-    s.rr(Op::fm, 4, 1, 2);
-    CHECK(s.w(4, 0) == 0x7FFFFFFFu && s.w(4, 1) == 0xFFFFFFFFu && s.w(4, 2) == 0x7FFFFFFFu && s.w(4, 3) == 0xFFFFFFFFu);
-    s.rr(Op::fa, 4, 1, 1);  // 2 * 3.4e38 is exactly the largest value; -2^128 fits; 2^129 does not
-    CHECK(s.w(4, 0) == 0x7FFFFFFFu && s.w(4, 1) == 0xFF800000u && s.w(4, 2) == 0x7FFFFFFFu && s.w(4, 3) == 0x7FFFFFFFu);
-    s.ri8(Op::cflts, 4, 1, 173);  // exponent 255 saturates by its sign
-    CHECK(s.w(4, 1) == 0x80000000u && s.w(4, 2) == 0x7FFFFFFFu);
-    // Comparisons: 0x7FFFFFFF is greater than any other value; +0, -0 and denormals are equal.
+    CHECK(s.w(4, 0) == 0 && s.w(4, 1) == 0x80000000u && s.w(4, 2) == 0 && s.w(4, 3) == 0x7FC00000u);
+    s.rrr(Op::fma, 4, 2, 1, 3);  // 0 * inf + 1.0
+    CHECK(s.f(4, 2) == 1.0f);
+    // Comparisons read exponent 255 as a number: 0x7FFFFFFF is greater than any other value
+    // (the starting "best distance" of the physics' nearest-pair search); +0, -0 and
+    // denormals are equal.
     s.words(1, 0x7FFFFFFFu, 0x80000000u, 0x00000001u, 0xFF800000u);
     s.words(2, 0x7F7FFFFFu, 0x00000000u, 0x80000000u, 0xBF800000u);
     s.rr(Op::fcgt, 4, 1, 2);
@@ -238,6 +233,20 @@ TEST(spu_single_float) {
     CHECK(s.f(4, 1) == 2.0f);
     s.ri8(Op::cuflt, 4, 1, 155);
     CHECK(s.f(4, 2) == 4294967296.0f);
+
+    // frest + fi is the SPU's piecewise-linear estimate: within 2^-9 of 1/x (a chord over
+    // 1/16 of the mantissa), and never above it for a power of two (1/1.0 is 1 - 2^-14: the
+    // game's MLAA weights count on that).
+    s.floats(1, 1.0f, 3.0f, 0.75f, 1234.5f);
+    s.rr(Op::frest, 2, 1, 0);
+    s.rr(Op::fi, 4, 1, 2);
+    CHECK(s.f(4, 0) < 1.0f && s.f(4, 0) > 0.9999f);
+    for (int i = 1; i < 4; ++i) CHECK(std::fabs(s.f(4, i) * s.f(1, i) - 1.0f) < 1.0f / 512);
+    s.floats(1, 4.0f, 2.0f, 10.0f, 0.3f);
+    s.rr(Op::frsqest, 2, 1, 0);
+    s.rr(Op::fi, 4, 1, 2);
+    CHECK(s.f(4, 0) <= 0.5f && s.f(4, 0) > 0.4999f);
+    for (int i = 1; i < 4; ++i) CHECK(std::fabs(s.f(4, i) * s.f(4, i) * s.f(1, i) - 1.0f) < 1.0f / 256);
 }
 
 TEST(spu_double_float) {

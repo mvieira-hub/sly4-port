@@ -46,6 +46,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -588,6 +589,15 @@ int main(int argc, char** argv) {
     long presented = 0;
     bool running = true, ok = true;
     sly4::PadInput pad;
+    // The game's frame rate (its flips, not the window's presents) in the title, every
+    // half second, and in the log every 10 s.
+    auto fps_at = start;
+    uint64_t fps_flips = 0;
+    double fps_logged = 0;
+    uint64_t shown_flips = ~0ull;
+    auto shown_at = start;
+    // In the log: the average over the 10 s (the title shows the last half second).
+    uint64_t log_flips = 0;
     while (running) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
@@ -608,11 +618,40 @@ int main(int argc, char** argv) {
             SDL_Delay(16);
             continue;
         }
+        // Presented when the game shows a new frame (and now and then for a resized window),
+        // not at the monitor's rate: each present is GPU work on the queue the game uses.
+        if (game) {
+            const uint64_t flips = sly4::rsx::flip_count();
+            const auto now = std::chrono::steady_clock::now();
+            if (flips == shown_flips && now - shown_at < std::chrono::milliseconds(100)) {
+                sly4::host_sleep_us(1000);
+                continue;
+            }
+            shown_flips = flips;
+            shown_at = now;
+        }
         if (!gpu.draw_frame(clear, g_renderer ? g_renderer->front() : sly4::VulkanContext::Source{})) {
             ok = false;
             break;
         }
         ++presented;
+        if (const auto now = std::chrono::steady_clock::now(); game && now - fps_at >= std::chrono::milliseconds(500)) {
+            const uint64_t flips = sly4::rsx::flip_count();
+            const double dt = std::chrono::duration<double>(now - fps_at).count();
+            const double fps = double(flips - fps_flips) / dt;
+            char title[160];
+            std::snprintf(title, sizeof(title), "Sly Cooper: Thieves in Time - port nativo  |  %.1f quadros/s", fps);
+            SDL_SetWindowTitle(window, title);
+            const double t = std::chrono::duration<double>(now - start).count();
+            if (t - fps_logged >= 10.0) {
+                SLY4_INFO("quadros/s: %.1f de média nos últimos %.0f s (%.0f s, %" PRIu64 " flips)",
+                          double(flips - log_flips) / (t - fps_logged), t - fps_logged, t, flips);
+                fps_logged = t;
+                log_flips = flips;
+            }
+            fps_at = now;
+            fps_flips = flips;
+        }
         if (args.frames > 0 && presented >= args.frames) break;
         if (game && (game_over() || game_timed_out())) break;
     }
