@@ -10,7 +10,8 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$ghidra = if ($env:GHIDRA_HOME) { $env:GHIDRA_HOME } else { 'C:\Users\Administrador\Documents\ghidra_12.1.4_PUBLIC' }
+$ghidra = if ($env:GHIDRA_HOME) { $env:GHIDRA_HOME } else { Join-Path $HOME 'Documents\ghidra_12.1.4_PUBLIC' }
+if (-not (Test-Path "$ghidra\support\analyzeHeadless.bat")) { throw "Ghidra not found in ${ghidra}: set GHIDRA_HOME" }
 $cspecRel = 'Ghidra\Processors\PowerPC\data\languages\ppc_64_32.cspec'
 $patched = "$root\work\ghidra\ppc_64_32.cspec"
 

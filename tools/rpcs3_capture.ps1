@@ -11,8 +11,12 @@
 param(
     [Parameter(Mandatory = $true)][string]$Keys,
     [int]$Seconds = 90,
-    [string]$Rpcs3 = "C:\Users\Administrador\Documents\rpcs3-v0.0.43-20354-b77d4a52_win64_msvc"
+    # RPCS3 folder: -Rpcs3, else RPCS3_HOME, else the first rpcs3-* folder in Documents
+    [string]$Rpcs3 = $(if ($env:RPCS3_HOME) { $env:RPCS3_HOME } else {
+        (Get-ChildItem (Join-Path $HOME 'Documents') -Directory -Filter 'rpcs3-*' -ErrorAction SilentlyContinue |
+            Select-Object -First 1).FullName })
 )
+if (-not $Rpcs3 -or -not (Test-Path "$Rpcs3\rpcs3.exe")) { throw "rpcs3.exe not found: pass -Rpcs3 or set RPCS3_HOME" }
 $game = Join-Path (Split-Path $PSScriptRoot) "PS3_GAME\USRDIR\EBOOT.BIN"
 Add-Type -Namespace Sly4 -Name Keys -MemberDefinition @'
 [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, System.UIntPtr extra);

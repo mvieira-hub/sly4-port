@@ -78,7 +78,7 @@ Valores pequenos podem ser ambíguos: `u:0` pode ser um float 0.0 ou um falso.
 
 **Passo 1: decifrar.** Pela linha de comando do RPCS3 (gera o `EBOOT.elf` ao lado do `.BIN`):
 ```powershell
-& "C:\Users\Administrador\Documents\rpcs3-v0.0.43-20354-b77d4a52_win64_msvc\rpcs3.exe" --decrypt "PS3_GAME\USRDIR\EBOOT.BIN"
+& "C:\caminho\do\rpcs3\rpcs3.exe" --decrypt "PS3_GAME\USRDIR\EBOOT.BIN"
 ```
 Também dá para usar o menu **Utilities → Decrypt PS3 Binaries**. Se o arquivo ficar em outro lugar, use `--elf`.
 

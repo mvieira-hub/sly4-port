@@ -2,7 +2,7 @@
 
 ## 0. Modo sem interface, via Docker (sem instalar Java)
 
-O `tools\run_ghidra.ps1` roda o `analyzeHeadless` do Ghidra extraído em `C:\Users\Administrador\Documents\ghidra_12.1.4_PUBLIC` dentro da imagem `eclipse-temurin:21-jdk`:
+O `tools\run_ghidra.ps1` roda o `analyzeHeadless` do Ghidra extraído em `$env:GHIDRA_HOME` (sem ela, `Documentos\ghidra_12.1.4_PUBLIC` do usuário) dentro da imagem `eclipse-temurin:21-jdk`:
 - a instalação do Ghidra é montada como somente leitura;
 - o ajuste do `r2` vai numa cópia do `ppc_64_32.cspec` em `work\ghidra\`, montada por cima da original.
 

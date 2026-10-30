@@ -1,27 +1,125 @@
-# Conteúdo do jogo (Sony) — nunca vai para o repositório.
-# Cada um usa o próprio dump do disco em PS3_GAME/.
+# ---------------------------------------------------------------------------
+# Nothing owned by Sony Interactive Entertainment or Sanzaru Games is ever
+# committed here. Everyone works from their own dump of their own disc, kept
+# locally in PS3_GAME/ (see DISCLAIMER.md). Patterns are listed in both cases
+# because Git matches case-sensitively on Linux and macOS.
+# ---------------------------------------------------------------------------
+
+# Disc dump, update and system folders
 PS3_GAME/
 PS3_UPDATE/
+USRDIR/
 PS3_DISC.SFB
+*.SFB
+*.sfb
+PARAM.SFO
+*.SFO
+*.sfo
+dev_flash/
+dev_hdd0/
+dev_hdd1/
+dev_bdvd/
+
+# Disc images, packages, firmware and licenses
+*.iso
+*.ISO
+*.pkg
+*.PKG
+*.PUP
+*.pup
+*.rap
+*.RAP
+*.edat
+*.EDAT
+*.sdat
+*.SDAT
+
+# Executables and modules of the console (encrypted or not)
 *.elf
+*.ELF
 *.self
+*.SELF
 *.sprx
+*.SPRX
+*.prx
+*.PRX
+*.bin
+*.BIN
+
+# Keys and console identifiers
+*.key
+*.keys
+keys.txt
+idps*
+act.dat
+
+# Game data containers and assets
 *.psarc
+*.PSARC
 *.san
 *.cooked
+*.dat
+*.DAT
+*.gtf
+*.GTF
+*.dds
+*.xvag
+*.XVAG
+*.vag
+*.at3
+*.bik
+*.BIK
+*.pam
+*.xmb
+*.sbnk
+*.ftd
+*.bfx_res
+*.hkx
+*.vpo
+*.fpo
+Shaders.Zip
 
-# Saídas das ferramentas: EBOOT descriptografado, assets extraídos, modelos,
-# texturas, projeto e código decompilado do Ghidra, desmontagens.
+# Anything extracted or converted from the game
+*.gltf
+*.glb
+*.obj
+*.mtl
+*.wav
+*.png
+*.jpg
+*.jpeg
+# Own images for the documentation are the one exception
+!docs/assets/**
+
+# Memory dumps, captures and logs
+*.dmp
+*.core
+*.rdc
+*.log
+
+# Tool outputs: decrypted EBOOT, extracted assets, Ghidra project,
+# disassembly listings, frame and audio dumps, SPU code caches
 work/
+*.gpr
+*.rep/
 
-# Código C++ gerado do EBOOT de cada um (derivado do código da Sony) e builds
+# C++ generated from each user's own EBOOT (derived from the game's code),
+# never distributed; builds and compiled binaries
 generated/
 build/
+out/
+*.exe
+*.dll
+*.o
+*.a
+*.pdb
 
-# Python / editores
+# Python and editors
 __pycache__/
 *.pyc
+.venv/
 .vscode/
 .idea/
 Thumbs.db
 desktop.ini
+.DS_Store
