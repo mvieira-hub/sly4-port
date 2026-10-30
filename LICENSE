@@ -21,13 +21,15 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ---------------------------------------------------------------------------
-Scope of this license
+Escopo desta licença
 
-This license covers only the original work in this repository: the source
-code, scripts, build files and documentation written for this project.
+Esta licença cobre apenas o trabalho original deste repositório: o código-fonte,
+os scripts, os arquivos de compilação e a documentação escritos para este
+projeto.
 
-It does not cover, and grants no rights to, Sly Cooper: Thieves in Time or
-any other material owned by Sony Interactive Entertainment, Sanzaru Games or
-their licensors, including the game's executable, data, assets, firmware, and
-any code generated or files extracted from a user's own copy of the game.
-None of that material is included in this repository. See DISCLAIMER.md.
+Ela não cobre, e não concede nenhum direito sobre, Sly Cooper: Thieves in Time
+ou qualquer outro material da Sony Interactive Entertainment, da Sanzaru Games
+ou de seus licenciadores, incluindo o executável, os dados, os assets e o
+firmware do jogo, além de qualquer código gerado ou arquivo extraído da cópia
+do próprio usuário. Nenhum desses materiais está incluído neste repositório.
+Veja o DISCLAIMER.md.

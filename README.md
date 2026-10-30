@@ -2,82 +2,82 @@
 
 # sly4-port
 
-### A native Windows port of *Sly Cooper: Thieves in Time* (PS3), built by static recompilation
+### Um port nativo para Windows de *Sly Cooper: Thieves in Time* (PS3), feito por recompilação estática
 
-[![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white)](#building)
+[![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white)](#compilação)
 [![Python 3.11](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)](tools/README.md)
-[![Cell BE](https://img.shields.io/badge/Cell_BE-PowerPC_64_%2B_SPU-8A2BE2)](#the-challenge)
+[![Cell BE](https://img.shields.io/badge/Cell_BE-PowerPC_64_%2B_SPU-8A2BE2)](#o-desafio)
 [![Vulkan 1.3](https://img.shields.io/badge/Vulkan-1.3-AC162C?logo=vulkan&logoColor=white)](docs/GPU.md)
-[![Windows x64](https://img.shields.io/badge/Windows-x86--64-0078D4?logo=windows&logoColor=white)](#building)
-[![Docker](https://img.shields.io/badge/Build-Docker-2496ED?logo=docker&logoColor=white)](#building)
+[![Windows x64](https://img.shields.io/badge/Windows-x86--64-0078D4?logo=windows&logoColor=white)](#compilação)
+[![Docker](https://img.shields.io/badge/Build-Docker-2496ED?logo=docker&logoColor=white)](#compilação)
 <br>
-[![Reverse Engineering](https://img.shields.io/badge/Reverse-Engineering-444444)](tools/docs/GHIDRA.md)
-[![Software Preservation](https://img.shields.io/badge/Software-Preservation-2E7D32)](DISCLAIMER.md)
+[![Engenharia Reversa](https://img.shields.io/badge/Engenharia-Reversa-444444)](tools/docs/GHIDRA.md)
+[![Preservação de Software](https://img.shields.io/badge/Preserva%C3%A7%C3%A3o-de_Software-2E7D32)](DISCLAIMER.md)
 [![build](https://github.com/mvieira-hub/sly4-port/actions/workflows/build.yml/badge.svg)](https://github.com/mvieira-hub/sly4-port/actions/workflows/build.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Licença: MIT](https://img.shields.io/badge/Licen%C3%A7a-MIT-yellow.svg)](LICENSE)
 
-**English** · [Português](README.pt-BR.md)
+**Português** · [English](README.en.md)
 
 </div>
 
 > [!IMPORTANT]
-> **No game content is included in this repository.** No executable, assets, firmware or keys
-> from Sony Interactive Entertainment or Sanzaru Games. The tools only work on a dump of a
-> disc you own. Read the [legal notice](DISCLAIMER.md).
+> **Nenhum conteúdo do jogo está neste repositório.** Não há executável, assets, firmware nem
+> chaves da Sony Interactive Entertainment ou da Sanzaru Games. As ferramentas só funcionam com o
+> dump de um disco que você possui. Leia o [aviso legal](DISCLAIMER.md).
 
 ---
 
-## Overview
+## Visão geral
 
-*Sly Cooper: Thieves in Time* (2013, BCES01284) only runs on the PlayStation 3 or under emulation.
-This project translates the game's own machine code, ahead of time, into C++ that compiles to a
-regular Windows program. A native runtime then stands in for the console's operating system and
-hardware.
+*Sly Cooper: Thieves in Time* (2013, BCES01284) só roda no PlayStation 3 ou em emulador. Este
+projeto traduz, antes da execução, o próprio código de máquina do jogo para C++, que compila como
+um programa comum de Windows. Um runtime nativo faz o papel do sistema operacional e do hardware
+do console.
 
-There is no emulator loop at run time. The game's PowerPC and SPU code runs as compiled x86-64,
-and an interpreter is only a fallback for code that was not seen before. The goal is
-**software preservation** and **interoperability**: keep a game playable on hardware that is
-still being made, from a copy its owner already has.
+Não há laço de emulação durante o jogo. O código PowerPC e SPU do jogo roda como x86-64
+compilado, e um interpretador só entra para código que ainda não foi visto. O objetivo é
+**preservação de software** e **interoperabilidade**: manter um jogo jogável em hardware que
+ainda é fabricado, a partir de uma cópia que o dono já tem.
 
-**Where it is today:** the game boots, plays its intro video and menus with music, and its
-**first level is playable**. The Paris prologue loads and renders, and Sly runs, jumps and
-double-jumps with a gamepad or keyboard, with sound, at 30–34 frames per second.
+**Onde está hoje:** o jogo inicia, toca o vídeo de abertura e os menus com música, e a
+**primeira fase é jogável**. O prólogo em Paris carrega e renderiza, e o Sly corre, pula e dá
+pulo duplo com gamepad ou teclado, com som, a 30–34 quadros por segundo.
 
-## The challenge
+## O desafio
 
-The PS3's Cell Broadband Engine is very different from a PC, and every part of it has to be
-reproduced:
+O Cell Broadband Engine do PS3 é muito diferente de um PC, e cada parte dele precisa ser
+reproduzida:
 
-| PS3 | What it is | How this port handles it |
+| PS3 | O que é | Como o port resolve |
 |---|---|---|
-| **PPU** | PowerPC 64, big-endian, with VMX (AltiVec) and Cell-specific instructions | Each function becomes C++ with branches turned into `goto` and calls into direct calls |
-| **SPUs** | 6 vector co-processors, each with 256 KiB of local store, fed only by DMA | SPU code is recompiled per block, with DMA, channels, mailboxes and atomics reimplemented |
-| **LV2 kernel** | Threads, sync primitives, timers, memory, file system | Mapped onto Win32 threads, events and files |
-| **System modules** | `cellFs`, `cellGcm`, `cellSpurs`, `cellAudio`, `cellPad`, `cellSaveData`... | High-level reimplementation; SPURS runs the console's own firmware, recompiled |
-| **RSX GPU** | NV47-class GPU fed by a command FIFO, with Cg shaders | FIFO decoded into Vulkan 1.3; shader bytecode translated straight to SPIR-V |
-| **Memory** | 32-bit guest pointers, big-endian data | 4 GiB guest address space reserved on the host, byte-swapped access |
+| **PPU** | PowerPC 64, big-endian, com VMX (AltiVec) e instruções próprias do Cell | Cada função vira C++, com desvios em `goto` e chamadas diretas |
+| **SPUs** | 6 coprocessadores vetoriais, cada um com 256 KiB de memória local, alimentados só por DMA | O código SPU é recompilado por bloco, com DMA, canais, mailboxes e atômicos reimplementados |
+| **Kernel LV2** | Threads, sincronização, timers, memória, sistema de arquivos | Mapeado para threads, eventos e arquivos do Win32 |
+| **Módulos de sistema** | `cellFs`, `cellGcm`, `cellSpurs`, `cellAudio`, `cellPad`, `cellSaveData`... | Reimplementação em alto nível; o SPURS roda o firmware do próprio console, recompilado |
+| **GPU RSX** | GPU da classe NV47, alimentada por uma fila de comandos, com shaders Cg | A fila vira Vulkan 1.3; o bytecode dos shaders é traduzido direto para SPIR-V |
+| **Memória** | Ponteiros de 32 bits, dados big-endian | 4 GiB de endereços reservados no PC, com acesso de bytes invertidos |
 
-## Architecture
+## Arquitetura
 
 ```mermaid
 flowchart LR
-  subgraph disc["Your own disc dump (never in Git)"]
-    EBOOT[EBOOT.elf<br/>PPU code]
-    SPUELF[SPU programs]
-    PSARC[Sly4.psarc<br/>+ videos]
+  subgraph disc["Dump do seu disco (nunca vai para o Git)"]
+    EBOOT[EBOOT.elf<br/>código PPU]
+    SPUELF[Programas SPU]
+    PSARC[Sly4.psarc<br/>+ vídeos]
   end
-  subgraph recomp["Recompiler (sly4_recomp)"]
-    DEC[Decoders<br/>PPU and SPU]
-    ANA[Control-flow<br/>analysis]
-    EMIT[C++ emitter]
+  subgraph recomp["Recompilador (sly4_recomp)"]
+    DEC[Decodificadores<br/>PPU e SPU]
+    ANA[Análise de<br/>fluxo]
+    EMIT[Emissor C++]
   end
   subgraph exe["sly4.exe"]
-    GEN[Generated C++<br/>24k functions]
-    MEM[Guest memory<br/>4 GiB, big-endian]
-    KRN[LV2 kernel<br/>+ HLE modules]
-    SPU[SPU runtime<br/>MFC, SPURS]
-    RSX[RSX to Vulkan<br/>shaders to SPIR-V]
-    IO[SDL3: window,<br/>audio, gamepad]
+    GEN[C++ gerado<br/>24 mil funções]
+    MEM[Memória do convidado<br/>4 GiB, big-endian]
+    KRN[Kernel LV2<br/>+ módulos HLE]
+    SPU[Runtime SPU<br/>MFC, SPURS]
+    RSX[RSX para Vulkan<br/>shaders para SPIR-V]
+    IO[SDL3: janela,<br/>áudio, controle]
   end
   EBOOT --> DEC
   SPUELF --> DEC
@@ -87,203 +87,208 @@ flowchart LR
   KRN --> SPU
   KRN --> RSX
   KRN --> IO
-  PSARC -. read at run time .-> KRN
+  PSARC -. lido durante o jogo .-> KRN
 ```
 
-## Technical accomplishments
+## O que foi feito
 
-### Static recompiler: PowerPC 64 (PPU)
-- Own decoder for the full PPU instruction set, including the Cell additions (`lvlx`, `lvrx`) that
-  Ghidra and Capstone do not decode. On all 2.8 million instructions its output is identical to
-  GNU binutils.
-- Control-flow analysis recovers **23,913 functions**, 301 thousand basic blocks and all **178 jump
-  tables**, and tells code from the 10,044 data words embedded in `.text`.
-- The emitter turns **2.77 million instructions into 24,164 C++ functions** in 98 files that
-  compile without warnings. Indirect calls go through a dispatch table, with the interpreter
-  as fallback.
-- A reference interpreter covers integers, the FPU with the full FPSCR, and VMX. It was
-  validated against real PowerPC execution under QEMU: 195 instructions, 195,000 cases, no
-  divergence.
+### Recompilador estático: PowerPC 64 (PPU)
+- Decodificador próprio do conjunto completo de instruções da PPU, incluindo as do Cell (`lvlx`,
+  `lvrx`) que o Ghidra e o Capstone não leem. Nas 2,8 milhões de instruções, a saída é idêntica à
+  do GNU binutils.
+- A análise de fluxo recupera **23.913 funções**, 301 mil blocos e todas as **178 tabelas de
+  salto**, e separa o código das 10.044 palavras de dados no meio do `.text`.
+- O emissor transforma **2,77 milhões de instruções em 24.164 funções C++**, em 98 arquivos que
+  compilam sem avisos. Chamadas indiretas passam por uma tabela de despacho, com o interpretador
+  de reserva.
+- Um interpretador de referência cobre inteiros, a FPU com o FPSCR completo e o VMX. Ele foi
+  validado contra execução PowerPC real no QEMU: 195 instruções, 195 mil casos, nenhuma
+  divergência.
 
-### SPU recompiler and SPURS
-- SPU decoder identical to `spu-elf-objdump` on all 266,842 words of the game's 10 SPU programs.
-- SPU code is recompiled into **verified blocks** that only run while the local store still holds
-  the code they came from. 60,382 blocks are compiled from a cache recorded during play.
-- The console's own SPURS scheduler (`libsre`) is loaded from the user's firmware, relocated and
-  recompiled: 384 functions, running on 6 SPU threads.
-- MFC DMA with lists and stall-and-notify, SPU interrupts, and atomic reservations shared between
-  PPU `stwcx.` and SPU `putllc`, following RPCS3's semantics.
+### Recompilador SPU e SPURS
+- Decodificador SPU idêntico ao `spu-elf-objdump` nas 266.842 palavras dos 10 programas SPU do
+  jogo.
+- O código SPU é recompilado em **blocos verificados**, que só rodam enquanto a memória local ainda
+  guarda o código de onde vieram. São 60.382 blocos compilados a partir de uma cache gravada
+  durante o jogo.
+- O escalonador SPURS do próprio console (`libsre`) é carregado do firmware do usuário, relocado e
+  recompilado: 384 funções, rodando em 6 threads SPU.
+- DMA do MFC com listas e *stall-and-notify*, interrupções do SPU e reservas atômicas
+  compartilhadas entre o `stwcx.` da PPU e o `putllc` da SPU, seguindo a semântica do RPCS3.
 
-### Kernel, system modules and I/O
-- 251 imported functions from 20 modules are resolved by NID, and 71 system calls are named.
-- LV2 threads and every sync object the game uses: lwmutex, mutex, condition, rwlock, semaphore,
-  event flag, event queue and port, timers. Plus `sys_mmapper` and a virtual file system.
-- `cellSaveData` drives the game's own callbacks; `cellAudio` mixes into WASAPI; `cellPad` reads
-  gamepad and keyboard through SDL3, with rumble. The Bink intro video plays through the game's
-  own recompiled decoder.
+### Kernel, módulos de sistema e entrada e saída
+- 251 funções importadas de 20 módulos são resolvidas por NID, e 71 chamadas de sistema têm nome.
+- Threads do LV2 e todos os objetos de sincronização que o jogo usa: lwmutex, mutex, condição,
+  rwlock, semáforo, event flag, filas e portas de eventos, timers. Além disso, `sys_mmapper` e um
+  sistema de arquivos virtual.
+- O `cellSaveData` chama as funções do próprio jogo; o `cellAudio` mistura para o WASAPI; o
+  `cellPad` lê gamepad e teclado pelo SDL3, com vibração. O vídeo de abertura em Bink toca pelo
+  decodificador do próprio jogo, recompilado.
 
-### RSX to Vulkan 1.3
-- Command FIFO, register state tracking, surfaces kept coherent with guest memory through page
-  protection, and 2D blits on the GPU.
-- All **541 vertex and fragment programs** of the game are translated directly from RSX bytecode
-  to SPIR-V, with no intermediate shading language.
-- Title screen and main menu were compared frame by frame with RPCS3 captures and match.
+### RSX para Vulkan 1.3
+- Fila de comandos, rastreamento do estado dos registradores, superfícies coerentes com a memória
+  do console por proteção de página e cópias 2D na GPU.
+- Todos os **541 programas de vértice e de fragmento** do jogo são traduzidos direto do bytecode
+  do RSX para SPIR-V, sem linguagem de shader intermediária.
+- A tela de título e o menu principal foram comparados quadro a quadro com capturas do RPCS3 e
+  batem.
 
-### Asset and format research (Python)
-Every format below was reverse-engineered from the game's data and from its loader code in the
-executable, then implemented as a script in [`tools/`](tools/README.md):
+### Pesquisa de formatos e assets (Python)
+Cada formato abaixo foi decifrado a partir dos dados do jogo e do código que os carrega no
+executável, e virou um script em [`tools/`](tools/README.md):
 
-| Format | Tool | Result |
+| Formato | Ferramenta | Resultado |
 |---|---|---|
-| PSARC archives | `psarc.py` | Full extraction; 148,603 compressed blocks verified against zlib |
-| Sanzaru chunk containers (`.san`, `.san.cooked`) | `sanchunks.py` | Generic walker for the engine's chunk tree |
-| Textures (TEXR / GTF) | `texr2dds.py` | 49,981 textures converted to DDS, lossless |
-| Scripts (XMLB) | `xmlb2json.py` | XML/JSON output, 85% of names recovered |
-| Meshes and levels (MESH, GINS) | `san2gltf.py` | 87 levels exported to glTF with hierarchy, materials and textures |
-| Skinned geometry (PlayStation EDGE) | `edge.py` | Compressed index stream and skinning decoded from the SPU code |
-| Animation (Havok 2011.3) | `havok.py` | All 4,320 clips decode and export to glTF |
-| Shaders (Cg binaries) | `cgbin_info.py` | Inventory of all 541 programs |
-| Executable map (EBOOT) | `eboot_scan.py` | Imports, syscalls, TOC and chunk handlers, applied to Ghidra |
+| Pacotes PSARC | `psarc.py` | Extração completa; 148.603 blocos comprimidos conferidos com o zlib |
+| Contêineres de chunks da Sanzaru (`.san`, `.san.cooked`) | `sanchunks.py` | Leitor genérico da árvore de chunks do motor |
+| Texturas (TEXR / GTF) | `texr2dds.py` | 49.981 texturas convertidas para DDS, sem perda |
+| Scripts (XMLB) | `xmlb2json.py` | Saída em XML/JSON, 85% dos nomes recuperados |
+| Malhas e fases (MESH, GINS) | `san2gltf.py` | 87 fases exportadas para glTF com hierarquia, materiais e texturas |
+| Geometria com skinning (PlayStation EDGE) | `edge.py` | Índices comprimidos e skinning decifrados a partir do código SPU |
+| Animação (Havok 2011.3) | `havok.py` | Os 4.320 clipes decodificam e saem no glTF |
+| Shaders (binários Cg) | `cgbin_info.py` | Inventário dos 541 programas |
+| Mapa do executável (EBOOT) | `eboot_scan.py` | Importações, syscalls, TOC e tratadores de chunk, aplicados no Ghidra |
 
-## Verification first
+## Verificação antes de tudo
 
-Every layer is checked against an independent reference before the next one is built on it.
+Cada camada é conferida contra uma referência independente antes que a próxima seja construída
+em cima dela.
 
-| What | Checked against | Result |
+| O quê | Conferido contra | Resultado |
 |---|---|---|
-| PPU decoder | GNU binutils `objdump` | 2.8 M instructions, 0 differences |
-| PPU interpreter | Real PowerPC execution under QEMU | 195,000 cases, 0 divergences |
-| Generated PPU C++ | The interpreter, on random states | 98,332 cases, all equal |
-| SPU decoder | `spu-elf-objdump` | 266,842 words, 0 differences |
-| Generated SPU C++ | The SPU interpreter | 3,685,525 cases, all equal |
-| SPU code end to end | The game's own zlib task vs. native inflate | 2,000 blocks equal (4.4 billion SPU instructions) |
-| Native inflate | Python's `zlib` | 148,603 blocks (9.01 GiB) equal |
-| Boot sequence | RPCS3 log | Identical line by line up to `cellGcmInit` |
-| Rendering | RPCS3 screenshots | Title and menu match |
+| Decodificador PPU | `objdump` do GNU binutils | 2,8 milhões de instruções, 0 diferenças |
+| Interpretador PPU | Execução PowerPC real no QEMU | 195 mil casos, 0 divergências |
+| C++ gerado da PPU | O interpretador, com estados aleatórios | 98.332 casos, todos iguais |
+| Decodificador SPU | `spu-elf-objdump` | 266.842 palavras, 0 diferenças |
+| C++ gerado da SPU | O interpretador SPU | 3.685.525 casos, todos iguais |
+| Código SPU de ponta a ponta | A tarefa zlib do jogo contra o inflate nativo | 2.000 blocos iguais (4,4 bilhões de instruções SPU) |
+| Inflate nativo | O `zlib` do Python | 148.603 blocos (9,01 GiB) iguais |
+| Sequência de boot | Log do RPCS3 | Idêntica linha a linha até o `cellGcmInit` |
+| Renderização | Capturas do RPCS3 | Título e menu batem |
 
-About 25,600 lines of hand-written C++20 and 3,900 lines of Python, with 51 unit test cases that run
-in CI on a Windows runner.
+São cerca de 25.600 linhas de C++20 escritas à mão e 3.900 linhas de Python, com 51 casos de
+teste que rodam na CI num runner Windows.
 
-## Bug hunts worth reading
+## Caçadas a bugs
 
-Some of the most interesting problems came from tiny differences between the Cell and x86:
+Alguns dos problemas mais interessantes vieram de pequenas diferenças entre o Cell e o x86:
 
-- **A NaN that was a number.** Loading hung forever inside a physics task. SPU single-precision
-  floats have no NaN or infinity, so `0x7FFFFFFF` is simply the largest number, but x86 treats it
-  as NaN and every comparison failed. ([FASE7.md](docs/FASE7.md), 7b)
-- **White dots from a reciprocal that was too exact.** The game's anti-aliasing on the SPUs
-  relies on the hardware's reciprocal *estimate* being slightly below the true value. An exact
-  `1/x` pushed one blend weight to 256, which overflowed into bright pixels on character edges.
-  The fix reproduces the SPU's piecewise-linear estimate. ([FASE7.md](docs/FASE7.md), 7i)
-- **A silent game.** Audio worked, but the save-data stub left the settings zeroed, volumes
-  included. ([FASE6.md](docs/FASE6.md), 6a)
-- **A green intro video.** The Bink decoder was right. The renderer was writing an old surface
-  over the video planes, which led to tracking drawn surfaces with page protection.
-  ([FASE6.md](docs/FASE6.md), 6d)
+- **Um NaN que era número.** O carregamento travava para sempre numa tarefa de física. O ponto
+  flutuante simples da SPU não tem NaN nem infinito, então `0x7FFFFFFF` é só o maior número, mas o
+  x86 o lê como NaN e toda comparação falhava. ([FASE7.md](docs/FASE7.md), 7b)
+- **Pontos brancos de um recíproco exato demais.** O antisserrilhado que o jogo faz nas SPUs
+  depende de a *estimativa* de recíproco do hardware ficar um pouco abaixo do valor exato. Um
+  `1/x` exato levava um peso de mistura a 256, que estourava em pixels claros nas bordas dos
+  personagens. A correção reproduz a estimativa por interpolação da SPU.
+  ([FASE7.md](docs/FASE7.md), 7i)
+- **Um jogo mudo.** O áudio funcionava, mas o stub de saves deixava as configurações zeradas,
+  inclusive os volumes. ([FASE6.md](docs/FASE6.md), 6a)
+- **Um vídeo de abertura verde.** O decodificador Bink estava certo. O renderizador escrevia uma
+  superfície velha por cima dos planos do vídeo, e a solução foi vigiar as superfícies desenhadas
+  com proteção de página. ([FASE6.md](docs/FASE6.md), 6d)
 
-## Roadmap
+## Roteiro
 
-| Phase | Scope | Status |
+| Fase | Escopo | Estado |
 |---|---|---|
-| 0 | Toolchain, window, Vulkan, CI | ✅ Done |
-| 1 | Guest memory and ELF loader | ✅ Done |
-| 2 | PPU recompiler | ✅ Done |
-| 3 | LV2 kernel and system modules: the game boots | ✅ Done |
-| 4 | SPU recompiler and SPURS | ✅ Done |
-| 5 | RSX to Vulkan: menus render correctly | ✅ Done |
-| 6 | Audio, controller, saves and video | ✅ Done |
-| 7 | First playable level | ✅ Done |
-| 8 | Full game, 60 FPS, higher resolutions, installer | 🚧 Next |
+| 0 | Toolchain, janela, Vulkan, CI | ✅ Concluída |
+| 1 | Memória do convidado e carregador ELF | ✅ Concluída |
+| 2 | Recompilador PPU | ✅ Concluída |
+| 3 | Kernel LV2 e módulos de sistema: o jogo inicia | ✅ Concluída |
+| 4 | Recompilador SPU e SPURS | ✅ Concluída |
+| 5 | RSX para Vulkan: os menus saem corretos | ✅ Concluída |
+| 6 | Áudio, controle, saves e vídeo | ✅ Concluída |
+| 7 | Primeira fase jogável | ✅ Concluída |
+| 8 | Jogo completo, 60 q/s, resoluções maiores, instalador | 🚧 Próxima |
 
-The full plan, with the audit of the executable and the exit criteria of every phase, is in
+O plano completo, com a auditoria do executável e os critérios de saída de cada fase, está em
 [docs/ROADMAP.md](docs/ROADMAP.md).
 
-## Repository structure
+## Estrutura do repositório
 
 ```text
-app/          Entry point: window, input, command-line options
-recomp/       Recompiler: PPU and SPU decoders, control-flow analysis, C++ emitters,
-              differential oracles
+app/          Ponto de entrada: janela, controle, opções de linha de comando
+recomp/       Recompilador: decodificadores PPU e SPU, análise de fluxo, emissores C++,
+              oráculos diferenciais
 runtime/
-  memory/     Guest address space, big-endian access
-  loader/     ELF/PRX loader, NIDs, TLS, SPU ELF
-  cpu/        PPU and SPU contexts, instruction semantics, interpreters, MFC, atomics
-  kernel/     LV2 syscalls, threads, sync, VFS, HLE modules, SPU threads, SPURS
-  rsx/        RSX command FIFO and state
-  gpu/        Vulkan renderer, shader translation to SPIR-V, textures
-  core/       Logging, inflate, PNG, timing helpers
-tests/        Unit tests and differential test programs
-tools/        Python research tools, Ghidra scripts, disassembler and QEMU oracle images
-docs/         Engineering notes, one file per phase or subsystem
-docker/       Build toolchain image and build script
-cmake/        MinGW-w64 toolchain file
+  memory/     Espaço de endereços do convidado, acesso big-endian
+  loader/     Carregador ELF/PRX, NIDs, TLS, ELF de SPU
+  cpu/        Contextos PPU e SPU, semântica das instruções, interpretadores, MFC, atômicos
+  kernel/     Syscalls do LV2, threads, sincronização, VFS, módulos HLE, threads SPU, SPURS
+  rsx/        Fila de comandos e estado do RSX
+  gpu/        Renderizador Vulkan, tradução de shaders para SPIR-V, texturas
+  core/       Log, inflate, PNG, tempo
+tests/        Testes unitários e programas de teste diferencial
+tools/        Ferramentas de pesquisa em Python, scripts do Ghidra, imagens do desmontador e do QEMU
+docs/         Notas de engenharia, um arquivo por fase ou subsistema
+docker/       Imagem do toolchain e script de compilação
+cmake/        Arquivo de toolchain do MinGW-w64
 ```
 
-Never committed: `PS3_GAME/` (your dump), `work/` (tool outputs), `generated/` (C++ generated
-from your executable) and `build/`.
+Nunca versionados: `PS3_GAME/` (o seu dump), `work/` (saídas das ferramentas), `generated/` (C++
+gerado do seu executável) e `build/`.
 
-## Building
+## Compilação
 
-Everything builds inside Docker, so the host only needs **Docker Desktop and Git**. The result is
-a single Windows `.exe` with no DLLs, built with MinGW-w64 GCC 14, CMake, Ninja and a static SDL3.
+Tudo compila dentro do Docker, então o computador só precisa de **Docker Desktop e Git**. O
+resultado é um único `.exe` de Windows, sem DLLs, feito com MinGW-w64 GCC 14, CMake, Ninja e SDL3
+estático.
 
 ```powershell
 .\docker\build.ps1 -Jobs 6                 # Release: build\mingw-release\sly4.exe
 .\docker\build.ps1 -Config Debug -Jobs 6   # Debug:   build\mingw-debug\sly4.exe
-.\build\mingw-release\sly4_tests.exe       # unit tests
+.\build\mingw-release\sly4_tests.exe       # testes unitários
 ```
 
-Without a game dump this builds the runtime, the recompiler and the tests, which is what CI does.
-To run the game you need: Windows 10/11 x64 and a GPU with Vulkan 1.3.
+Sem o dump do jogo, isso compila o runtime, o recompilador e os testes, que é o que a CI faz.
+Para rodar o jogo é preciso Windows 10/11 x64 e uma GPU com Vulkan 1.3.
 
-## Using it with your own copy
+## Como usar com a sua cópia
 
-1. **Dump your own disc** of *Sly Cooper: Thieves in Time* (BCES01284) into `PS3_GAME/`.
-2. **Decrypt the executable** with [RPCS3](https://rpcs3.net), which writes `EBOOT.elf` next to
-   `EBOOT.BIN`:
+1. **Faça o dump do seu disco** de *Sly Cooper: Thieves in Time* (BCES01284) em `PS3_GAME/`.
+2. **Descriptografe o executável** com o [RPCS3](https://rpcs3.net), que grava o `EBOOT.elf` ao
+   lado do `EBOOT.BIN`:
    ```powershell
-   & "C:\path\to\rpcs3\rpcs3.exe" --decrypt "PS3_GAME\USRDIR\EBOOT.BIN"
+   & "C:\caminho\do\rpcs3\rpcs3.exe" --decrypt "PS3_GAME\USRDIR\EBOOT.BIN"
    ```
-3. **Generate the C++** for the PPU code, the SPURS firmware module and the SPU programs, then
-   build again. The commands are in [docs/RECOMP.md](docs/RECOMP.md) and
-   [docs/SPU.md](docs/SPU.md).
-4. **Run**:
+3. **Gere o C++** do código PPU, do módulo SPURS do firmware e dos programas SPU, e compile de
+   novo. Os comandos estão em [docs/RECOMP.md](docs/RECOMP.md) e [docs/SPU.md](docs/SPU.md).
+4. **Rode**:
    ```powershell
    .\build\mingw-release\sly4.exe --game PS3_GAME --firmware work\firmware
    ```
 
-The research tools run in a Python container: start with [tools/README.md](tools/README.md).
+As ferramentas de pesquisa rodam num contêiner Python: comece por
+[tools/README.md](tools/README.md).
 
-## Documentation
+## Documentação
 
-The engineering notes are written in Portuguese.
-
-| Document | Subject |
+| Documento | Assunto |
 |---|---|
-| [ROADMAP.md](docs/ROADMAP.md) | Audit of the game, architecture, phases and exit criteria |
-| [RECOMP.md](docs/RECOMP.md) | PPU decoder, analysis, interpreter and C++ emitter |
-| [KERNEL.md](docs/KERNEL.md) | LV2 kernel, threads, file system, system modules |
-| [SPU.md](docs/SPU.md) | SPU decoder, interpreter, recompiler, SPURS and MFC |
-| [GPU.md](docs/GPU.md) | RSX, Vulkan renderer, shader translation, RPCS3 comparison |
-| [FASE6.md](docs/FASE6.md) | Saves, audio, controller and video |
-| [FASE7.md](docs/FASE7.md) | First playable level and the bugs behind it |
-| [tools/](tools/README.md) | Data formats and research tools (EDGE, Havok, shaders, Ghidra) |
+| [ROADMAP.md](docs/ROADMAP.md) | Auditoria do jogo, arquitetura, fases e critérios de saída |
+| [RECOMP.md](docs/RECOMP.md) | Decodificador PPU, análise, interpretador e emissor C++ |
+| [KERNEL.md](docs/KERNEL.md) | Kernel LV2, threads, sistema de arquivos, módulos de sistema |
+| [SPU.md](docs/SPU.md) | Decodificador, interpretador e recompilador SPU, SPURS e MFC |
+| [GPU.md](docs/GPU.md) | RSX, renderizador Vulkan, tradução de shaders, comparação com o RPCS3 |
+| [FASE6.md](docs/FASE6.md) | Saves, áudio, controle e vídeo |
+| [FASE7.md](docs/FASE7.md) | A primeira fase jogável e os bugs por trás dela |
+| [tools/](tools/README.md) | Formatos de dados e ferramentas de pesquisa (EDGE, Havok, shaders, Ghidra) |
 
-## Acknowledgements
+## Agradecimentos
 
-- [RPCS3](https://github.com/RPCS3/rpcs3), the reference for the console's behaviour and the tool
-  that decrypts the executable.
-- [GNU binutils](https://www.gnu.org/software/binutils/) and [QEMU](https://www.qemu.org), used as
-  independent oracles for the decoders and the interpreter.
-- [Ghidra](https://ghidra-sre.org), [SDL3](https://libsdl.org) and the
-  [Vulkan](https://www.vulkan.org) ecosystem.
+- [RPCS3](https://github.com/RPCS3/rpcs3), a referência do comportamento do console e a ferramenta
+  que descriptografa o executável.
+- [GNU binutils](https://www.gnu.org/software/binutils/) e [QEMU](https://www.qemu.org), usados
+  como oráculos independentes dos decodificadores e do interpretador.
+- [Ghidra](https://ghidra-sre.org), [SDL3](https://libsdl.org) e o ecossistema
+  [Vulkan](https://www.vulkan.org).
 
-## Legal
+## Aviso legal
 
-This is an independent, non-commercial research project focused on software preservation and
-interoperability. It is not affiliated with or endorsed by Sony Interactive Entertainment or
-Sanzaru Games. *Sly Cooper* is a trademark of Sony Interactive Entertainment LLC. No proprietary
-code, assets or keys are included, and the project does not support piracy: you need your own,
-legitimately purchased copy of the game. See [DISCLAIMER.md](DISCLAIMER.md).
+Este é um projeto de pesquisa independente e sem fins comerciais, voltado à preservação de
+software e à interoperabilidade. Não tem ligação nem aval da Sony Interactive Entertainment ou da
+Sanzaru Games. *Sly Cooper* é marca registrada da Sony Interactive Entertainment LLC. Nenhum
+código proprietário, asset ou chave está incluído, e o projeto não apoia a pirataria: é preciso
+ter a sua própria cópia do jogo, comprada legalmente. Veja o [DISCLAIMER.md](DISCLAIMER.md).
 
-The original code in this repository is released under the [MIT License](LICENSE).
+O código original deste repositório é distribuído sob a [licença MIT](LICENSE).

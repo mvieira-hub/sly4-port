@@ -1,70 +1,76 @@
-# Legal notice
+# Aviso legal
 
-**sly4-port** is an independent, non-commercial research project about the
-software of *Sly Cooper: Thieves in Time* (PlayStation 3). Its purpose is
-**software preservation** and **interoperability**: understanding how a game
-written for the Cell Broadband Engine (PowerPC 64 PPU + SPUs, LV2 kernel, RSX
-GPU) works, and making a copy that someone legitimately owns run natively on a
-different platform (Windows on x86-64).
+**Português** · [English](DISCLAIMER.en.md)
 
-## No proprietary material is included
+O **sly4-port** é um projeto de pesquisa independente e sem fins comerciais
+sobre o software de *Sly Cooper: Thieves in Time* (PlayStation 3). O objetivo
+é a **preservação de software** e a **interoperabilidade**: entender como
+funciona um jogo escrito para o Cell Broadband Engine (PPU PowerPC 64 + SPUs,
+kernel LV2, GPU RSX) e fazer uma cópia que alguém possui legitimamente rodar
+de forma nativa em outra plataforma (Windows em x86-64).
 
-This repository contains only original work: source code, scripts, build
-files and documentation written for this project. It does **not** contain,
-and has never contained in its history:
+## Nenhum material proprietário está incluído
 
-- the game's executable (`EBOOT.BIN` / `EBOOT.elf`), SPU programs or any other
-  code from the disc, in original, decrypted, disassembled or recompiled form
-  (the engineering notes quote at most a handful of instructions at a time,
-  with addresses, to explain a specific finding);
-- game data or assets of any kind: archives, models, textures, audio, video,
-  scripts, shaders, text or images;
-- PlayStation 3 firmware, system modules or SDK libraries;
-- encryption keys, license files, console identifiers or any means to
-  decrypt protected content.
+Este repositório contém apenas trabalho original: código-fonte, scripts,
+arquivos de compilação e documentação escritos para este projeto. Ele **não**
+contém, e nunca conteve em seu histórico:
 
-The C++ that the recompiler produces is derived from the game's code. It is
-generated locally, from each user's own copy, into a folder that Git ignores,
-and it is never committed or distributed. The continuous integration builds
-only the runtime, with no game data.
+- o executável do jogo (`EBOOT.BIN` / `EBOOT.elf`), os programas SPU ou
+  qualquer outro código do disco, seja na forma original, descriptografada,
+  desmontada ou recompilada (as notas de engenharia citam no máximo algumas
+  poucas instruções por vez, com endereços, para explicar uma descoberta
+  específica);
+- dados ou assets do jogo de qualquer tipo: pacotes, modelos, texturas, áudio,
+  vídeo, scripts, shaders, textos ou imagens;
+- firmware, módulos de sistema ou bibliotecas do SDK do PlayStation 3;
+- chaves de criptografia, arquivos de licença, identificadores de console ou
+  qualquer meio de descriptografar conteúdo protegido.
 
-Decrypting the executable is done by a separate, publicly available tool
-(RPCS3) on the user's own machine. This project ships no decryption code.
+O C++ que o recompilador produz é derivado do código do jogo. Ele é gerado
+localmente, a partir da cópia de cada usuário, numa pasta que o Git ignora, e
+nunca é versionado nem distribuído. A integração contínua compila apenas o
+runtime, sem nenhum dado do jogo.
 
-## You need your own copy of the game
+A descriptografia do executável é feita por uma ferramenta separada e pública
+(o RPCS3), na máquina do próprio usuário. Este projeto não distribui nenhum
+código de descriptografia.
 
-The tools and the runtime here do nothing on their own. To use them you must
-own a **legitimately purchased copy** of the game on its original disc and
-make your own dump of it for personal use, in compliance with the laws of
-your country. Do not ask for, share or link to game files, firmware or keys
-in issues or pull requests: such content will be removed.
+## Você precisa ter a sua própria cópia do jogo
 
-This project does not condone or support piracy in any form.
+As ferramentas e o runtime deste repositório não fazem nada sozinhos. Para
+usá-los é preciso ter uma **cópia comprada legalmente** do jogo, no disco
+original, e fazer o seu próprio dump para uso pessoal, de acordo com as leis
+do seu país. Não peça, não compartilhe e não aponte links para arquivos do
+jogo, firmware ou chaves em issues ou pull requests: esse conteúdo será
+removido.
 
-## Trademarks and affiliation
+Este projeto não apoia a pirataria de nenhuma forma.
 
-*Sly Cooper* and *Sly Cooper: Thieves in Time* are trademarks of Sony
-Interactive Entertainment LLC. The game was developed by Sanzaru Games.
-*PlayStation*, *PS3* and *Cell Broadband Engine* are trademarks of their
-respective owners. All trademarks belong to their owners and are used here
-only to identify the software being studied.
+## Marcas registradas e vínculos
 
-This project is **not affiliated with, endorsed by or sponsored by** Sony
-Interactive Entertainment, Sanzaru Games or any of their partners.
+*Sly Cooper* e *Sly Cooper: Thieves in Time* são marcas registradas da Sony
+Interactive Entertainment LLC. O jogo foi desenvolvido pela Sanzaru Games.
+*PlayStation*, *PS3* e *Cell Broadband Engine* são marcas de seus respectivos
+donos. Todas as marcas pertencem aos seus donos e aparecem aqui apenas para
+identificar o software estudado.
 
-## Third-party references
+Este projeto **não tem ligação, aval nem patrocínio** da Sony Interactive
+Entertainment, da Sanzaru Games ou de qualquer parceiro delas.
 
-Some techniques follow the public source code and documentation of the RPCS3
-emulator and of the GNU binutils, which are credited where they are used.
-Library and format names (for example PlayStation EDGE, Havok, Bink, SPURS)
-are mentioned only to describe how the game's data and code are structured.
+## Referências de terceiros
 
-## No warranty, and a contact for concerns
+Algumas técnicas seguem o código-fonte e a documentação públicos do emulador
+RPCS3 e do GNU binutils, que recebem o devido crédito onde são usados. Nomes
+de bibliotecas e formatos (por exemplo PlayStation EDGE, Havok, Bink, SPURS)
+aparecem apenas para descrever como os dados e o código do jogo estão
+organizados.
 
-The software is provided "as is", without warranty of any kind (see
-[LICENSE](LICENSE)). This notice is a statement of the project's intent and
-practices, not legal advice.
+## Sem garantia, e um contato para questionamentos
 
-If you are a rights holder and believe something in this repository should
-not be here, please open an issue or contact the author through GitHub, and
-it will be reviewed and removed promptly.
+O software é fornecido "no estado em que se encontra", sem garantia de
+nenhum tipo (veja a [LICENSE](LICENSE)). Este aviso descreve a intenção e as
+práticas do projeto; não é aconselhamento jurídico.
+
+Se você é titular de direitos e acredita que algo neste repositório não
+deveria estar aqui, abra uma issue ou fale com o autor pelo GitHub, e o
+conteúdo será analisado e removido prontamente.
